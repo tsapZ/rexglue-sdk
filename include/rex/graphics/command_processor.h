@@ -264,6 +264,10 @@ class CommandProcessor {
 
   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
   std::atomic<uint32_t> write_ptr_index_;
+  // Counts InitializeRingBuffer calls; the worker thread restarts at the beginning of the ring when
+  // it sees a new one (ring_generation_seen_ is only used by the worker thread).
+  std::atomic<uint32_t> ring_generation_{0};
+  uint32_t ring_generation_seen_ = 0;
 
   // Some titles submit writes beyond the emulated register file range in PM4
   // packets. Preserve these values so dependent packet logic can still observe

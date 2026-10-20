@@ -236,6 +236,16 @@ void CommandProcessor::WorkerThreadMain() {
         continue;
       }
     }
+    // The game set up a new ring (InitializeRingBuffer): it starts at its beginning, and only the
+    // write pointers the game wrote since then belong to it.
+    if (const uint32_t generation = ring_generation_.load(); generation != ring_generation_seen_) {
+      ring_generation_seen_ = generation;
+      read_ptr_index_ = 0;
+      write_ptr_index = write_ptr_index_.load();
+      if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+        continue;
+      }
+    }
     assert_true(read_ptr_index_ != write_ptr_index);
 
     // Execute. Note that we handle wraparound transparently.
@@ -312,9 +322,18 @@ bool CommandProcessor::SetupContext() {
 void CommandProcessor::ShutdownContext() {}
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
-  read_ptr_index_ = 0;
   primary_buffer_ptr_ = ptr;
   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+  // A new ring holds no commands until the game writes its first write pointer. Games that set up
+  // the ring again (Skylanders: Spyro's Adventure, when it recreates its device) leave the previous
+  // ring's write pointer in place; taken for the new ring, it ran whatever that buffer held, and
+  // the game's first real write pointer, below it, read as a wrap through the whole ring into
+  // memory the game never wrote (a 0x0BADF00D guard, "ExecutePacketType0 overflow"), losing that
+  // batch and the fence in it: the game then waited for the GPU forever. The worker thread resets
+  // its read pointer to 0 when it sees the new generation (it owns that pointer).
+  write_ptr_index_ = 0xBAADF00D;
+  ring_generation_.fetch_add(1);
+  write_ptr_index_event_->Set();
 }
 
 void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
