@@ -252,6 +252,9 @@ class XmaContext {
 
   void Decode(XMA_CONTEXT_DATA* data);
   void Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data);
+  // Turns the carried tail of the last decoded frame into a final output block once the input
+  // has run out (no next frame will complete it).
+  void FlushCarry(const XMA_CONTEXT_DATA* data);
   void UpdateLoopStatus(XMA_CONTEXT_DATA* data);
   void ClearLocked(XMA_CONTEXT_DATA* data);
   void ResetDecoderState();

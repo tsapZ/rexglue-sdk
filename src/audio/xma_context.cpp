@@ -113,6 +113,9 @@ bool XmaContext::Work() {
   // Consume-only context: no input, just drain remaining subframes.
   if (data.IsConsumeOnlyContext()) {
     if (current_frame_remaining_subframes_ == 0) {
+      FlushCarry(&data);
+    }
+    if (current_frame_remaining_subframes_ == 0) {
       return true;
     }
     Consume(&output_rb, &data);
@@ -528,11 +531,13 @@ bool XmaContext::DecodePacket(AVCodecContext* av_context, const AVPacket* av_pac
 void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   SCOPE_profile_cpu_f("apu");
 
-  if (!data->IsAnyInputBufferValid()) {
+  if (current_frame_remaining_subframes_ > 0) {
     return;
   }
 
-  if (current_frame_remaining_subframes_ > 0) {
+  if (!data->IsAnyInputBufferValid()) {
+    // The stream ran out: its last frame is still in the carry.
+    FlushCarry(data);
     return;
   }
 
@@ -738,6 +743,29 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     }
   }
   data->input_buffer_read_offset = next_input_offset;
+}
+
+void XmaContext::FlushCarry(const XMA_CONTEXT_DATA* data) {
+  // Each decoded frame completes the block of the frame before it (see the realignment in
+  // Decode), so the last frame of a stream waits in the carry for a next frame that never comes.
+  // Without this, every stream that ends came out one frame (512 samples) short of what its
+  // header promises. Games that wait for a voice to play all of it (Wwise in Skylanders: Spyro's
+  // Adventure: every spoken line, and the cutscene with it, never finished) waited forever. The
+  // head of that final block would have come from the next frame; with none, it is silence.
+  if (!carry_valid_) {
+    return;
+  }
+  const size_t pad_bytes = kDecoderStartPadding * kBytesPerSample << data->is_stereo;
+  const size_t carry_bytes = (kBytesPerFrameChannel << data->is_stereo) - pad_bytes;
+  std::memcpy(raw_frame_.data(), carry_frame_.data(), carry_bytes);
+  std::memset(raw_frame_.data() + carry_bytes, 0, pad_bytes);
+  current_frame_remaining_subframes_ = 4 << data->is_stereo;
+  loop_frame_output_limit_ = pending_output_limit_;
+  current_frame_remaining_subframes_ -=
+      std::min(pending_start_skip_, current_frame_remaining_subframes_);
+  carry_valid_ = false;
+  pending_output_limit_ = 0;
+  pending_start_skip_ = 0;
 }
 
 void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
