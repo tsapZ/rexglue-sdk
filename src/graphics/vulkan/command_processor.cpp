@@ -2279,8 +2279,9 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
-  vertex_buffers_in_sync_[0] = 0;
-  vertex_buffers_in_sync_[1] = 0;
+  // As in D3D12CommandProcessor::IssueSwap: forget the requested vertex buffer ranges too, so
+  // vertex data the CPU rewrote in place is uploaded again once per frame.
+  InvalidateAllVertexBufferResidency();
 
   if (!graphics_system_)
     return;

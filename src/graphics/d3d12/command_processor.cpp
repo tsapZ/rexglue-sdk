@@ -1904,8 +1904,13 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
-  vertex_buffers_in_sync_[0] = 0;
-  vertex_buffers_in_sync_[1] = 0;
+  // Forget the requested vertex buffer ranges too, not only the in-sync bits: a draw with the same
+  // fetch constant as before skips RequestRange, so pages the CPU rewrote in place since then
+  // (the shared memory has invalidated them) were never uploaded again and the GPU kept drawing
+  // the old vertices (Skylanders Swap Force's second logo movie drew with the first one's texture
+  // coordinates and came out green on the right and bottom). Once per frame, every vertex buffer is
+  // requested again.
+  InvalidateAllVertexBufferResidency();
 
   if (!graphics_system_)
     return;
