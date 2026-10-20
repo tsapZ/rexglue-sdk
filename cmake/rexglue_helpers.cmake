@@ -163,6 +163,22 @@ function(rexglue_configure_target target_name)
                 $<TARGET_FILE_DIR:${target_name}>
             VERBATIM
         )
+        # The POST_BUILD copy only runs when the host relinks, and a rebuilt plugin never makes it
+        # relink (it isn't linked), so a change to the GPU code alone left the old plugin next to
+        # the host. This target copies it whenever the plugin file changes.
+        set(_plugin_stamp "${CMAKE_CURRENT_BINARY_DIR}/${target_name}_${_plugin}_staged.stamp")
+        add_custom_command(OUTPUT ${_plugin_stamp}
+            COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${target_name}>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:${_plugin_target}>
+                $<TARGET_FILE_DIR:${target_name}>
+            COMMAND ${CMAKE_COMMAND} -E touch ${_plugin_stamp}
+            DEPENDS ${_plugin_target} $<TARGET_FILE:${_plugin_target}>
+            VERBATIM
+        )
+        add_custom_target(${target_name}_stage_${_plugin} ALL DEPENDS ${_plugin_stamp})
+        add_dependencies(${target_name} ${target_name}_stage_${_plugin})
+        unset(_plugin_stamp)
         unset(_plugin_target)
     endforeach()
 
