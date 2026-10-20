@@ -162,6 +162,13 @@ class ContentManager {
   X_RESULT SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                std::vector<uint8_t> buffer);
   X_RESULT DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+  // Replaces a saved game the way the console does, for XamContentCreate's CREATE_ALWAYS and
+  // TRUNCATE_EXISTING: the old package and its header are moved aside instead of deleted, and
+  // the new one only counts once the game closes it (CloseContent on `root_name`). If the game
+  // stops before that (a crash in the middle of saving), the next start puts the old package
+  // back. Other content types are deleted as before.
+  X_RESULT ReplaceContent(const std::string_view root_name, uint64_t xuid,
+                          const XCONTENT_AGGREGATE_DATA& data);
   X_RESULT UnmountContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
   X_RESULT UnmountAndDeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
 
@@ -196,8 +203,17 @@ class ContentManager {
   ContentPackage* DetachPackage(std::unordered_map<string::string_key_case, ContentPackage*,
                                                    string::string_key_case::Hash>::iterator it);
 
+  // ReplaceContent's bookkeeping, under root_path_/save-backup/: pending/<id>/ holds an old
+  // package (package/, header) until the new one is closed, previous/<id>/ the last replaced one.
+  std::filesystem::path SaveBackupPath(const char* kind, const std::string& id) const;
+  void CommitReplacement(const std::string& id);
+  void RecoverInterruptedReplacements();
+
   KernelState* kernel_state_;
   std::filesystem::path root_path_;
+  // Open packages with an uncommitted ReplaceContent: root name -> pending id.
+  std::unordered_map<string::string_key_case, std::string, string::string_key_case::Hash>
+      pending_replacements_;
 
   // TODO(benvanik): remove use of global lock, it's bad here!
   rex::thread::global_critical_region global_critical_region_;
