@@ -161,7 +161,8 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
         // Games may reuse the same root without explicitly closing.
         content_manager->CloseContent(root_name);
         if (content_manager->ContentExists(xuid, content_data)) {
-          content_manager->DeleteContent(xuid, content_data);
+          // A saved game is kept aside until the new one is closed (see ReplaceContent).
+          content_manager->ReplaceContent(root_name, xuid, content_data);
         }
         // Check filesystem state after deletion attempt to decide
         // whether to create fresh or open existing.
@@ -193,7 +194,7 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
           result = X_ERROR_PATH_NOT_FOUND;
         } else {
           content_manager->CloseContent(root_name);
-          content_manager->DeleteContent(xuid, content_data);
+          content_manager->ReplaceContent(root_name, xuid, content_data);
           if (content_manager->ContentExists(xuid, content_data)) {
             disposition = kDispositionState::Open;
           } else {

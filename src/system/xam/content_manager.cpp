@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstring>
+#include <fstream>
 #include <queue>
 #include <string>
 
@@ -19,6 +20,7 @@
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
+#include <rex/logging.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
@@ -37,6 +39,46 @@ static const char* kGameUserContentDirName = "profile";
 static const char* kGameContentHeaderDirName = "Headers";
 
 static int content_device_id_ = 0;
+
+// ReplaceContent keeps the package it replaces here, next to the content folders.
+static const char* kSaveBackupDirName = "save-backup";
+static const char* kSaveBackupManifestName = "manifest.txt";
+
+namespace {
+
+// Moves a file or folder: renames it, or copies and deletes it when renaming fails (another
+// volume, a file briefly held by a virus scanner). False if it is still where it was.
+bool MovePath(const std::filesystem::path& from, const std::filesystem::path& to) {
+  std::error_code ec;
+  std::filesystem::rename(from, to, ec);
+  if (!ec) {
+    return true;
+  }
+  ec.clear();
+  std::filesystem::copy(from, to,
+                        std::filesystem::copy_options::recursive |
+                            std::filesystem::copy_options::overwrite_existing,
+                        ec);
+  if (ec) {
+    std::filesystem::remove_all(to, ec);
+    return false;
+  }
+  std::filesystem::remove_all(from, ec);
+  return true;
+}
+
+// A package's id for the backup folders: its path below the content root, '_' for separators.
+std::string PackageId(const std::filesystem::path& relative_package_path) {
+  std::string id = rex::path_to_utf8(relative_package_path);
+  for (char& c : id) {
+    if (c == '/' || c == '\\' || c == ':') {
+      c = '_';
+    }
+  }
+  return id;
+}
+
+}  // namespace
 
 ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
                                const XCONTENT_AGGREGATE_DATA& data,
@@ -81,7 +123,9 @@ void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_p
 }
 
 ContentManager::ContentManager(KernelState* kernel_state, const std::filesystem::path& root_path)
-    : kernel_state_(kernel_state), root_path_(root_path) {}
+    : kernel_state_(kernel_state), root_path_(root_path) {
+  RecoverInterruptedReplacements();
+}
 
 ContentManager::~ContentManager() = default;
 
@@ -325,8 +369,142 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
     }
     package = DetachPackage(it);
   }
+  std::string pending_id;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    auto it = pending_replacements_.find(string::string_key_case(root_name));
+    if (it != pending_replacements_.end()) {
+      pending_id = it->second;
+      pending_replacements_.erase(it);
+    }
+  }
   delete package;
+  if (!pending_id.empty()) {
+    CommitReplacement(pending_id);
+  }
   return X_ERROR_SUCCESS;
+}
+
+std::filesystem::path ContentManager::SaveBackupPath(const char* kind,
+                                                     const std::string& id) const {
+  return root_path_ / kSaveBackupDirName / kind / rex::to_path(id);
+}
+
+X_RESULT ContentManager::ReplaceContent(const std::string_view root_name, uint64_t xuid,
+                                        const XCONTENT_AGGREGATE_DATA& data) {
+  if (data.content_type != XContentType::kSavedGame) {
+    return DeleteContent(xuid, data);
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  if (IsContentOpen(data)) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+
+  const auto package_path = ResolvePackagePath(xuid, data);
+  uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
+  const auto header_path =
+      ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
+  const auto relative_package = package_path.lexically_relative(root_path_);
+  const auto relative_header = header_path.lexically_relative(root_path_);
+  const std::string id = PackageId(relative_package);
+  const auto pending = SaveBackupPath("pending", id);
+
+  std::error_code ec;
+  if (std::filesystem::exists(pending / "package", ec)) {
+    // An earlier replacement was never closed: its old package is still the last complete one,
+    // so it stays, and the unfinished one goes.
+    std::filesystem::remove_all(package_path, ec);
+    std::filesystem::remove(header_path, ec);
+  } else {
+    std::filesystem::remove_all(pending, ec);
+    std::filesystem::create_directories(pending, ec);
+    // The manifest comes first: a backup folder without one never holds a package.
+    bool kept = false;
+    if (auto file = rex::filesystem::OpenFile(pending / kSaveBackupManifestName, "wb")) {
+      const std::string text =
+          rex::path_to_utf8(relative_package) + "\n" + rex::path_to_utf8(relative_header) + "\n";
+      kept = fwrite(text.data(), 1, text.size(), file) == text.size();
+      fclose(file);
+    }
+    const bool had_package = std::filesystem::exists(package_path, ec);
+    kept = kept && (!had_package || MovePath(package_path, pending / "package"));
+    if (kept && std::filesystem::exists(header_path, ec)) {
+      kept = MovePath(header_path, pending / "header");
+    }
+    if (!kept) {
+      REXSYS_WARN("Content: could not keep the old {} while the game saves it anew; replacing it "
+                  "directly",
+                  rex::path_to_utf8(relative_package));
+      if (std::filesystem::exists(pending / "package", ec)) {
+        MovePath(pending / "package", package_path);
+      }
+      std::filesystem::remove_all(pending, ec);
+      return DeleteContent(xuid, data);
+    }
+  }
+  pending_replacements_.insert_or_assign(string::string_key_case::create(root_name), id);
+  REXSYS_INFO("Content: saving {} anew; the old version stays in {} until the game closes it",
+              rex::path_to_utf8(relative_package),
+              rex::path_to_utf8(pending.lexically_relative(root_path_)));
+  return X_ERROR_SUCCESS;
+}
+
+void ContentManager::CommitReplacement(const std::string& id) {
+  const auto pending = SaveBackupPath("pending", id);
+  const auto previous = SaveBackupPath("previous", id);
+  std::error_code ec;
+  std::filesystem::remove_all(previous, ec);
+  std::filesystem::create_directories(previous.parent_path(), ec);
+  if (!MovePath(pending, previous)) {
+    std::filesystem::remove_all(pending, ec);
+  }
+  REXSYS_INFO("Content: {} saved; the version before it is in {}", id,
+              rex::path_to_utf8(previous.lexically_relative(root_path_)));
+}
+
+void ContentManager::RecoverInterruptedReplacements() {
+  const auto pending_root = root_path_ / kSaveBackupDirName / "pending";
+  std::error_code ec;
+  if (!std::filesystem::is_directory(pending_root, ec)) {
+    return;
+  }
+  std::vector<std::filesystem::path> dirs;
+  for (const auto& entry : std::filesystem::directory_iterator(pending_root, ec)) {
+    dirs.push_back(entry.path());
+  }
+  for (const auto& dir : dirs) {
+    std::string package_line, header_line;
+    {
+      std::ifstream manifest(dir / kSaveBackupManifestName);
+      std::getline(manifest, package_line);
+      std::getline(manifest, header_line);
+    }
+    if (!package_line.empty() && std::filesystem::exists(dir / "package", ec)) {
+      // The game stopped between taking the old package away and closing the new one, as when
+      // it crashes while saving: what is in the package's place now is unfinished.
+      const auto package_path = root_path_ / rex::to_path(package_line);
+      std::filesystem::remove_all(package_path, ec);
+      std::filesystem::create_directories(package_path.parent_path(), ec);
+      if (MovePath(dir / "package", package_path)) {
+        if (!header_line.empty()) {
+          const auto header_path = root_path_ / rex::to_path(header_line);
+          std::filesystem::remove(header_path, ec);
+          if (std::filesystem::exists(dir / "header", ec)) {
+            std::filesystem::create_directories(header_path.parent_path(), ec);
+            MovePath(dir / "header", header_path);
+          }
+        }
+        REXSYS_WARN("Content: saving {} was not finished when the game stopped; the version "
+                    "before it is back",
+                    package_line);
+      } else {
+        REXSYS_ERROR("Content: could not put the old {} back; it is still in {}", package_line,
+                     rex::path_to_utf8(dir));
+        continue;
+      }
+    }
+    std::filesystem::remove_all(dir, ec);
+  }
 }
 
 X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
