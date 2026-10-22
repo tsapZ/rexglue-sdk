@@ -29,6 +29,8 @@ class SharedMemory {
   static constexpr uint32_t kBufferSize = 1 << kBufferSizeLog2;
 
   virtual ~SharedMemory();
+  // The guest memory this mirrors, for reading a texture's bytes on the CPU (texture_dump_dir).
+  memory::Memory& guest_memory() const { return memory_; }
   // Call in the implementation-specific ClearCache.
   virtual void ClearCache();
   void SetSystemPageBlocksValidWithGpuDataWritten();
