@@ -14,4 +14,8 @@ static const AVCodec* const codec_list[] = {
 #if CONFIG_XMAFRAMES_DECODER
     &ff_xmaframes_decoder,
 #endif
+    // Whole XMA2 streams (2048-byte packets), for tools that decode a file from the disc instead
+    // of the emulated XMA hardware's frames: wmaprodec.c builds it unconditionally, but the
+    // generated config leaves CONFIG_XMA2_DECODER at 0, so it is listed without the guard.
+    &ff_xma2_decoder,
     NULL};
