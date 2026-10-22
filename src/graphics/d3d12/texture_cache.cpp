@@ -11,13 +11,27 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cfloat>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
+
+#include <fmt/format.h>
+#include <xxhash.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
@@ -31,6 +45,17 @@
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+REXCVAR_DEFINE_STRING(texture_dump_dir, "", "GPU/D3D12",
+                      "Write each new 2D texture in DXT1/DXT3/DXT5 (BC1-BC3) the game loads, its "
+                      "top level as a DDS named by the hash of its content, into this folder (once "
+                      "each), to make replacements from; empty = off")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(texture_replace_dir, "", "GPU/D3D12",
+                      "Load <hash>.dds from this folder in place of the game's texture of that "
+                      "content (the names texture_dump_dir gives): the same block format, any size "
+                      "(e.g. 4x), best with a full mip chain; empty = off")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::d3d12 {
 
@@ -1422,6 +1447,24 @@ D3D12TextureCache::D3D12Texture::D3D12Texture(D3D12TextureCache& texture_cache,
   SetHostMemoryUsage(device->GetResourceAllocationInfo(0, 1, &resource_desc).SizeInBytes);
 }
 
+void D3D12TextureCache::D3D12Texture::SetReplacement(Microsoft::WRL::ComPtr<ID3D12Resource> resource,
+                                                     D3D12_RESOURCE_STATES state,
+                                                     Microsoft::WRL::ComPtr<ID3D12Resource> upload,
+                                                     uint32_t mip_levels) {
+  auto& d3d12_texture_cache = static_cast<D3D12TextureCache&>(texture_cache());
+  for (const auto& descriptor_pair : srv_descriptors_) {
+    d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_pair.second);
+  }
+  srv_descriptors_.clear();
+  resource_ = std::move(resource);
+  resource_state_ = state;
+  replacement_upload_ = std::move(upload);
+  replaced_mip_levels_ = mip_levels;
+  ID3D12Device* device = d3d12_texture_cache.command_processor_.GetD3D12Provider().GetDevice();
+  D3D12_RESOURCE_DESC resource_desc = resource_->GetDesc();
+  SetHostMemoryUsage(device->GetResourceAllocationInfo(0, 1, &resource_desc).SizeInBytes);
+}
+
 D3D12TextureCache::D3D12Texture::~D3D12Texture() {
   auto& d3d12_texture_cache = static_cast<D3D12TextureCache&>(texture_cache());
   for (const auto& descriptor_pair : srv_descriptors_) {
@@ -1560,6 +1603,16 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                               bool load_mips) {
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
+  // A replacement (texture_replace_dir) stays: the guest's data doesn't go into it.
+  if (d3d12_texture.replaced_mip_levels()) {
+    return true;
+  }
+  if (load_base && !d3d12_texture.files_checked) {
+    d3d12_texture.files_checked = true;
+    if (DumpOrReplaceTexture(d3d12_texture)) {
+      return true;
+    }
+  }
   TextureKey texture_key = d3d12_texture.key();
 
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
@@ -2074,7 +2127,9 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(D3D12Texture& texture,
     return UINT32_MAX;
   }
 
-  uint32_t mip_levels = texture_key.mip_max_level + 1;
+  // A replacement has its own mip count (texture_replace_dir).
+  uint32_t mip_levels = texture.replaced_mip_levels() ? texture.replaced_mip_levels()
+                                                      : texture_key.mip_max_level + 1;
   ID3D12Resource* resource_for_view = texture.resource();
   switch (dimension) {
     case xenos::DataDimension::k3D:
@@ -2202,6 +2257,273 @@ xenos::ClampMode D3D12TextureCache::NormalizeClampMode(xenos::ClampMode clamp_mo
     return xenos::ClampMode::kMirrorClampToEdge;
   }
   return clamp_mode;
+}
+
+namespace {
+
+// DDS's legacy header (DDS_HEADER, after the "DDS " magic) for the BC1-BC3 textures dumped, and
+// what the replacement reader takes from one (also with the DX10 header).
+struct DdsHeader {
+  uint32_t size, flags, height, width, pitch_or_linear_size, depth, mip_map_count;
+  uint32_t reserved1[11];
+  struct {
+    uint32_t size, flags, four_cc, rgb_bit_count, r_mask, g_mask, b_mask, a_mask;
+  } pixel_format;
+  uint32_t caps, caps2, caps3, caps4, reserved2;
+};
+static_assert(sizeof(DdsHeader) == 124);
+constexpr uint32_t FourCC(char a, char b, char c, char d) {
+  return uint32_t(uint8_t(a)) | uint32_t(uint8_t(b)) << 8 | uint32_t(uint8_t(c)) << 16 |
+         uint32_t(uint8_t(d)) << 24;
+}
+
+// 0 BC1, 1 BC2, 2 BC3, or -1 for the formats this doesn't handle.
+int BlockFamily(xenos::TextureFormat format) {
+  switch (format) {
+    case xenos::TextureFormat::k_DXT1:
+      return 0;
+    case xenos::TextureFormat::k_DXT2_3:
+      return 1;
+    case xenos::TextureFormat::k_DXT4_5:
+      return 2;
+    default:
+      return -1;
+  }
+}
+int BlockFamily(DXGI_FORMAT format) {
+  switch (format) {
+    case DXGI_FORMAT_BC1_TYPELESS:
+    case DXGI_FORMAT_BC1_UNORM:
+    case DXGI_FORMAT_BC1_UNORM_SRGB:
+      return 0;
+    case DXGI_FORMAT_BC2_TYPELESS:
+    case DXGI_FORMAT_BC2_UNORM:
+    case DXGI_FORMAT_BC2_UNORM_SRGB:
+      return 1;
+    case DXGI_FORMAT_BC3_TYPELESS:
+    case DXGI_FORMAT_BC3_UNORM:
+    case DXGI_FORMAT_BC3_UNORM_SRGB:
+      return 2;
+    default:
+      return -1;
+  }
+}
+
+std::filesystem::path Utf8Dir(const std::string& utf8) {
+  return std::filesystem::u8path(utf8);  // this file builds as C++17
+}
+
+// The DDS files of the replacement folder by their hash name, read once.
+const std::unordered_map<uint64_t, std::filesystem::path>& ReplacementIndex() {
+  static std::unordered_map<uint64_t, std::filesystem::path> index;
+  static std::once_flag once;
+  std::call_once(once, [] {
+    std::error_code ec;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(Utf8Dir(REXCVAR_GET(texture_replace_dir)), ec)) {
+      const std::filesystem::path& path = entry.path();
+      const std::string stem = path.stem().string();
+      if (path.extension() != ".dds" || stem.size() != 16) continue;
+      char* end = nullptr;
+      const uint64_t hash = std::strtoull(stem.c_str(), &end, 16);
+      if (end && *end == '\0') index[hash] = path;
+    }
+    REXGPU_INFO("Texture replacement: {} DDS files in {}", index.size(),
+                REXCVAR_GET(texture_replace_dir));
+  });
+  return index;
+}
+
+}  // namespace
+
+bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
+  const std::string& dump_dir = REXCVAR_GET(texture_dump_dir);
+  const std::string& replace_dir = REXCVAR_GET(texture_replace_dir);
+  if (dump_dir.empty() && replace_dir.empty()) return false;
+  const TextureKey key = texture.key();
+  const int family = BlockFamily(key.format);
+  const uint32_t width = key.GetWidth(), height = key.GetHeight();
+  // 2D textures in BC1-BC3 the host keeps compressed, not render-to-texture results, not tiny.
+  if (family < 0 || key.scaled_resolve || key.dimension != xenos::DataDimension::k2DOrStacked ||
+      key.GetDepthOrArraySize() != 1 || width < 32 || height < 32 ||
+      IsDecompressionNeeded(key.format, width, height) ||
+      BlockFamily(GetDXGIResourceFormat(key)) != family) {
+    return false;
+  }
+  // The top level in the guest's memory, untiled and in little-endian order, as a DDS has it.
+  const FormatInfo* info = FormatInfo::Get(key.format);
+  const uint32_t bytes_per_block = info->bytes_per_block();
+  const uint32_t bytes_per_block_log2 = bytes_per_block == 16 ? 4 : 3;
+  const uint32_t blocks_x = (width + 3) / 4, blocks_y = (height + 3) / 4;
+  const auto& base = texture.guest_layout().base;
+  const uint32_t guest_size = texture.GetGuestBaseSize();
+  const uint8_t* guest =
+      static_cast<const uint8_t*>(shared_memory().guest_memory().TranslatePhysical(key.base_page << 12));
+  if (!guest || !base.row_pitch_bytes) return false;
+  std::vector<uint8_t> linear(size_t(blocks_x) * blocks_y * bytes_per_block);
+  for (uint32_t y = 0; y < blocks_y; ++y) {
+    for (uint32_t x = 0; x < blocks_x; ++x) {
+      const uint32_t offset =
+          key.tiled ? uint32_t(texture_util::GetTiledOffset2D(int32_t(x), int32_t(y),
+                                                              base.row_pitch_bytes / bytes_per_block,
+                                                              bytes_per_block_log2))
+                    : y * base.row_pitch_bytes + x * bytes_per_block;
+      if (offset + bytes_per_block > guest_size) return false;
+      std::memcpy(&linear[(size_t(y) * blocks_x + x) * bytes_per_block], guest + offset,
+                  bytes_per_block);
+    }
+  }
+  switch (key.endianness) {
+    case xenos::Endian::k8in16:
+      for (size_t i = 0; i + 1 < linear.size(); i += 2) std::swap(linear[i], linear[i + 1]);
+      break;
+    case xenos::Endian::k8in32:
+      for (size_t i = 0; i + 3 < linear.size(); i += 4) {
+        std::swap(linear[i], linear[i + 3]);
+        std::swap(linear[i + 1], linear[i + 2]);
+      }
+      break;
+    case xenos::Endian::k16in32:
+      for (size_t i = 0; i + 3 < linear.size(); i += 4) {
+        std::swap(linear[i], linear[i + 2]);
+        std::swap(linear[i + 1], linear[i + 3]);
+      }
+      break;
+    default:
+      break;
+  }
+  const uint64_t hash =
+      XXH3_64bits_withSeed(linear.data(), linear.size(),
+                           uint64_t(family) | uint64_t(width) << 8 | uint64_t(height) << 24);
+  const std::string name = fmt::format("{:016X}.dds", hash);
+  static const uint32_t kFourCC[3] = {FourCC('D', 'X', 'T', '1'), FourCC('D', 'X', 'T', '3'),
+                                      FourCC('D', 'X', 'T', '5')};
+
+  // The dump: once per content, written on a thread of its own.
+  if (!dump_dir.empty()) {
+    static std::mutex dumped_mutex;
+    static std::unordered_set<uint64_t> dumped;
+    bool first;
+    {
+      std::lock_guard lock(dumped_mutex);
+      first = dumped.insert(hash).second;
+    }
+    if (first) {
+      std::thread([path = Utf8Dir(dump_dir) / name, data = linear, width, height,
+                   four_cc = kFourCC[family]] {
+        DdsHeader h = {};
+        h.size = sizeof(DdsHeader);
+        h.flags = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000;  // caps, height, width, pixel format, linear size
+        h.height = height;
+        h.width = width;
+        h.pitch_or_linear_size = uint32_t(data.size());
+        h.mip_map_count = 1;
+        h.pixel_format.size = 32;
+        h.pixel_format.flags = 0x4;  // DDPF_FOURCC
+        h.pixel_format.four_cc = four_cc;
+        h.caps = 0x1000;  // DDSCAPS_TEXTURE
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write("DDS ", 4);
+        out.write(reinterpret_cast<const char*>(&h), sizeof(h));
+        out.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
+      }).detach();
+    }
+  }
+
+  // The replacement: <hash>.dds of the same block format.
+  if (replace_dir.empty()) return false;
+  const auto& index = ReplacementIndex();
+  const auto it = index.find(hash);
+  if (it == index.end()) return false;
+  std::ifstream in(it->second, std::ios::binary);
+  std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  if (file.size() < 4 + sizeof(DdsHeader) || std::memcmp(file.data(), "DDS ", 4) != 0) return false;
+  DdsHeader h;
+  std::memcpy(&h, file.data() + 4, sizeof(h));
+  size_t data_offset = 4 + sizeof(DdsHeader);
+  int dds_family = -1;
+  for (int f = 0; f < 3; ++f) {
+    if (h.pixel_format.four_cc == kFourCC[f]) dds_family = f;
+  }
+  if (h.pixel_format.four_cc == FourCC('D', 'X', '1', '0') && file.size() >= data_offset + 20) {
+    uint32_t dxgi_format;
+    std::memcpy(&dxgi_format, file.data() + data_offset, 4);
+    dds_family = BlockFamily(DXGI_FORMAT(dxgi_format));
+    data_offset += 20;
+  }
+  const uint32_t mips = std::max(uint32_t(1), h.mip_map_count);
+  if (dds_family != family || !h.width || !h.height || (h.width & 3) || (h.height & 3) ||
+      mips > 16 || h.width > 16384 || h.height > 16384) {
+    REXGPU_WARN("Texture replacement: {} is not a {}x{}-compatible DXT{} DDS", it->second.string(),
+                width, height, family == 0 ? 1 : family == 1 ? 3 : 5);
+    return false;
+  }
+  D3D12_RESOURCE_DESC desc = texture.resource()->GetDesc();
+  desc.Width = h.width;
+  desc.Height = h.height;
+  desc.MipLevels = UINT16(mips);
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 16> layouts;
+  std::array<UINT, 16> rows;
+  std::array<UINT64, 16> row_bytes;
+  UINT64 upload_size = 0;
+  device->GetCopyableFootprints(&desc, 0, mips, 0, layouts.data(), rows.data(), row_bytes.data(),
+                                &upload_size);
+  // The file's levels one after the other, each its blocks row by row.
+  size_t needed = data_offset;
+  for (uint32_t m = 0; m < mips; ++m) needed += size_t(rows[m]) * row_bytes[m];
+  if (file.size() < needed) {
+    REXGPU_WARN("Texture replacement: {} is too short for {} mips", it->second.string(), mips);
+    return false;
+  }
+  Microsoft::WRL::ComPtr<ID3D12Resource> resource, upload;
+  D3D12_RESOURCE_DESC upload_desc;
+  ui::d3d12::util::FillBufferResourceDesc(upload_desc, upload_size, D3D12_RESOURCE_FLAG_NONE);
+  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+                                             provider.GetHeapFlagCreateNotZeroed(), &desc,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&resource))) ||
+      FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesUpload,
+                                             provider.GetHeapFlagCreateNotZeroed(), &upload_desc,
+                                             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                             IID_PPV_ARGS(&upload)))) {
+    return false;
+  }
+  uint8_t* mapped = nullptr;
+  D3D12_RANGE no_read = {0, 0};
+  if (FAILED(upload->Map(0, &no_read, reinterpret_cast<void**>(&mapped)))) return false;
+  const uint8_t* source = file.data() + data_offset;
+  for (uint32_t m = 0; m < mips; ++m) {
+    for (UINT row = 0; row < rows[m]; ++row) {
+      std::memcpy(mapped + layouts[m].Offset + UINT64(row) * layouts[m].Footprint.RowPitch, source,
+                  size_t(row_bytes[m]));
+      source += row_bytes[m];
+    }
+  }
+  upload->Unmap(0, nullptr);
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  for (uint32_t m = 0; m < mips; ++m) {
+    D3D12_TEXTURE_COPY_LOCATION dst, src;
+    dst.pResource = resource.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = m;
+    src.pResource = upload.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint = layouts[m];
+    command_list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  }
+  texture.SetReplacement(std::move(resource), D3D12_RESOURCE_STATE_COPY_DEST, std::move(upload),
+                         mips);
+  static std::atomic<uint32_t> replaced{0};
+  const uint32_t count = ++replaced;
+  if (count <= 20 || count % 100 == 0) {
+    REXGPU_INFO("Texture replacement: {} ({}x{} -> {}x{}, {} mips), {} so far", name, width, height,
+                h.width, h.height, mips, count);
+  }
+  return true;
 }
 
 }  // namespace rex::graphics::d3d12

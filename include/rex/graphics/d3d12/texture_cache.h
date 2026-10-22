@@ -179,6 +179,11 @@ class D3D12TextureCache final : public TextureCache {
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
 
  private:
+  // texture_dump_dir / texture_replace_dir on a texture's first load: writes its top level as a
+  // DDS named by its content hash, and/or puts <hash>.dds from the replacement folder in its
+  // place. True when it was replaced (nothing else to load then).
+  class D3D12Texture;
+  bool DumpOrReplaceTexture(D3D12Texture& texture);
   static constexpr uint32_t kLoadGuestXThreadsPerGroupLog2 = 2;
   static constexpr uint32_t kLoadGuestYBlocksPerGroupLog2 = 5;
 
@@ -268,7 +273,19 @@ class D3D12TextureCache final : public TextureCache {
       srv_descriptors_.emplace(descriptor_key, descriptor_index);
     }
 
+    // A replacement from texture_replace_dir (its own size and mip count) in place of the
+    // resource made for the guest texture; the guest's data isn't loaded into it any more.
+    // `upload` holds the replacement's data until the texture goes.
+    void SetReplacement(Microsoft::WRL::ComPtr<ID3D12Resource> resource,
+                        D3D12_RESOURCE_STATES state, Microsoft::WRL::ComPtr<ID3D12Resource> upload,
+                        uint32_t mip_levels);
+    uint32_t replaced_mip_levels() const { return replaced_mip_levels_; }
+    // Looked at once for texture_dump_dir / texture_replace_dir (on its first load).
+    bool files_checked = false;
+
    private:
+    uint32_t replaced_mip_levels_ = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> replacement_upload_;
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
     std::unique_ptr<D3D12Texture> texture_3d_as_2d_;
