@@ -11,12 +11,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 
 #include <rex/assert.h>
 #include <rex/audio/conversion.h>
 #include <rex/audio/downmix.h>
 #include <rex/audio/flags.h>
+#include <rex/audio/output_tap.h>
 #include <rex/audio/sdl/sdl_audio_driver.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -25,6 +27,18 @@
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+
+namespace rex::audio {
+namespace {
+std::atomic<OutputTap> g_tap{nullptr};
+std::atomic<void*> g_tap_user{nullptr};
+}  // namespace
+
+void SetOutputTap(OutputTap tap, void* user) {
+  g_tap_user.store(user);
+  g_tap.store(tap);
+}
+}  // namespace rex::audio
 
 namespace rex::audio::sdl {
 
@@ -195,7 +209,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     } else {
       auto buffer = driver->frames_queued_.front();
       driver->frames_queued_.pop();
-      if (REXCVAR_GET(audio_mute)) {
+      const OutputTap tap = g_tap.load();
+      if (REXCVAR_GET(audio_mute) && !tap) {
         std::memset(data, 0, len);
       } else {
         switch (driver->sdl_device_channels_) {
@@ -210,6 +225,10 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
           default:
             assert_unhandled_case(driver->sdl_device_channels_);
             break;
+        }
+        if (tap) {
+          tap(data, channel_samples_, driver->sdl_device_channels_, g_tap_user.load());
+          if (REXCVAR_GET(audio_mute)) std::memset(data, 0, len);
         }
       }
       if (!SDL_PutAudioStreamData(stream, data, len)) {
