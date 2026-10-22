@@ -13,6 +13,8 @@
 #include <cctype>
 #include <charconv>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -544,7 +546,15 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
     return result;
 
   try {
-    auto config = toml::parse_file(config_path.string());
+    toml::table config;
+    try {
+      config = toml::parse_file(config_path.string());
+    } catch (const toml::parse_error&) {
+      // A key set twice makes the file invalid; read it as LoadConfig does (cvar.cpp).
+      std::ifstream in(config_path, std::ios::binary);
+      const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      config = toml::parse(rex::cvar::CommentOutRepeatedKeys(text), config_path.string());
+    }
     auto* log_table = config["log"].as_table();
     if (!log_table)
       return result;

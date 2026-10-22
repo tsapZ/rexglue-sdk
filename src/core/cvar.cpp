@@ -16,6 +16,9 @@
 #include <optional>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <iterator>
 
 #include <CLI/CLI.hpp>
 
@@ -682,6 +685,57 @@ std::vector<std::string> Init(int argc, char** argv) {
   return positional;
 }
 
+namespace {
+std::mutex g_config_problem_mutex;
+std::string g_config_problem;
+}  // namespace
+
+std::string CommentOutRepeatedKeys(std::string_view text, std::vector<std::string>* repeated) {
+  std::string out;
+  out.reserve(text.size() + 64);
+  std::string table;
+  std::unordered_set<std::string> seen;  // "[table] key"
+  size_t pos = 0;
+  while (pos < text.size()) {
+    const size_t newline = text.find('\n', pos);
+    const size_t next = newline == std::string_view::npos ? text.size() : newline + 1;
+    const std::string_view line = text.substr(pos, next - pos);
+    pos = next;
+    const size_t start = line.find_first_not_of(" \t");
+    if (start == std::string_view::npos || line[start] == '#') {
+      out += line;
+      continue;
+    }
+    if (line[start] == '[') {
+      const size_t close = line.find(']', start);
+      table = std::string(line.substr(start, close == std::string_view::npos ? line.size() - start
+                                                                            : close + 1 - start));
+      // An array of tables ([[name]]) starts a new entry each time: its keys may come again.
+      if (line.substr(start, 2) == "[[") {
+        std::erase_if(seen, [&](const std::string& key) { return key.starts_with(table + " "); });
+      }
+      out += line;
+      continue;
+    }
+    const size_t eq = line.find('=', start);
+    if (eq != std::string_view::npos) {
+      std::string key(line.substr(start, eq - start));
+      key.erase(key.find_last_not_of(" \t") + 1);
+      if (!key.empty() && !seen.insert(table + " " + key).second) {
+        if (repeated) repeated->push_back(table + " " + key);
+        out += "# ";
+      }
+    }
+    out += line;
+  }
+  return out;
+}
+
+std::string TakeConfigProblem() {
+  std::lock_guard lock(g_config_problem_mutex);
+  return std::exchange(g_config_problem, {});
+}
+
 void LoadConfig(const std::filesystem::path& config_path) {
   if (!std::filesystem::exists(config_path)) {
     REXLOG_DEBUG("Config file not found: {}", config_path.string());
@@ -693,6 +747,33 @@ void LoadConfig(const std::filesystem::path& config_path) {
     ApplyTomlTable(config);
     REXLOG_DEBUG("Loaded config from {}", config_path.string());
   } catch (const toml::parse_error& err) {
+    // A key set twice in one table (the settings examples of some games had skip_intro twice)
+    // makes the whole file invalid, and every setting in it would be lost. Read it again with each
+    // repeat commented out; the file itself is left as it is.
+    std::ifstream in(config_path, std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::vector<std::string> repeated;
+    const std::string cleaned = CommentOutRepeatedKeys(text, &repeated);
+    if (!repeated.empty()) {
+      try {
+        auto config = toml::parse(cleaned, config_path.string());
+        ApplyTomlTable(config);
+        std::string keys;
+        for (const std::string& key : repeated) keys += (keys.empty() ? "" : ", ") + key;
+        std::lock_guard lock(g_config_problem_mutex);
+        g_config_problem = "Config " + config_path.string() + " sets " + keys +
+                           " more than once; the first one counts (delete the later lines)";
+        fprintf(stderr, "cvar: %s\n", g_config_problem.c_str());
+        return;
+      } catch (const toml::parse_error&) {
+        // Something else is wrong with it too: report the first error below.
+      }
+    }
+    {
+      std::lock_guard lock(g_config_problem_mutex);
+      g_config_problem = "Failed to parse config " + config_path.string() + ": " +
+                         std::string(err.description());
+    }
     // This runs before InitLogging sets up the log file sink (config loads first so log cvars
     // have final values -- see the caller), so REXLOG_ERROR alone would be invisible here; also
     // print to stderr, matching the CLI11 parse-error workaround below.
