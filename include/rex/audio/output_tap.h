@@ -9,8 +9,11 @@ namespace rex::audio {
 
 // Called on the audio thread with each block: `frames` frames of `channels` interleaved float
 // samples (2 or 6, as the device plays them) at 48 kHz, with the output gain applied. It also sees
-// the sound while audio_mute silences the device. Keep it short; it must not block.
-using OutputTap = void (*)(const float* samples, uint32_t frames, uint32_t channels, void* user);
+// the sound while audio_mute silences the device. Each of the game's audio clients has its own
+// stream (`source`, one per client: a game may play music and effects on two), which the PC mixes;
+// a recording sums them. Keep it short; it must not block.
+using OutputTap = void (*)(const void* source, const float* samples, uint32_t frames, uint32_t channels,
+                           void* user);
 
 // Sets the tap (nullptr removes it).
 void SetOutputTap(OutputTap tap, void* user);
