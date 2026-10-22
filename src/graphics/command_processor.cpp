@@ -12,8 +12,12 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <string_view>
+#include <unordered_set>
 
 #include <fmt/format.h>
 
@@ -57,6 +61,24 @@ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
 REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
                     "When draw resolution scaling is active, sample from the center of each "
                     "scaled block during resolve readback downscale")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_UINT32(readback_resolve_max_size, 0, "GPU",
+                      "With readback_resolve on: only resolves of up to this many bytes are read "
+                      "back to the CPU (0 = all). A game that reads one small render-to-texture "
+                      "result on the CPU needs only that one; the large ones cost the most")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(readback_resolve_addresses, "", "GPU",
+                      "With readback_resolve on: only resolves to these guest physical addresses "
+                      "(hex, comma separated) are read back (empty = all), for a game that reads "
+                      "one known render-to-texture result on the CPU; readback_resolve_log names "
+                      "the addresses")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(readback_resolve_log, false, "GPU",
+                    "Log each resolve destination (address, size, format) the resolve readback "
+                    "sees, once, to find the one a game reads")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(readback_memexport, true, "GPU",
@@ -179,6 +201,33 @@ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
   }
   return legacy_readback_resolve_enabled ? ReadbackResolveMode::kFast
                                          : ReadbackResolveMode::kDisabled;
+}
+
+bool CommandProcessor::IsResolveReadbackWanted(uint32_t written_address, uint32_t written_length) {
+  if (REXCVAR_GET(readback_resolve_log)) {
+    static std::mutex logged_mutex;
+    static std::unordered_set<uint64_t> logged;
+    std::lock_guard lock(logged_mutex);
+    if (logged.insert((uint64_t(written_address) << 32) | written_length).second) {
+      const auto info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
+      REXGPU_INFO("Resolve readback: address {:#010x}, {} bytes, format {}", written_address,
+                  written_length, uint32_t(info.copy_dest_format));
+    }
+  }
+  if (const uint32_t max_size = REXCVAR_GET(readback_resolve_max_size);
+      max_size && written_length > max_size) {
+    return false;
+  }
+  const std::string& list = REXCVAR_GET(readback_resolve_addresses);
+  if (list.empty()) return true;
+  for (size_t start = 0; start < list.size();) {
+    size_t end = list.find(',', start);
+    if (end == std::string::npos) end = list.size();
+    const std::string one = list.substr(start, end - start);
+    if (!one.empty() && std::strtoul(one.c_str(), nullptr, 16) == written_address) return true;
+    start = end + 1;
+  }
+  return false;
 }
 
 bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
