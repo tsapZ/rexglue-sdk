@@ -13,9 +13,15 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
+
+// The signed-in player's name, the Xbox gamertag games show (e.g. a launcher's profile name);
+// up to 15 characters, as on the console.
+REXCVAR_DEFINE_STRING(user_name, "User", "User",
+                      "The player's name the game shows (the Xbox gamertag, up to 15 characters)");
 
 namespace rex {
 namespace system {
@@ -26,7 +32,8 @@ UserProfile::UserProfile() {
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
   xuid_ = 0xB13EBABEBABEBABE;
-  name_ = "User";
+  name_ = REXCVAR_GET(user_name);
+  if (name_.empty()) name_ = "User";
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py
