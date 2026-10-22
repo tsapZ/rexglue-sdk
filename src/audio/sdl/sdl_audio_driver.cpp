@@ -227,7 +227,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
             break;
         }
         if (tap) {
-          tap(data, channel_samples_, driver->sdl_device_channels_, g_tap_user.load());
+          tap(driver, data, channel_samples_, driver->sdl_device_channels_, g_tap_user.load());
           if (REXCVAR_GET(audio_mute)) std::memset(data, 0, len);
         }
       }
