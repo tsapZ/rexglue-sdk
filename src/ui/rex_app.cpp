@@ -179,6 +179,11 @@ bool ReXApp::SetupEnvironment() {
 
   OnPostInitLogging();
 
+  // LoadConfig ran before the log file existed: what it found wrong with the file goes in now.
+  if (const std::string problem = rex::cvar::TakeConfigProblem(); !problem.empty()) {
+    REXLOG_WARN("{}", problem);
+  }
+
   if (std::filesystem::exists(config_path_))
     REXLOG_DEBUG("Loaded config: {}", config_path_.filename().string());
 

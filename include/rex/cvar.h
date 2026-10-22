@@ -121,6 +121,13 @@ namespace rex::cvar {
 
 std::vector<std::string> Init(int argc, char** argv);
 void LoadConfig(const std::filesystem::path& config_path);
+// The text of a TOML file with every key that a table sets a second time commented out (the first
+// one stays, as the settings menu writes the first). Such a file isn't valid TOML, and loading it
+// would lose every setting in it; `repeated` gets the "[table] key" of each line commented out.
+std::string CommentOutRepeatedKeys(std::string_view text, std::vector<std::string>* repeated = nullptr);
+// What LoadConfig had to say about the file (it runs before the log file exists), once; empty if
+// the file loaded as it is.
+std::string TakeConfigProblem();
 void ApplyEnvironment();
 void FinalizeInit();
 bool IsFinalized();

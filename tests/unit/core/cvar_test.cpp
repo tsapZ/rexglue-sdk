@@ -193,6 +193,38 @@ TEST_CASE("cvar TOML config loading", "[cvar]") {
     rex::cvar::LoadConfig(missing);
   }
 
+  SECTION("A key set twice in a table still loads, the first one counting") {
+    std::ofstream file(config_path);
+    file << "[\"Test\"]\n";
+    file << "test_int32_flag = 7\n";
+    file << "test_string_flag = \"first\"\n";
+    file << "test_int32_flag = 8   # the repeat\n";
+    file.close();
+
+    REXCVAR_SET(test_int32_flag, 0);
+    REXCVAR_SET(test_string_flag, "");
+    (void)rex::cvar::TakeConfigProblem();
+
+    rex::cvar::LoadConfig(config_path);
+
+    CHECK(REXCVAR_GET(test_int32_flag) == 7);
+    CHECK(REXCVAR_GET(test_string_flag) == "first");
+    CHECK(rex::cvar::TakeConfigProblem().find("test_int32_flag") != std::string::npos);
+    CHECK(rex::cvar::TakeConfigProblem().empty());
+
+    std::filesystem::remove(config_path);
+  }
+
+  SECTION("CommentOutRepeatedKeys keeps keys of other tables and arrays of tables") {
+    std::vector<std::string> repeated;
+    const std::string text =
+        "a = 1\n[\"X\"]\na = 2\nb = 3\nb = 4\n[[h]]\nn = 1\n[[h]]\nn = 2\n";
+    const std::string out = rex::cvar::CommentOutRepeatedKeys(text, &repeated);
+    CHECK(out == "a = 1\n[\"X\"]\na = 2\nb = 3\n# b = 4\n[[h]]\nn = 1\n[[h]]\nn = 2\n");
+    REQUIRE(repeated.size() == 1);
+    CHECK(repeated[0] == "[\"X\"] b");
+  }
+
   SECTION("A [table] header is cosmetic, not a name prefix") {
     std::ofstream file(config_path);
     file << "[\"Some Header\"]\n";
