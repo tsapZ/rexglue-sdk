@@ -2929,6 +2929,11 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   if (!written_length) {
     return true;
   }
+  // Only the resolves the settings ask for (readback_resolve_max_size / _addresses): the
+  // full-screen ones are the costly copies, and a game usually reads one known result.
+  if (!IsResolveReadbackWanted(written_address, written_length)) {
+    return true;
+  }
 
   if (!memory_->TranslatePhysical(written_address)) {
     return true;
