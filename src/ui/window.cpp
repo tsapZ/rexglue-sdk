@@ -36,6 +36,12 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
 // in sync whenever this cvar is changed at runtime.
 REXCVAR_DEFINE_BOOL(fullscreen, true, "UI/Window", "Start the window in fullscreen mode");
 
+// For runs that only write files and quit (a launcher's export of a game's pictures or music):
+// the window is made but never shown, so nothing pops up while it runs.
+REXCVAR_DEFINE_BOOL(window_hidden, false, "UI/Window",
+                    "Never show the window (for runs that only write files, e.g. a launcher's export)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                      "Monitor index to display on (0 = default, 1 = primary, 2 = "
                      "second monitor, etc.)")

@@ -183,7 +183,8 @@ bool WindowSDL::OpenImpl() {
   // desired state so a reopened window comes back with the state it had.
   ApplyTextInputActiveNow();
   ApplyCursorVisibilityNow();
-  SDL_ShowWindow(sdl_window_);
+  // Made hidden (SDL_WINDOW_HIDDEN); window_hidden keeps it so.
+  if (!REXCVAR_GET(window_hidden)) SDL_ShowWindow(sdl_window_);
 
   // Actualize state for the common Window code. Listener dispatch is handled
   // by Window::Open after OpenImpl returns; these only record initial state.
