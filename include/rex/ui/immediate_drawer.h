@@ -120,10 +120,13 @@ class ImmediateDrawer {
   // Ends drawing in immediate mode and flushes contents.
   virtual void End();
 
+  // The presenter it draws on (null between presenters): public for code that only gets the
+  // drawer, e.g. to capture the guest output (Presenter::CaptureGuestOutput) for a screenshot.
+  Presenter* presenter() const { return presenter_; }
+
  protected:
   ImmediateDrawer() = default;
 
-  Presenter* presenter() const { return presenter_; }
   virtual void OnLeavePresenter() {}
   virtual void OnEnterPresenter() {}
 
