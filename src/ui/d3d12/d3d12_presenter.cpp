@@ -45,6 +45,19 @@ REXCVAR_DEFINE_INT32(frame_rate_limit, 0, "Graphics",
     .range(0, 1000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// A game whose frame waits for the next vblank after its swap (presentation interval 1) drops to
+// half the rate as soon as a frame takes longer than one vblank: at frame_rate_limit 60 a 19 ms
+// frame waits for the second 60 Hz vblank, so it runs at 30 (Spyro's Adventure, 2026-10-24). A
+// faster guest vblank lets such a frame go at the next one while ThrottleGuestTickRate
+// (xboxkrnl_video.cpp) still caps the rate at frame_rate_limit. Only for games that pace by real
+// time, not by counting vblanks: those would run faster. Used by the vsync worker
+// (graphics_system.cpp), defined here with frame_rate_limit so a game can set it before the GPU
+// plugin is loaded. 0: the vblank at the video mode's rate or frame_rate_limit, whichever is higher.
+REXCVAR_DEFINE_DOUBLE(guest_vblank_rate, 0.0, "GPU",
+                      "Guest vblank rate in Hz (0 = the video mode's or frame_rate_limit); higher "
+                      "only for games that keep their speed with it")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::ui::d3d12 {
 
 // Generated with `xb buildshaders`.
