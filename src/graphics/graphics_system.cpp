@@ -41,6 +41,8 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
 
 REXCVAR_DECLARE(int32_t, frame_rate_limit);
 
+REXCVAR_DECLARE(double, guest_vblank_rate);  // d3d12_presenter.cpp
+
 namespace {
 
 rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
@@ -175,6 +177,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         if (frame_rate_limit_value > 0) {
           refresh_rate_hz = std::max(refresh_rate_hz, double(frame_rate_limit_value));
         }
+        // guest_vblank_rate (above): a faster vblank for a game that paces by real time.
+        refresh_rate_hz = std::max(refresh_rate_hz, std::min(REXCVAR_GET(guest_vblank_rate), 1000.0));
         uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
         uint64_t vsync_interval_ticks =
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
