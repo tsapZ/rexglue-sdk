@@ -648,19 +648,31 @@ std::vector<std::string> Init(int argc, char** argv) {
     }
   }
 
+  // One bad option made CLI11 throw, and then it applied none of the command line: "--scene_size="
+  // (nothing after "=") dropped --user_data_root too, and a game ran on its default data folder
+  // (2026-10-25). On a parse error every argument goes through the loop below instead, which
+  // applies the registered cvars at once and stashes the rest, as for unrecognized options.
+  bool parsed = true;
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
     // TODO(tomc): dumb workaround for the stupid chicken and its egg.
     //             dont call rex logging funcs here for now.
-    fprintf(stderr, "cvar: CLI11  parse error: %s\n", e.what());
+    fprintf(stderr, "cvar: CLI11  parse error: %s; taking each option on its own\n", e.what());
+    parsed = false;
+  }
+  std::vector<std::string> args;
+  if (parsed) {
+    args = app.remaining();
+  } else {
+    for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
   }
 
   // Stash unrecognized --options for cvars that register later. Supported
   // forms: --name=value, --name (true), --no-name (false); a separated
   // "--name value" pair is ambiguous with a positional, so never consumed.
   std::vector<std::string> positional;
-  for (const auto& arg : app.remaining()) {
+  for (const auto& arg : args) {
     std::string_view view(arg);
     if (!view.starts_with("--")) {
       positional.push_back(arg);
@@ -679,6 +691,13 @@ std::vector<std::string> Init(int argc, char** argv) {
       name.assign(view);
     }
     std::lock_guard lock(GetRegistryMutex());
+    if (!parsed) {
+      auto it = GetRegistryIndex().find(name);
+      if (it != GetRegistryIndex().end()) {
+        ApplyFromSource(GetRegistryStorage()[it->second], value, Source::kCommandLine);
+        continue;
+      }
+    }
     GetPendingValuesStorage()[name].cmdline = std::move(value);
   }
   g_init_done = true;
