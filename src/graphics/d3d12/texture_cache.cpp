@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <cfloat>
 #include <cstddef>
@@ -2437,8 +2438,17 @@ bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
   const auto& index = ReplacementIndex();
   const auto it = index.find(hash);
   if (it == index.end()) return false;
-  std::ifstream in(it->second, std::ios::binary);
-  std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  const auto load_start = std::chrono::steady_clock::now();
+  // One read of the whole file: this runs on the GPU thread while the game waits, and reading it
+  // through stream iterators byte by byte made a figure change stutter with an HD pack (a 1024x1024
+  // DXT5 with mips is about 1.4 MB, and a new character brings dozens).
+  std::ifstream in(it->second, std::ios::binary | std::ios::ate);
+  const std::streamoff file_size = in ? std::streamoff(in.tellg()) : std::streamoff(0);
+  std::vector<uint8_t> file(file_size > 0 ? size_t(file_size) : 0);
+  if (!file.empty()) {
+    in.seekg(0);
+    if (!in.read(reinterpret_cast<char*>(file.data()), std::streamsize(file.size()))) file.clear();
+  }
   if (file.size() < 4 + sizeof(DdsHeader) || std::memcmp(file.data(), "DDS ", 4) != 0) return false;
   DdsHeader h;
   std::memcpy(&h, file.data() + 4, sizeof(h));
@@ -2518,10 +2528,16 @@ bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
   texture.SetReplacement(std::move(resource), D3D12_RESOURCE_STATE_COPY_DEST, std::move(upload),
                          mips);
   static std::atomic<uint32_t> replaced{0};
+  // The time the GPU thread spent on it (reading, the two resources, the copy), for the log.
+  static std::atomic<uint64_t> spent_us{0};
+  const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - load_start)
+                                   .count());
+  const uint64_t total_us = spent_us += us;
   const uint32_t count = ++replaced;
   if (count <= 20 || count % 100 == 0) {
-    REXGPU_INFO("Texture replacement: {} ({}x{} -> {}x{}, {} mips), {} so far", name, width, height,
-                h.width, h.height, mips, count);
+    REXGPU_INFO("Texture replacement: {} ({}x{} -> {}x{}, {} mips, {:.1f} ms), {} so far, {} ms in all", name,
+                width, height, h.width, h.height, mips, double(us) / 1000.0, count, total_us / 1000);
   }
   return true;
 }
