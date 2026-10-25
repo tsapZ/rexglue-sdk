@@ -28,6 +28,7 @@
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
+#include <rex/system/frame_gate.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/runtime.h>
@@ -580,6 +581,10 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   assert(texture_format_ptr);
   assert(width);
   assert(height);
+
+  // A menu holding the game still (frame_gate.h): the render thread waits here, before it hands
+  // over the frame, holding nothing else.
+  rex::system::WaitWhileGuestFramesHeld();
 
   namespace xenos = rex::graphics::xenos;
 
