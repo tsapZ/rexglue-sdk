@@ -1688,7 +1688,9 @@ void Presenter::DXGIUITickThread() {
     {
       Microsoft::WRL::ComPtr<IDXGIOutput> dxgi_output = dxgi_ui_tick_output_;
       dxgi_ui_tick_lock.unlock();
-      wait_succeeded = SUCCEEDED(dxgi_ui_tick_output_->WaitForVBlank());
+      // The copy, not the member: another thread may Reset() the member while the mutex is
+      // unlocked (the window moving to another output at start-up), and this read null then.
+      wait_succeeded = SUCCEEDED(dxgi_output->WaitForVBlank());
     }
     dxgi_ui_tick_lock.lock();
     if (wait_succeeded) {
