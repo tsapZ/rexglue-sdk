@@ -309,6 +309,14 @@ class XmaContext {
   bool carry_valid_ = false;
   uint8_t pending_output_limit_ = 0;
   uint8_t pending_start_skip_ = 0;
+
+  // The last frame of the input has been decoded, with nothing queued after it. The hardware has
+  // written a frame's output by the time it marks the frame's input used up; this decoder still
+  // holds that frame in the carry and may be writing the one before it. A game that ends a voice
+  // once its input is used up and its output read lost those 1024 samples (Skylanders: Trap Team's
+  // portal speaker cut off the end of every line, TrapTeamRecomp #15). So the input buffer stays
+  // valid until all of its output is out; input queued meanwhile simply continues the stream.
+  bool input_end_pending_ = false;
 };
 
 }  // namespace rex::audio

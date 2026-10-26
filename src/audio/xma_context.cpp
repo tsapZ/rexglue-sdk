@@ -207,6 +207,7 @@ void XmaContext::ResetDecoderState() {
   decoded_frame_.fill(0);
   carry_frame_.fill(0);
   carry_valid_ = false;
+  input_end_pending_ = false;
   pending_output_limit_ = 0;
   pending_start_skip_ = 0;
   current_frame_remaining_subframes_ = 0;
@@ -535,6 +536,34 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     return;
   }
 
+  // The current buffer's frames are all decoded, but it stays valid until their output is out
+  // (see input_end_pending_).
+  if (input_end_pending_) {
+    if (!data->IsCurrentInputBufferValid()) {
+      // The game took the buffer back itself.
+      input_end_pending_ = false;
+    } else if (data->IsInputBufferValid(data->current_buffer ^ 1)) {
+      // More input came in meanwhile: the stream goes on from there, as below.
+      input_end_pending_ = false;
+      SwapInputBuffer(data);
+      const uint32_t first_frame_offset =
+          xma::GetPacketFrameOffset(memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()));
+      if (first_frame_offset > kMaxFrameSizeinBits) {
+        SwapInputBuffer(data);
+        return;
+      }
+      data->input_buffer_read_offset = first_frame_offset;
+    } else if (carry_valid_) {
+      FlushCarry(data);
+      return;
+    } else {
+      // All of it is out: now the input counts as used up.
+      input_end_pending_ = false;
+      SwapInputBuffer(data);
+      return;
+    }
+  }
+
   if (!data->IsAnyInputBufferValid()) {
     // The stream ran out: its last frame is still in the carry.
     FlushCarry(data);
@@ -596,6 +625,10 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     uint32_t next_input_offset =
         GetNextPacketReadOffset(current_input_buffer, packet_index + 1, current_input_packet_count);
     if (next_input_offset == kBitsPerPacketHeader) {
+      if (!data->IsInputBufferValid(data->current_buffer ^ 1)) {
+        input_end_pending_ = true;
+        return;
+      }
       SwapInputBuffer(data);
     }
     data->input_buffer_read_offset = next_input_offset;
@@ -731,6 +764,11 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       GetNextPacketReadOffset(current_input_buffer, next_packet_index, current_input_packet_count);
 
   if (next_input_offset == kBitsPerPacketHeader) {
+    if (!data->IsInputBufferValid(data->current_buffer ^ 1)) {
+      // The input ends here, for now (see input_end_pending_).
+      input_end_pending_ = true;
+      return;
+    }
     SwapInputBuffer(data);
     if (data->IsAnyInputBufferValid()) {
       next_input_offset = xma::GetPacketFrameOffset(
