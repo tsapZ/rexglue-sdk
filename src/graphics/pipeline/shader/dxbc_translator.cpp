@@ -28,6 +28,14 @@ REXCVAR_DEFINE_BOOL(dxbc_switch, true, "GPU/Shader", "Use switch statements in D
 
 REXCVAR_DEFINE_BOOL(dxbc_source_map, false, "GPU/Shader", "Generate source maps for DXBC");
 
+// Off by default: a pass that reads a texture 1:1 at the pixel position itself, without the D3D9
+// half texel, wants the corner (Xenia's way). A game whose passes add the half texel turns it on
+// (SSARecomp does, in OnPostSetup).
+REXCVAR_DEFINE_BOOL(draw_resolution_scaled_pixel_position_centered, false, "GPU/Shader",
+                    "With resolution scaling, the pixel position a shader reads is each host "
+                    "pixel's centre in guest pixels, for passes that add the D3D9 half texel "
+                    "(false: its corner)");
+
 namespace rex::graphics {
 using namespace ucode;
 
@@ -664,9 +672,28 @@ void DxbcShaderTranslator::StartPixelShader() {
       // Revert resolution scale - after truncating, so if the pixel position
       // is passed to tfetch (assuming the game doesn't round it by itself),
       // it will be sampled with higher resolution too.
-      a_.OpMul(dxbc::Dest::R(param_gen_temp, resolution_scaled_axes), dxbc::Src::R(param_gen_temp),
-               dxbc::Src::LF(1.0f / draw_resolution_scale_x_, 1.0f / draw_resolution_scale_y_, 1.0f,
-                             1.0f));
+      if (REXCVAR_GET(draw_resolution_scaled_pixel_position_centered)) {
+        // Each host pixel's centre in guest pixels, (i + 0.5) / scale - 0.5, so the host pixels of a
+        // guest pixel average to its position. Its corner, i / scale, lay a quarter guest pixel
+        // right of and below the centre at scale 2 (a third at 3): a pass that turns the position
+        // into a texture coordinate the D3D9 way, (position + 0.5) / size, then read every texel one
+        // host pixel off (1.5 at scale 3). Spyro's Adventure's depth-of-field composite did that:
+        // the whole picture came out a pixel up-left, its depth a texel apart from its colour, and
+        // close objects got a ghost outline against the blurred background (SSARecomp #40).
+        a_.OpMAd(dxbc::Dest::R(param_gen_temp, resolution_scaled_axes), dxbc::Src::R(param_gen_temp),
+                 dxbc::Src::LF(1.0f / draw_resolution_scale_x_, 1.0f / draw_resolution_scale_y_, 1.0f,
+                               1.0f),
+                 dxbc::Src::LF(0.5f / draw_resolution_scale_x_ - 0.5f,
+                               0.5f / draw_resolution_scale_y_ - 0.5f, 0.0f, 0.0f));
+        // The first host pixel of a row or column lands a little below 0; the sign bits carry the
+        // flags below, so it's 0.
+        a_.OpMax(dxbc::Dest::R(param_gen_temp, resolution_scaled_axes), dxbc::Src::R(param_gen_temp),
+                 dxbc::Src::LF(0.0f));
+      } else {
+        a_.OpMul(dxbc::Dest::R(param_gen_temp, resolution_scaled_axes), dxbc::Src::R(param_gen_temp),
+                 dxbc::Src::LF(1.0f / draw_resolution_scale_x_, 1.0f / draw_resolution_scale_y_, 1.0f,
+                               1.0f));
+      }
     }
     if (shader_modification.pixel.param_gen_point) {
       // A point - always front-facing (the upper bit of X is 0), not a line
