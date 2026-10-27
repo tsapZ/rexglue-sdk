@@ -59,6 +59,8 @@ class SDLWindowedAppContext final : public WindowedAppContext {
   uint32_t paint_event_type_ = 0;
   uint32_t synchronously_handled_quit_events_ = 0;
   bool event_watch_registered_ = false;
+  // SDL's audio subsystem, started on this thread in Initialize (see there).
+  bool audio_subsystem_initialized_ = false;
 };
 
 }  // namespace rex::ui
