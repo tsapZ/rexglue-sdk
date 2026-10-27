@@ -247,25 +247,28 @@ void CommandProcessor::NoteResolvedRange(uint32_t address, uint32_t length,
     return;
   }
   const uint64_t frame = guest_frame_count_.load(std::memory_order_relaxed);
-  resolved_ranges_[address] = {length, bits_per_pixel, frame};
-  if (resolved_ranges_.size() > 256) {
-    for (auto it = resolved_ranges_.begin(); it != resolved_ranges_.end();) {
-      it = frame - it->second.frame > kResolvedRangeFrames ? resolved_ranges_.erase(it)
-                                                           : std::next(it);
-    }
+  // Older resolves that this one covers whole, or that are too old, are no use any more.
+  std::erase_if(resolved_ranges_, [&](const ResolvedRange& r) {
+    return (r.start >= address && r.start + r.length <= address + length) ||
+           frame - r.frame > kResolvedRangeFrames;
+  });
+  if (resolved_ranges_.size() >= 256) {
+    resolved_ranges_.erase(resolved_ranges_.begin());
   }
+  resolved_ranges_.push_back({address, length, bits_per_pixel, frame});
 }
 
 bool CommandProcessor::ReadBackNotedResolves(uint32_t address, uint32_t length) {
   const uint64_t frame = guest_frame_count_.load(std::memory_order_relaxed);
   bool any = false;
-  // Whole resolves, as resolved: the backends copy them the way the resolve laid them out.
-  for (const auto& [start, range] : resolved_ranges_) {
-    if (start >= address + length || start + range.length <= address ||
-        frame - range.frame > kResolvedRangeFrames) {
+  // Oldest first, each copied the way it was laid out and only its part inside the range: where
+  // resolves overlap, the newest one's bytes end up in guest memory, as on the console.
+  for (const ResolvedRange& r : resolved_ranges_) {
+    if (r.start >= address + length || r.start + r.length <= address ||
+        frame - r.frame > kResolvedRangeFrames) {
       continue;
     }
-    if (ReadBackResolvedRange(start, range.length, range.bits_per_pixel)) {
+    if (ReadBackResolvedRange(r.start, r.length, r.bits_per_pixel, address, address + length)) {
       any = true;
     }
   }
