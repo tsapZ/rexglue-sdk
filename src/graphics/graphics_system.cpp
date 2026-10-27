@@ -344,6 +344,10 @@ uint64_t GraphicsSystem::guest_frame_count() const {
   return command_processor_ ? command_processor_->guest_frame_count() : 0;
 }
 
+bool GraphicsSystem::ReadBackResolvedMemory(uint32_t physical_address, uint32_t length) {
+  return command_processor_ && command_processor_->ReadBackResolvedMemory(physical_address, length);
+}
+
 void GraphicsSystem::MarkVblank() {
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");

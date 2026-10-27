@@ -238,6 +238,97 @@ bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) cons
   return REXCVAR_GET(readback_memexport);
 }
 
+// How many guest frames a noted resolve counts as fresh for ReadBackResolvedMemory.
+constexpr uint64_t kResolvedRangeFrames = 120;
+
+void CommandProcessor::NoteResolvedRange(uint32_t address, uint32_t length,
+                                         uint32_t bits_per_pixel) {
+  if (!length) {
+    return;
+  }
+  const uint64_t frame = guest_frame_count_.load(std::memory_order_relaxed);
+  resolved_ranges_[address] = {length, bits_per_pixel, frame};
+  if (resolved_ranges_.size() > 256) {
+    for (auto it = resolved_ranges_.begin(); it != resolved_ranges_.end();) {
+      it = frame - it->second.frame > kResolvedRangeFrames ? resolved_ranges_.erase(it)
+                                                           : std::next(it);
+    }
+  }
+}
+
+bool CommandProcessor::ReadBackNotedResolves(uint32_t address, uint32_t length) {
+  const uint64_t frame = guest_frame_count_.load(std::memory_order_relaxed);
+  bool any = false;
+  // Whole resolves, as resolved: the backends copy them the way the resolve laid them out.
+  for (const auto& [start, range] : resolved_ranges_) {
+    if (start >= address + length || start + range.length <= address ||
+        frame - range.frame > kResolvedRangeFrames) {
+      continue;
+    }
+    if (ReadBackResolvedRange(start, range.length, range.bits_per_pixel)) {
+      any = true;
+    }
+  }
+  return any;
+}
+
+bool CommandProcessor::ReadBackResolvedMemory(uint32_t physical_address, uint32_t length,
+                                              uint32_t timeout_ms) {
+  if (!length || !worker_running_) {
+    return false;
+  }
+  if (system::XThread::IsInThread(worker_thread_.get())) {
+    return ReadBackNotedResolves(physical_address, length);
+  }
+  std::unique_lock<std::mutex> lock(readback_request_mutex_);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  // One request at a time.
+  if (!readback_request_cv_.wait_until(lock, deadline, [this] { return !readback_request_; })) {
+    return false;
+  }
+  ReadBackRequest request;
+  request.address = physical_address;
+  request.length = length;
+  readback_request_ = &request;
+  readback_request_pending_.store(true, std::memory_order_release);
+  write_ptr_index_event_->Set();
+  if (!readback_request_cv_.wait_until(lock, deadline, [&request] { return request.taken; })) {
+    // Not picked up in time (the command processor is busy, or waits for this very thread):
+    // give up rather than hang; the caller reads what the CPU has.
+    readback_request_ = nullptr;
+    readback_request_pending_.store(false, std::memory_order_release);
+    readback_request_cv_.notify_all();
+    REXGPU_WARN("Resolve read back of {:#010x} ({} bytes) not served within {} ms",
+                physical_address, length, timeout_ms);
+    return false;
+  }
+  // Taken: the copy itself is short, and the request lives on this stack until it is done.
+  readback_request_cv_.wait(lock, [&request] { return request.done; });
+  return request.result;
+}
+
+void CommandProcessor::ServeReadBackRequest() {
+  ReadBackRequest* request;
+  {
+    std::lock_guard<std::mutex> lock(readback_request_mutex_);
+    request = readback_request_;
+    readback_request_ = nullptr;
+    readback_request_pending_.store(false, std::memory_order_release);
+    if (!request) {
+      return;
+    }
+    request->taken = true;
+  }
+  readback_request_cv_.notify_all();
+  const bool result = ReadBackNotedResolves(request->address, request->length);
+  {
+    std::lock_guard<std::mutex> lock(readback_request_mutex_);
+    request->result = result;
+    request->done = true;
+  }
+  readback_request_cv_.notify_all();
+}
+
 void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect) {
   if (swap_post_effect_desired_ == swap_post_effect) {
     return;
@@ -257,6 +348,9 @@ void CommandProcessor::WorkerThreadMain() {
       auto fn = std::move(pending_fns_.front());
       pending_fns_.pop();
       fn();
+    }
+    if (HasReadBackRequest()) {
+      ServeReadBackRequest();
     }
 
     uint32_t write_ptr_index = write_ptr_index_.load();
@@ -278,10 +372,10 @@ void CommandProcessor::WorkerThreadMain() {
         rex::thread::MaybeYield();
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
-      } while (worker_running_ && pending_fns_.empty() &&
+      } while (worker_running_ && pending_fns_.empty() && !HasReadBackRequest() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty()) {
+      if (!worker_running_ || !pending_fns_.empty() || HasReadBackRequest()) {
         continue;
       }
     }
@@ -1103,6 +1197,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      // The value may be the CPU's to write after a read back it is waiting for.
+      if (HasReadBackRequest()) {
+        ServeReadBackRequest();
+      }
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();

@@ -12,8 +12,10 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -103,6 +105,15 @@ class CommandProcessor {
   virtual void Shutdown();
 
   void CallInThread(std::function<void()> fn);
+
+  // Copies what resolves of the last frames wrote into [physical_address, +length) back into
+  // guest memory and returns once it is there: for game code that reads a render-to-texture
+  // result on the CPU at a known point (a hook on that code calls this first), instead of
+  // reading back every resolve of every frame (readback_resolve). From a guest thread it waits
+  // for the command processor thread, at most timeout_ms for it to pick the request up. True if
+  // something was read back.
+  bool ReadBackResolvedMemory(uint32_t physical_address, uint32_t length,
+                              uint32_t timeout_ms = 1000);
 
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
@@ -242,6 +253,23 @@ class CommandProcessor {
   // Shared memexport readback enable state with backend legacy-flag override support.
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
 
+  // Backends note every resolve (its guest range and the bits per pixel of the copy), so
+  // ReadBackResolvedMemory knows which ranges hold GPU-written data.
+  void NoteResolvedRange(uint32_t address, uint32_t length, uint32_t bits_per_pixel);
+  // Command processor thread: copies one noted resolve back into guest memory, as it is in the
+  // GPU's memory now, and waits for that. Backends that can read back implement it.
+  virtual bool ReadBackResolvedRange(uint32_t address, uint32_t length, uint32_t bits_per_pixel) {
+    (void)address;
+    (void)length;
+    (void)bits_per_pixel;
+    return false;
+  }
+  // Command processor thread: serves a waiting ReadBackResolvedMemory request.
+  bool HasReadBackRequest() const {
+    return readback_request_pending_.load(std::memory_order_acquire);
+  }
+  void ServeReadBackRequest();
+
   memory::Memory* memory_ = nullptr;
   system::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;
@@ -293,6 +321,32 @@ class CommandProcessor {
   // Set by backend command processors to their legacy memexport readback cvar
   // name (for explicit-override compatibility).
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
+
+ private:
+  // Copies the noted resolves overlapping the range back (command processor thread).
+  bool ReadBackNotedResolves(uint32_t address, uint32_t length);
+
+  struct ResolvedRange {
+    uint32_t length;
+    uint32_t bits_per_pixel;
+    uint64_t frame;  // guest_frame_count_ at the resolve
+  };
+  // The resolves of the last frames by start address (command processor thread only).
+  std::map<uint32_t, ResolvedRange> resolved_ranges_;
+
+  // A ReadBackResolvedMemory call waiting for the command processor thread; lives on the
+  // caller's stack until done.
+  struct ReadBackRequest {
+    uint32_t address = 0;
+    uint32_t length = 0;
+    bool taken = false;
+    bool done = false;
+    bool result = false;
+  };
+  std::mutex readback_request_mutex_;
+  std::condition_variable readback_request_cv_;
+  ReadBackRequest* readback_request_ = nullptr;
+  std::atomic<bool> readback_request_pending_{false};
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};

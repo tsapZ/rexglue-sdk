@@ -130,6 +130,10 @@ class TextureCache {
            (binding->texture_signed && binding->texture_signed->key().scaled_resolve);
   }
 
+  // Checks if there are any pages that contain scaled resolve data within the
+  // range.
+  bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+
  protected:
   struct TextureKey {
     // Dimensions minus 1 are stored similarly to how they're stored in fetch
@@ -568,9 +572,6 @@ class TextureCache {
   static void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
                             void* context, void* data, uint64_t argument, bool invalidated_by_gpu);
 
-  // Checks if there are any pages that contain scaled resolve data within the
-  // range.
-  bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
   // Global shared memory invalidation callback for invalidating scaled resolved
   // texture data.
   static void ScaledResolveGlobalWatchCallbackThunk(

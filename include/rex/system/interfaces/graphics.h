@@ -62,6 +62,17 @@ class IGraphicsSystem {
   // it. Used for the debug overlay's guest FPS/frametime readout.
   virtual uint64_t guest_frame_count() const { return 0; }
 
+  // Copies what the GPU's resolves wrote to this guest physical range back into
+  // guest memory and returns once it is there, for game code that reads a
+  // render-to-texture result on the CPU at a known point (a hook on that code
+  // calls this first). False if nothing there was resolved lately or the
+  // backend can't read back.
+  virtual bool ReadBackResolvedMemory(uint32_t physical_address, uint32_t length) {
+    (void)physical_address;
+    (void)length;
+    return false;
+  }
+
   // Guest GPU services reached from the xboxkrnl Vd* exports.
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {
     (void)callback;

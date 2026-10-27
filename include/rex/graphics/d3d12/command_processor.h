@@ -366,6 +366,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
   bool IssueCopy_ReadbackResolvePath();
+  // Bits per pixel of the copy format of the resolve being issued (RB_COPY_DEST_INFO).
+  uint32_t ResolveCopyBitsPerPixel() const;
+  // Records the copy of a resolved guest range into `destination` (a readback buffer of at least
+  // `length` bytes), downscaled to 1x first when the resolution is scaled (the scaled range must
+  // be current then). False if it can't.
+  bool RecordResolveReadbackCopy(uint32_t address, uint32_t length, uint32_t bits_per_pixel,
+                                 ID3D12Resource* destination);
+  bool ReadBackResolvedRange(uint32_t address, uint32_t length, uint32_t bits_per_pixel) override;
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
@@ -615,6 +623,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> resolve_downscale_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12Resource> resolve_downscale_buffer_;
   uint32_t resolve_downscale_buffer_size_ = 0;
+  // For ReadBackResolvedRange (persistently mapped).
+  Microsoft::WRL::ComPtr<ID3D12Resource> requested_readback_buffer_;
+  uint32_t requested_readback_buffer_size_ = 0;
+  void* requested_readback_mapping_ = nullptr;
 
   // PWL gamma ramp can result in values with more precision than 10bpc. Though
   // those sub-10bpc bits don't have any noticeable visual effect, so normally
