@@ -668,7 +668,10 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
                                                       packet_info.current_frame_size_);
 
   if (bits_to_copy == 0) {
-    REXAPU_ERROR("XmaContext {}: There are no bits to copy!", id());
+    // A frame length of 0 here is the zero padding after a stream's last frame, and moving on to
+    // the next buffer is the handling. It comes in bursts, several contexts at once (Swap Force,
+    // SuperChargers): nothing to report.
+    REXAPU_DEBUG("XmaContext {}: There are no bits to copy!", id());
     SwapInputBuffer(data);
     return;
   }
