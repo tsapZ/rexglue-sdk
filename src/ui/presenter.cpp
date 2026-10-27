@@ -501,19 +501,29 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       // re-present the same guest frame, so each guest frame stays on screen for an uneven
       // number of host refreshes -- measured ~136 presents/s with 4-9ms gaps at a 60 cap, visible
       // as uneven frame pacing. Skipped paints re-request at the next UI tick, which is cheap.
+      // Once the guest has brought no frame for 100 ms (a stall, or the game held while a menu
+      // is open, rex/system/frame_gate.h), UI-only presents go on at the cap's rate: at one per
+      // 100 ms the menus' own animations stuttered (a portal overview at 10 FPS).
       const auto now = std::chrono::steady_clock::now();
       const uint64_t guest_output_refresh_count =
           guest_output_refresh_count_.load(std::memory_order_acquire);
       const bool new_guest_frame =
           guest_output_refresh_count != ui_thread_last_presented_guest_output_refresh_count_;
+      const int32_t frame_cap = REXCVAR_GET(frame_rate_limit);
+      const bool guest_refreshing =
+          now - ui_thread_last_guest_frame_present_time_ < std::chrono::milliseconds(100);
       const bool skip_ui_only_present =
-          REXCVAR_GET(frame_rate_limit) > 0 && draw_ui && !force_paint && !new_guest_frame &&
-          now - ui_thread_last_present_time_ < std::chrono::milliseconds(100);
+          frame_cap > 0 && draw_ui && !force_paint && !new_guest_frame &&
+          (guest_refreshing ||
+           now - ui_thread_last_present_time_ < std::chrono::microseconds(1000000 / frame_cap));
       if (skip_ui_only_present) {
         request_repaint_at_tick = true;
       } else {
         ui_thread_last_presented_guest_output_refresh_count_ = guest_output_refresh_count;
         ui_thread_last_present_time_ = now;
+        if (new_guest_frame) {
+          ui_thread_last_guest_frame_present_time_ = now;
+        }
         paint_result = PaintAndPresent(draw_ui);
       }
       if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {

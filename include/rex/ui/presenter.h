@@ -960,6 +960,8 @@ class Presenter {
   // UI thread only.
   uint64_t ui_thread_last_presented_guest_output_refresh_count_ = 0;
   std::chrono::steady_clock::time_point ui_thread_last_present_time_{};
+  // The last present that brought a new guest frame.
+  std::chrono::steady_clock::time_point ui_thread_last_guest_frame_present_time_{};
   // The "writable" image is different than both "acquired" and "ready" and is
   // accessible only by the guest output refreshing - it's the image that the
   // refresher may write to.
