@@ -15,7 +15,6 @@
 #include <condition_variable>
 #include <cstring>
 #include <functional>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -257,11 +256,16 @@ class CommandProcessor {
   // ReadBackResolvedMemory knows which ranges hold GPU-written data.
   void NoteResolvedRange(uint32_t address, uint32_t length, uint32_t bits_per_pixel);
   // Command processor thread: copies one noted resolve back into guest memory, as it is in the
-  // GPU's memory now, and waits for that. Backends that can read back implement it.
-  virtual bool ReadBackResolvedRange(uint32_t address, uint32_t length, uint32_t bits_per_pixel) {
+  // GPU's memory now, and waits for that; only its part inside [clip_start, clip_end), and with
+  // resolution scaling only the pages still holding the resolve (not written by the CPU since).
+  // Backends that can read back implement it.
+  virtual bool ReadBackResolvedRange(uint32_t address, uint32_t length, uint32_t bits_per_pixel,
+                                     uint32_t clip_start, uint32_t clip_end) {
     (void)address;
     (void)length;
     (void)bits_per_pixel;
+    (void)clip_start;
+    (void)clip_end;
     return false;
   }
   // Command processor thread: serves a waiting ReadBackResolvedMemory request.
@@ -327,12 +331,14 @@ class CommandProcessor {
   bool ReadBackNotedResolves(uint32_t address, uint32_t length);
 
   struct ResolvedRange {
+    uint32_t start;
     uint32_t length;
     uint32_t bits_per_pixel;
     uint64_t frame;  // guest_frame_count_ at the resolve
   };
-  // The resolves of the last frames by start address (command processor thread only).
-  std::map<uint32_t, ResolvedRange> resolved_ranges_;
+  // The resolves of the last frames, oldest first; one that a newer resolve covers whole is dropped
+  // (command processor thread only).
+  std::vector<ResolvedRange> resolved_ranges_;
 
   // A ReadBackResolvedMemory call waiting for the command processor thread; lives on the
   // caller's stack until done.

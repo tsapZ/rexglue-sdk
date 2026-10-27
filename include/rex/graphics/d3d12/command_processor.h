@@ -373,7 +373,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   // be current then). False if it can't.
   bool RecordResolveReadbackCopy(uint32_t address, uint32_t length, uint32_t bits_per_pixel,
                                  ID3D12Resource* destination);
-  bool ReadBackResolvedRange(uint32_t address, uint32_t length, uint32_t bits_per_pixel) override;
+  bool ReadBackResolvedRange(uint32_t address, uint32_t length, uint32_t bits_per_pixel,
+                             uint32_t clip_start, uint32_t clip_end) override;
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 

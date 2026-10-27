@@ -3163,7 +3163,8 @@ bool D3D12CommandProcessor::RecordResolveReadbackCopy(uint32_t address, uint32_t
 }
 
 bool D3D12CommandProcessor::ReadBackResolvedRange(uint32_t address, uint32_t length,
-                                                  uint32_t bits_per_pixel) {
+                                                  uint32_t bits_per_pixel, uint32_t clip_start,
+                                                  uint32_t clip_end) {
   uint8_t* guest = memory_->TranslatePhysical(address);
   if (!guest) {
     return false;
@@ -3199,8 +3200,11 @@ bool D3D12CommandProcessor::ReadBackResolvedRange(uint32_t address, uint32_t len
       return false;
     }
     if (requested_readback_buffer_) {
-      // Idle: every copy into it was awaited.
+      // Released once the GPU is past it: a copy into it may still be in a submission that
+      // failed to end.
       requested_readback_buffer_->Unmap(0, nullptr);
+      resources_for_deletion_.emplace_back(GetCurrentSubmission(),
+                                           requested_readback_buffer_.Detach());
     }
     requested_readback_buffer_ = buffer;
     requested_readback_mapping_ = mapping;
@@ -3213,8 +3217,22 @@ bool D3D12CommandProcessor::ReadBackResolvedRange(uint32_t address, uint32_t len
   if (!AwaitAllQueueOperationsCompletion()) {
     return false;
   }
-  std::memcpy(guest, requested_readback_mapping_, length);
-  return true;
+  // Page by page, only inside the clip range and, with scaling, only where the scaled copy is
+  // still the newest data (the CPU may have written some pages of the range since the resolve).
+  const uint32_t first = std::max(address, clip_start);
+  const uint32_t end = std::min(address + length, clip_end);
+  bool any = false;
+  for (uint32_t page = first; page < end;) {
+    const uint32_t next = std::min(end, (page & ~uint32_t(0xFFF)) + 0x1000);
+    if (!is_scaled || texture_cache_->IsRangeScaledResolved(page, next - page)) {
+      std::memcpy(guest + (page - address),
+                  static_cast<const uint8_t*>(requested_readback_mapping_) + (page - address),
+                  next - page);
+      any = true;
+    }
+    page = next;
+  }
+  return any;
 }
 
 void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
