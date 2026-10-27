@@ -32,6 +32,9 @@ SDLWindowedAppContext::~SDLWindowedAppContext() {
   // Execute leftover pending functions before the loop machinery goes away,
   // mirroring the shutdown contract documented in WindowedAppContext.
   ExecutePendingFunctionsFromUIThread();
+  if (audio_subsystem_initialized_) {
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+  }
   if (SDL_WasInit(SDL_INIT_VIDEO)) {
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
   }
@@ -56,6 +59,22 @@ bool SDLWindowedAppContext::Initialize() {
   }
   const char* video_driver_in_use = SDL_GetCurrentVideoDriver();
   REXLOG_INFO("SDL video driver: {}", video_driver_in_use ? video_driver_in_use : "unknown");
+  // The audio subsystem too, here on the UI thread, before the guest can start it. The SDL audio
+  // driver (audio/sdl/sdl_audio_driver.cpp) calls SDL_InitSubSystem(SDL_INIT_AUDIO) on the
+  // guest's audio thread, and the first such call creates SDL's audio lock while this thread may
+  // be in SDL_PumpEvents -> SDL_UpdateAudio. That locks the lock it reads first (none yet, so
+  // nothing) and unlocks the one it reads second (the new one), ReleaseSRWLockShared on a lock it
+  // doesn't hold: exception C0000264, seen once at start-up (TrapTeamRecomp, 2026-10-27). Started
+  // here, the driver's call only counts up and its SDL_QuitSubSystem never ends the subsystem while
+  // the loop runs. Not fatal: without it the driver tries itself and reports what failed. The
+  // hint and the name as the driver sets them before its own call (a sound server may read the
+  // name when the subsystem starts).
+  SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
+  SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
+  audio_subsystem_initialized_ = SDL_InitSubSystem(SDL_INIT_AUDIO);
+  if (!audio_subsystem_initialized_) {
+    REXLOG_WARN("SDL_InitSubSystem(SDL_INIT_AUDIO) on the UI thread failed: {}", SDL_GetError());
+  }
   uint32_t first = SDL_RegisterEvents(2);
   if (first == 0) {
     REXLOG_ERROR("SDL_RegisterEvents failed: {}", SDL_GetError());
