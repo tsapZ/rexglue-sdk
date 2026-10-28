@@ -10,6 +10,8 @@
  */
 
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -21,6 +23,11 @@
 #include <malloc.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(d3d12_gpu_validation, false, "UI/D3D12",
+                    "With d3d12_debug: also the debug layer's GPU-based validation (much slower; "
+                    "for test runs)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(d3d12_break_on_error, false, "UI/D3D12",
@@ -222,6 +229,16 @@ bool D3D12Provider::Initialize() {
     ID3D12Debug* debug_interface;
     if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&debug_interface)))) {
       debug_interface->EnableDebugLayer();
+      if (REXCVAR_GET(d3d12_gpu_validation)) {
+        ID3D12Debug1* debug1;
+        if (SUCCEEDED(debug_interface->QueryInterface(IID_PPV_ARGS(&debug1)))) {
+          debug1->SetEnableGPUBasedValidation(TRUE);
+          debug1->Release();
+          REXLOG_INFO("Direct3D 12 GPU-based validation enabled");
+        } else {
+          REXLOG_WARN("Direct3D 12 GPU-based validation is not available");
+        }
+      }
       debug_interface->Release();
     } else {
       REXLOG_WARN("Failed to enable the Direct3D 12 debug layer");
@@ -350,6 +367,29 @@ bool D3D12Provider::Initialize() {
     }
     if (REXCVAR_GET(d3d12_break_on_warning)) {
       d3d12_info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
+    }
+    // The debug layer's messages into the log as well (they go to a debugger only otherwise), the
+    // first three of each kind, so an unattended test run shows them (ID3D12InfoQueue1, Windows 11).
+    ID3D12InfoQueue1* d3d12_info_queue1;
+    if (SUCCEEDED(d3d12_info_queue->QueryInterface(IID_PPV_ARGS(&d3d12_info_queue1)))) {
+      DWORD cookie = 0;
+      d3d12_info_queue1->RegisterMessageCallback(
+          [](D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id,
+             LPCSTR description, void*) {
+            static std::mutex mutex;
+            static std::unordered_map<int, int> seen;
+            {
+              std::lock_guard<std::mutex> lock(mutex);
+              if (++seen[int(id)] > 3) return;
+            }
+            const char* level = severity <= D3D12_MESSAGE_SEVERITY_ERROR ? "error"
+                                : severity == D3D12_MESSAGE_SEVERITY_WARNING ? "warning"
+                                                                             : "message";
+            REXLOG_WARN("D3D12 debug layer {} {}: {}", level, int(id), description ? description : "");
+          },
+          D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie);
+      d3d12_info_queue1->Release();
+      REXLOG_INFO("Direct3D 12 debug layer messages go to the log");
     }
     d3d12_info_queue->Release();
   }
