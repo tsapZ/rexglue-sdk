@@ -208,6 +208,7 @@ void XmaContext::ResetDecoderState() {
   carry_frame_.fill(0);
   carry_valid_ = false;
   input_end_pending_ = false;
+  offset_past_end_logged_ = false;
   pending_output_limit_ = 0;
   pending_start_skip_ = 0;
   current_frame_remaining_subframes_ = 0;
@@ -600,6 +601,24 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   const uint32_t current_input_size = GetCurrentInputBufferSize(data);
   const uint32_t current_input_packet_count = current_input_size / kBytesPerPacket;
+
+  // A read offset past the end of the buffer: the buffer is used up, as the hardware takes it, so
+  // the stream goes on in the next one (or ends as at the end of its frames). Returning with nothing
+  // changed instead had the same call fail on every decode: the voice stuck, ~5,000 log lines a
+  // second (ImaginatorsRecomp #16, a level of Imaginators, offset 32799 in a 2-packet buffer).
+  if (data->input_buffer_read_offset >= (current_input_size << 3)) {
+    if (!offset_past_end_logged_) {
+      REXAPU_WARN("XmaContext {}: read offset {} past the end of its {}-packet input; taken as used up",
+                  id(), static_cast<uint32_t>(data->input_buffer_read_offset), current_input_packet_count);
+      offset_past_end_logged_ = true;
+    }
+    if (!data->IsInputBufferValid(data->current_buffer ^ 1)) {
+      input_end_pending_ = true;
+      return;
+    }
+    SwapInputBuffer(data);
+    return;
+  }
 
   const int16_t packet_index = GetPacketNumber(current_input_size, data->input_buffer_read_offset);
 

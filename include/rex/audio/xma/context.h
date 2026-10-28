@@ -317,6 +317,10 @@ class XmaContext {
   // portal speaker cut off the end of every line, TrapTeamRecomp #15). So the input buffer stays
   // valid until all of its output is out; input queued meanwhile simply continues the stream.
   bool input_end_pending_ = false;
+
+  // The read offset was past the end of the input buffer once already: logged once, not on every
+  // decode call (ImaginatorsRecomp #16: ~5,000 lines a second for one context).
+  bool offset_past_end_logged_ = false;
 };
 
 }  // namespace rex::audio
