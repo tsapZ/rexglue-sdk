@@ -10,6 +10,8 @@
  */
 
 #include <rex/filesystem/vfs.h>
+
+#include <atomic>
 #include <rex/logging.h>
 #include <rex/string.h>
 
@@ -21,6 +23,18 @@ REXCVAR_DEFINE_BOOL(allow_game_relative_writes, false, "Filesystem",
                     "generating test data to compare with original hardware.");
 
 namespace rex::filesystem {
+
+namespace {
+std::atomic<OpenObserver> g_open_observer{nullptr};
+}  // namespace
+
+void SetOpenObserver(OpenObserver observer) {
+  g_open_observer.store(observer);
+}
+
+void NotifyOpened(std::string_view path) {
+  if (const OpenObserver observer = g_open_observer.load()) observer(path);
+}
 
 VirtualFileSystem::VirtualFileSystem() {}
 

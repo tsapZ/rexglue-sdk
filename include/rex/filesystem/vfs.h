@@ -13,6 +13,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -25,6 +26,14 @@
 REXCVAR_DECLARE(bool, allow_game_relative_writes);
 
 namespace rex::filesystem {
+
+// Called after every file the guest opened (NtCreateFile and NtOpenFile that succeeded), with the
+// path as the guest asked for it ("game:\archives\Level_503.pak"): e.g. for an app that names the
+// level from the last level archive opened. One observer; set it before the guest runs. It runs on
+// the guest's thread that opened the file, so it has to be short and thread-safe.
+using OpenObserver = void (*)(std::string_view path);
+void SetOpenObserver(OpenObserver observer);
+void NotifyOpened(std::string_view path);
 
 class VirtualFileSystem {
  public:

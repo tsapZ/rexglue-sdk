@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <rex/filesystem/device.h>
+#include <rex/filesystem/vfs.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
@@ -172,6 +173,7 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
+    rex::filesystem::NotifyOpened(target_path);
   }
   return result;
 }
