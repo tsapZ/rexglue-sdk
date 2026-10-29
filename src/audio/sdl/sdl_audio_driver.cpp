@@ -278,7 +278,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     const uint64_t now = SDL_GetTicks();
     if (!driver->starved_minute_start_ms_) driver->starved_minute_start_ms_ = now;
     if (now - driver->starved_minute_start_ms_ >= 60000) {
-      if (driver->starved_callbacks_) {
+      // One or two at a loading screen are normal (seen on Windows: 1 of 6002), so from 10 on.
+      if (driver->starved_callbacks_ >= 10) {
         REXAPU_WARN("audio: {} of {} requests from the endpoint found too few frames queued and "
                     "played silence in the last minute ({} samples per request)",
                     driver->starved_callbacks_, driver->callbacks_, driver->device_sample_frames_);
