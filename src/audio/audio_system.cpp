@@ -44,6 +44,13 @@ namespace rex::audio {
 
 namespace {
 constexpr std::chrono::milliseconds kWorkerShutdownTimeout{500};
+
+// The frames a client may queue: the audio_maxqframes setting, or more if the output asks for more
+// at a time (AudioDriver::wanted_queued_frames), at most `cap` (kMaximumQueuedFrames).
+uint32_t QueuedFramesFor(uint32_t setting, const AudioDriver* driver, size_t cap) {
+  const uint32_t wanted = driver ? driver->wanted_queued_frames() : 0;
+  return std::min(static_cast<uint32_t>(cap), std::max(setting, wanted));
+}
 }  // namespace
 
 AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
@@ -56,8 +63,10 @@ AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
       static_cast<uint32_t>(kMaximumQueuedFrames),
       std::max(static_cast<uint32_t>(REXCVAR_GET(audio_maxqframes)), static_cast<uint32_t>(4)));
 
+  // Room for the most frames any output may want (QueuedFramesFor); each client starts with its own
+  // count.
   for (size_t i = 0; i < kMaximumClientCount; ++i) {
-    client_semaphores_[i] = rex::thread::Semaphore::Create(0, queued_frames_);
+    client_semaphores_[i] = rex::thread::Semaphore::Create(0, kMaximumQueuedFrames);
     assert_not_null(client_semaphores_[i]);
     wait_handles_[i] = client_semaphores_[i].get();
   }
@@ -238,8 +247,6 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
                queued_frames_);
 
   auto client_semaphore = client_semaphores_[index].get();
-  auto ret = client_semaphore->Release(queued_frames_, nullptr);
-  assert_true(ret);
 
   AudioDriver* driver;
   auto result = CreateDriver(index, client_semaphore, &driver);
@@ -247,6 +254,14 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
     return result;
   }
   assert_not_null(driver);
+
+  const uint32_t frames = QueuedFramesFor(queued_frames_, driver, kMaximumQueuedFrames);
+  if (frames != queued_frames_) {
+    REXAPU_INFO("audio: up to {} frames queued for this output (audio_maxqframes {})", frames,
+                queued_frames_);
+  }
+  auto ret = client_semaphore->Release(frames, nullptr);
+  assert_true(ret);
 
   uint32_t ptr = memory()->SystemHeapAlloc(0x4);
   memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
@@ -347,8 +362,6 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
     client.in_use = true;
 
     auto client_semaphore = client_semaphores_[id].get();
-    auto ret = client_semaphore->Release(queued_frames_, nullptr);
-    assert_true(ret);
 
     AudioDriver* driver = nullptr;
     auto status = CreateDriver(id, client_semaphore, &driver);
@@ -362,6 +375,8 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
 
     assert_not_null(driver);
     client.driver = driver;
+    auto ret = client_semaphore->Release(QueuedFramesFor(queued_frames_, driver, kMaximumQueuedFrames), nullptr);
+    assert_true(ret);
   }
 
   return true;

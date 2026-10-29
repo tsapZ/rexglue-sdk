@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 
 #include <rex/assert.h>
@@ -107,13 +108,29 @@ bool SDLAudioDriver::Initialize() {
     }
   }
 
+  // How much the endpoint asks for at a time. A large buffer (Wine's and PulseAudio's can be) asks
+  // for more than the default queue of guest frames holds, and the rest of every request plays as
+  // silence: choppy, slow-sounding audio. The queue is made to cover two requests.
+  {
+    SDL_AudioSpec device_spec = {};
+    int sample_frames = 0;
+    if (SDL_GetAudioDeviceFormat(sdl_device, &device_spec, &sample_frames) && sample_frames > 0) {
+      device_sample_frames_ = sample_frames;
+      const int freq = device_spec.freq > 0 ? device_spec.freq : static_cast<int>(frame_frequency_);
+      const double ours = double(sample_frames) * frame_frequency_ / freq;
+      wanted_queued_frames_ = static_cast<uint32_t>(std::ceil(2.0 * ours / channel_samples_)) + 1;
+    }
+  }
+
   // The endpoint layout decides which mix the callback runs, and it is the
   // first thing worth knowing when a report says the balance is wrong on one
   // speaker setup and right on another.
   const char* device_name = SDL_GetAudioDeviceName(sdl_device);
-  REXAPU_INFO("audio endpoint '{}': {} ch, {} Hz, format 0x{:04X}; submitting {} ch",
+  REXAPU_INFO("audio endpoint '{}': {} ch, {} Hz, format 0x{:04X}, {} samples per request; "
+              "submitting {} ch",
               device_name ? device_name : "?", obtained_spec.channels, obtained_spec.freq,
-              static_cast<uint32_t>(obtained_spec.format), static_cast<int>(sdl_device_channels_));
+              static_cast<uint32_t>(obtained_spec.format), device_sample_frames_,
+              static_cast<int>(sdl_device_channels_));
 
   if (!SDL_ResumeAudioDevice(sdl_device)) {
     REXAPU_ERROR("SDL_ResumeAudioDevice() failed: {}", SDL_GetError());
@@ -150,6 +167,10 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
     frames_queued_.push(output_frame);
     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
   }
+}
+
+uint32_t SDLAudioDriver::wanted_queued_frames() const {
+  return wanted_queued_frames_;
 }
 
 void SDLAudioDriver::Shutdown() {
@@ -192,10 +213,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
   const StereoFold fold = GetStereoFold();
   const SurroundMix mix = GetSurroundMix();
   const float gain = GetOutputGain();
+  bool starved = false;
   while (additional_amount > 0) {
     static uint32_t sdl_callback_count = 0;
     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
     if (driver->frames_queued_.empty()) {
+      starved = true;
       if (sdl_callback_count < 10) {
         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
         sdl_callback_count++;
@@ -207,6 +230,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
       }
       additional_amount -= len;
     } else {
+      driver->started_ = true;
       auto buffer = driver->frames_queued_.front();
       driver->frames_queued_.pop();
       const OutputTap tap = g_tap.load();
@@ -244,6 +268,26 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     }
   }
   SDL_stack_free(data);
+
+  // Once a minute, how often the guest's frames ran out (each such request had a gap of silence):
+  // a few at loading screens are normal, many mean the endpoint asks for more than is queued or
+  // the guest makes its frames slower than they play.
+  if (driver->started_) {
+    ++driver->callbacks_;
+    if (starved) ++driver->starved_callbacks_;
+    const uint64_t now = SDL_GetTicks();
+    if (!driver->starved_minute_start_ms_) driver->starved_minute_start_ms_ = now;
+    if (now - driver->starved_minute_start_ms_ >= 60000) {
+      if (driver->starved_callbacks_) {
+        REXAPU_WARN("audio: {} of {} requests from the endpoint found too few frames queued and "
+                    "played silence in the last minute ({} samples per request)",
+                    driver->starved_callbacks_, driver->callbacks_, driver->device_sample_frames_);
+      }
+      driver->starved_callbacks_ = 0;
+      driver->callbacks_ = 0;
+      driver->starved_minute_start_ms_ = now;
+    }
+  }
 }
 
 }  // namespace rex::audio::sdl

@@ -23,6 +23,11 @@ class AudioDriver {
 
   virtual void SubmitFrame(uint32_t samples_ptr) = 0;
 
+  // How many frames the guest should be allowed to queue ahead for this output, at least: an
+  // endpoint that asks for more samples at a time than the queue holds plays the rest as silence
+  // each time (0: no preference, the audio_maxqframes setting alone).
+  virtual uint32_t wanted_queued_frames() const { return 0; }
+
  protected:
   inline uint8_t* TranslatePhysical(uint32_t guest_address) const {
     return memory_->TranslatePhysical(guest_address);

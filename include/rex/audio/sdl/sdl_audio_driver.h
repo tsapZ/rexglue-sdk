@@ -29,6 +29,7 @@ class SDLAudioDriver : public AudioDriver {
 
   bool Initialize();
   void SubmitFrame(uint32_t frame_ptr) override;
+  uint32_t wanted_queued_frames() const override;
   void Shutdown();
 
  protected:
@@ -40,6 +41,16 @@ class SDLAudioDriver : public AudioDriver {
   SDL_AudioStream* sdl_stream_ = nullptr;
   bool sdl_initialized_ = false;
   uint8_t sdl_device_channels_ = 0;
+  // The endpoint's buffer in sample frames (what one callback asks for), 0 if SDL didn't say, and
+  // the frames to queue for it (wanted_queued_frames).
+  int device_sample_frames_ = 0;
+  uint32_t wanted_queued_frames_ = 0;
+  // Callbacks that found too few frames queued and played silence, counted per minute for the log
+  // (from the first frame on; only the callback's thread touches them).
+  bool started_ = false;
+  uint32_t starved_callbacks_ = 0;
+  uint32_t callbacks_ = 0;
+  uint64_t starved_minute_start_ms_ = 0;
 
   static const uint32_t frame_frequency_ = 48000;
   static const uint32_t frame_channels_ = 6;
