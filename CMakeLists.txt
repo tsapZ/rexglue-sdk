@@ -222,10 +222,18 @@ configure_file(
     @ONLY
 )
 
-# Output directories (multi-config appends /<Config>/ automatically)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+# Output directories (multi-config appends /<Config>/ automatically). Built as part of a project
+# (add_subdirectory), each of its build folders gets its own: in one shared folder, a build with
+# other flags left its libraries and DLLs there, and another build folder's ninja took them as up
+# to date and linked or staged them.
+if(PROJECT_IS_TOP_LEVEL)
+    set(REXGLUE_OUTPUT_DIR "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+else()
+    set(REXGLUE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/rexglue-out")
+endif()
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
 
 # Sanitizer support for debugging memory corruption and undefined behavior
 if(REXGLUE_ENABLE_SANITIZERS)
