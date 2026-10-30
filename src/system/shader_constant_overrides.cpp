@@ -25,6 +25,9 @@ struct Entry {
 std::shared_mutex g_mutex;
 std::unordered_map<uint64_t, Entry> g_callbacks;
 std::atomic<uint64_t> g_generation{1};
+// Whether any override is there (callbacks or debug ones): without, the per-draw questions need no
+// lock (set under the unique lock).
+std::atomic<bool> g_any{false};
 
 // Debug overrides, re-parsed when the setting string changes.
 std::string g_debug_text;
@@ -41,6 +44,7 @@ void RefreshDebugOverrides() {
   if (text == g_debug_text) return;
   g_debug_text = text;
   g_debug = std::move(parsed);
+  g_any.store(!g_callbacks.empty() || !g_debug.empty());
   g_generation.fetch_add(1);
 }
 
@@ -67,23 +71,31 @@ bool ParseFloat(std::string_view s, float& out) {
 void RegisterPixelConstantOverride(uint64_t ucode_hash, PixelConstantOverride fn, void* user) {
   std::unique_lock lock(g_mutex);
   g_callbacks[ucode_hash] = {fn, user};
+  g_any.store(true);
   g_generation.fetch_add(1);
 }
 
 void ClearPixelConstantOverrides() {
   std::unique_lock lock(g_mutex);
   g_callbacks.clear();
+  g_any.store(!g_debug.empty());
   g_generation.fetch_add(1);
 }
 
 void InvalidatePixelConstantOverrides() { g_generation.fetch_add(1); }
 
 uint64_t PixelConstantOverrideGeneration() {
-  RefreshDebugOverrides();
+  // Asked for every draw: the setting (a string copy and a lock) is read again only every 1024
+  // calls, a few frames (it cost about 3 % of the command processor thread in Spyro's Adventure).
+  static std::atomic<uint32_t> calls{0};
+  if ((calls.fetch_add(1, std::memory_order_relaxed) & 1023) == 0) {
+    RefreshDebugOverrides();
+  }
   return g_generation.load();
 }
 
 bool HasPixelConstantOverrides(uint64_t ucode_hash) {
+  if (!g_any.load()) return false;
   std::shared_lock lock(g_mutex);
   if (g_callbacks.count(ucode_hash)) return true;
   for (const auto& d : g_debug) {
