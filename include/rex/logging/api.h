@@ -15,6 +15,8 @@
 
 #include <filesystem>
 #include <span>
+#include <string>
+#include <string_view>
 
 #include <rex/cvar.h>
 
@@ -192,6 +194,16 @@ void RemoveSink(spdlog::sink_ptr sink);
  * @param sink      The sink to remove (matched by pointer identity).
  */
 void RemoveSink(LogCategoryId category, spdlog::sink_ptr sink);
+
+/**
+ * A log line with the player's data taken out, as every sink gets it: the user folder (USERPROFILE,
+ * HOME) becomes %USERPROFILE%, any other user's folder after \Users\ or /home/ <user>, and the
+ * user's and the machine's names <user> and <computer> (logs end up in public reports).
+ *
+ * @param line  The message.
+ * @return      The message without them.
+ */
+std::string RedactUserData(std::string_view line);
 
 /**
  * Replace the global console sink on every registered logger with `sink`.

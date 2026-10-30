@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -19,6 +20,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <spdlog/sinks/base_sink.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
@@ -61,6 +63,130 @@ REXCVAR_DEFINE_INT32(log_max_files, 20, "Log", "Max number of rotated log files 
 namespace rex {
 
 namespace {
+
+// --- The player's data out of every log line ---------------------------------------------------
+// Logs end up in public problem reports, so no line may carry the player's user folder, user name
+// or the machine's name (2026-10-30). Every sink gets the lines through RedactingSink.
+
+struct Redactions {
+  std::string profile;  // the user folder, e.g. C:\Users\<name> (HOME elsewhere)
+  std::vector<std::pair<std::string, std::string_view>> words;  // a name and what it becomes
+};
+
+const Redactions& GetRedactions() {
+  static const Redactions redactions = [] {
+    Redactions r;
+    auto env = [](const char* name) {
+      const char* value = std::getenv(name);
+      return value ? std::string(value) : std::string();
+    };
+#if REX_PLATFORM_WIN32
+    r.profile = env("USERPROFILE");
+    const std::string user = env("USERNAME"), computer = env("COMPUTERNAME");
+#else
+    r.profile = env("HOME");
+    const std::string user = env("USER"), computer = env("HOSTNAME");
+#endif
+    // Short names would match ordinary words.
+    if (user.size() >= 3)
+      r.words.emplace_back(user, "<user>");
+    if (computer.size() >= 3 && computer != user)
+      r.words.emplace_back(computer, "<computer>");
+    return r;
+  }();
+  return redactions;
+}
+
+char FoldChar(char c) {
+  return c == '/' ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+}
+
+bool MatchesAt(std::string_view text, size_t at, std::string_view what) {
+  if (what.empty() || at + what.size() > text.size())
+    return false;
+  for (size_t i = 0; i < what.size(); ++i) {
+    if (FoldChar(text[at + i]) != FoldChar(what[i]))
+      return false;
+  }
+  return true;
+}
+
+bool IsWordChar(char c) {
+  return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+// Every occurrence of `what` (case and slashes ignored; with `whole_word`, not inside a longer
+// word) becomes `with`.
+void ReplaceAll(std::string& text, std::string_view what, std::string_view with, bool whole_word) {
+  for (size_t at = 0; at + what.size() <= text.size();) {
+    const bool word_ok = !whole_word || ((at == 0 || !IsWordChar(text[at - 1])) &&
+                                         (at + what.size() == text.size() || !IsWordChar(text[at + what.size()])));
+    if (MatchesAt(text, at, what) && word_ok) {
+      text.replace(at, what.size(), with);
+      at += with.size();
+    } else {
+      ++at;
+    }
+  }
+}
+
+// Any other user's folder: the part after \Users\ (or /home/) up to the next separator or quote.
+void ReplaceUserFolders(std::string& text) {
+  for (std::string_view marker : {"\\users\\", "\\home\\"}) {
+    for (size_t at = 0; at + marker.size() <= text.size(); ++at) {
+      if (!MatchesAt(text, at, marker))
+        continue;
+      const size_t begin = at + marker.size();
+      size_t end = begin;
+      while (end < text.size() && text[end] != '\\' && text[end] != '/' && text[end] != '\'' && text[end] != '"')
+        ++end;
+      const std::string_view name(text.data() + begin, end - begin);
+      if (name.empty() || name == "<user>" || name == "Public" || name == "Default" || name == "All Users")
+        continue;
+      text.replace(begin, end - begin, "<user>");
+    }
+  }
+}
+
+class RedactingSink final : public spdlog::sinks::base_sink<std::mutex> {
+ public:
+  explicit RedactingSink(spdlog::sink_ptr target) : target_(std::move(target)) {}
+
+ protected:
+  void sink_it_(const spdlog::details::log_msg& msg) override {
+    const std::string text = RedactUserData(std::string_view(msg.payload.data(), msg.payload.size()));
+    spdlog::details::log_msg redacted = msg;
+    redacted.payload = spdlog::string_view_t(text.data(), text.size());
+    if (target_->should_log(redacted.level))
+      target_->log(redacted);
+  }
+  void flush_() override { target_->flush(); }
+  // The pattern is the target's (SetConsolePattern, SetFilePattern).
+  void set_pattern_(const std::string& pattern) override { target_->set_pattern(pattern); }
+  void set_formatter_(std::unique_ptr<spdlog::formatter> formatter) override {
+    target_->set_formatter(std::move(formatter));
+  }
+
+ private:
+  spdlog::sink_ptr target_;
+};
+
+spdlog::sink_ptr Redacted(spdlog::sink_ptr sink) {
+  return sink ? std::make_shared<RedactingSink>(std::move(sink)) : sink;
+}
+
+// The sinks AddSink was given and what the loggers got instead, for RemoveSink.
+std::vector<std::pair<spdlog::sink_ptr, spdlog::sink_ptr>> g_added_sinks;
+
+spdlog::sink_ptr AddedSink(const spdlog::sink_ptr& sink) {
+  for (auto& [given, redacted] : g_added_sinks) {
+    if (given == sink)
+      return redacted;
+  }
+  auto redacted = Redacted(sink);
+  g_added_sinks.emplace_back(sink, redacted);
+  return redacted;
+}
 
 std::vector<LogCategoryEntry> g_registry;
 spdlog::sink_ptr g_console_sink;
@@ -145,6 +271,17 @@ std::shared_ptr<spdlog::logger> CreateCategoryLogger(const std::string& name) {
 
 }  // namespace
 
+std::string RedactUserData(std::string_view line) {
+  std::string text(line);
+  const Redactions& r = GetRedactions();
+  if (r.profile.size() >= 4)
+    ReplaceAll(text, r.profile, "%USERPROFILE%", false);
+  ReplaceUserFolders(text);
+  for (const auto& [word, with] : r.words)
+    ReplaceAll(text, word, with, true);
+  return text;
+}
+
 void InitLoggingEarly() {
   std::lock_guard lock(g_mutex);
   if (g_early_initialized || g_initialized)
@@ -157,7 +294,7 @@ void InitLoggingEarly() {
 #endif
   sink->set_level(spdlog::level::trace);
   sink->set_pattern("[%l] [%n] %v");
-  g_early_sink = sink;
+  g_early_sink = Redacted(sink);
 
   g_config.default_level = kDefaultLogLevel;
 
@@ -215,7 +352,7 @@ void InitLogging(const LogConfig& config) {
     auto sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.console_pattern);
-    g_console_sink = sink;
+    g_console_sink = Redacted(sink);
   }
 
   // File sink (rotating) with sequential naming fallback
@@ -233,10 +370,12 @@ void InitLogging(const LogConfig& config) {
         static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.file_pattern);
-    g_file_sink = sink;
+    g_file_sink = Redacted(sink);
   }
 
-  g_extra_sinks = config.extra_sinks;
+  g_extra_sinks.clear();
+  for (auto& sink : config.extra_sinks)
+    g_extra_sinks.push_back(AddedSink(sink));
 
   // Rebuild all loggers with new sinks
   for (auto& entry : g_registry) {
@@ -416,8 +555,9 @@ void RegisterLogLevelCallback() {
   });
 }
 
-void AddSink(spdlog::sink_ptr sink) {
+void AddSink(spdlog::sink_ptr given) {
   std::lock_guard lock(g_mutex);
+  const auto sink = AddedSink(given);
   g_extra_sinks.push_back(sink);
   for (auto& entry : g_registry) {
     if (entry.logger)
@@ -425,8 +565,9 @@ void AddSink(spdlog::sink_ptr sink) {
   }
 }
 
-void AddSink(LogCategoryId category, spdlog::sink_ptr sink) {
+void AddSink(LogCategoryId category, spdlog::sink_ptr given) {
   std::lock_guard lock(g_mutex);
+  const auto sink = AddedSink(given);
   if (category.id < g_registry.size()) {
     if (auto& logger = g_registry[category.id].logger) {
       logger->sinks().push_back(sink);
@@ -434,8 +575,9 @@ void AddSink(LogCategoryId category, spdlog::sink_ptr sink) {
   }
 }
 
-void RemoveSink(spdlog::sink_ptr sink) {
+void RemoveSink(spdlog::sink_ptr given) {
   std::lock_guard lock(g_mutex);
+  const auto sink = AddedSink(given);
   std::erase(g_extra_sinks, sink);
   for (auto& entry : g_registry) {
     if (entry.logger)
@@ -443,8 +585,9 @@ void RemoveSink(spdlog::sink_ptr sink) {
   }
 }
 
-void RemoveSink(LogCategoryId category, spdlog::sink_ptr sink) {
+void RemoveSink(LogCategoryId category, spdlog::sink_ptr given) {
   std::lock_guard lock(g_mutex);
+  const auto sink = AddedSink(given);
   if (category.id < g_registry.size()) {
     if (auto& logger = g_registry[category.id].logger) {
       std::erase(logger->sinks(), sink);
@@ -452,8 +595,9 @@ void RemoveSink(LogCategoryId category, spdlog::sink_ptr sink) {
   }
 }
 
-void ReplaceConsoleSink(spdlog::sink_ptr sink) {
+void ReplaceConsoleSink(spdlog::sink_ptr given) {
   std::lock_guard lock(g_mutex);
+  const auto sink = Redacted(given);
   for (auto& entry : g_registry) {
     if (!entry.logger)
       continue;
