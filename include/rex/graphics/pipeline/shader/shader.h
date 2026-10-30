@@ -1030,6 +1030,11 @@ class Shader {
 
   // Modification bits -> translation.
   std::unordered_map<uint64_t, Translation*> translations_;
+  // The last one GetOrCreateTranslation returned: a shader is drawn with the same modification
+  // draw after draw, and the command processor asks for it twice a draw (the map's find hashes
+  // each time). Cleared when that translation is destroyed.
+  uint64_t last_modification_ = 0;
+  Translation* last_translation_ = nullptr;
 
   uint32_t ucode_storage_index_ = UINT32_MAX;
 
