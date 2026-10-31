@@ -123,6 +123,28 @@ foreach(_rexglue_ffx_target amd_fidelityfx_dx12 amd_fidelityfx_vk)
     endif()
 endforeach()
 
+# FidelityFX's CMakeLists sends its DLL, import library and PDB to <top-level source>/bin: one
+# folder for all of a project's build folders. A build with other flags (profile-instrumented) left
+# its DLL there, and another build folder's ninja took it as up to date and staged it beside its own
+# executable (rexglue_configure_target copies $<TARGET_FILE>), a release build too. They go to the
+# build folder's own output folder instead, like the SDK's other libraries. Its per-configuration
+# variables are set as well, so the per-configuration properties win; both are overridden here.
+if(NOT REXGLUE_OUTPUT_DIR)
+    set(REXGLUE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/rexglue-out")
+endif()
+foreach(_rexglue_ffx_target amd_fidelityfx_dx12 amd_fidelityfx_vk)
+    if(TARGET ${_rexglue_ffx_target})
+        foreach(_rexglue_ffx_kind RUNTIME LIBRARY ARCHIVE PDB)
+            set_target_properties(${_rexglue_ffx_target} PROPERTIES
+                ${_rexglue_ffx_kind}_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+            foreach(_rexglue_ffx_config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+                set_target_properties(${_rexglue_ffx_target} PROPERTIES
+                    ${_rexglue_ffx_kind}_OUTPUT_DIRECTORY_${_rexglue_ffx_config} "${REXGLUE_OUTPUT_DIR}")
+            endforeach()
+        endforeach()
+    endif()
+endforeach()
+
 # The upstream FidelityFX targets expose source-tree include paths in
 # INTERFACE_INCLUDE_DIRECTORIES, which breaks our install export checks.
 # We only link against these targets internally, so no public includes are
