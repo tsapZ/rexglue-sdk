@@ -248,6 +248,9 @@ class XmaContext {
                                uint32_t current_input_packet_count);
   uint32_t GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
                                    uint32_t current_input_packet_count);
+  // Right after SwapInputBuffer: the read offset of the stream's first frame in the new buffer,
+  // at next_buffer_packet_. False when no frame starts in that packet.
+  bool StartInNewBuffer(XMA_CONTEXT_DATA* data);
   uint8_t* GetCurrentInputBuffer(XMA_CONTEXT_DATA* data);
 
   void Decode(XMA_CONTEXT_DATA* data);
@@ -321,6 +324,16 @@ class XmaContext {
   // The read offset was past the end of the input buffer once already: logged once, not on every
   // decode call (ImaginatorsRecomp #16: ~5,000 lines a second for one context).
   bool offset_past_end_logged_ = false;
+
+  // Multi-stream XMA: a sound with more than two channels is several stereo streams, one context
+  // each, all reading the same buffers. Their packets are interleaved, and each packet's skip count
+  // says how many packets of other streams come before the stream's next one, also across the end
+  // of a buffer: in a 32-packet buffer, a skip that leads to packet 34 means packet 2 of the next
+  // buffer. This is that packet. Going on at packet 0 of every new buffer gave all streams of a
+  // sound the first stream's music from its second buffer on (Skylanders: SuperChargers' level
+  // music has five stems in ten channels, and the switch to the vehicle or boss stem was never
+  // heard, SuperChargersRecomp #11).
+  uint32_t next_buffer_packet_ = 0;
 };
 
 }  // namespace rex::audio
