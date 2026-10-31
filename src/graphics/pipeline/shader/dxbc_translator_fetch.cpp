@@ -829,6 +829,20 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
         break;
     }
   }
+  // Point-sampled 2D fetches in pixel shaders with normalized coordinates from a resolution-scaled
+  // texture that is magnified beyond the scale snap to its guest texels (below), which needs the
+  // size. Only with the offsets in guest texels (draw_resolution_scaled_texture_offsets off), as
+  // the console's are.
+  const bool may_snap_to_guest_texels =
+      !REXCVAR_GET(draw_resolution_scaled_texture_offsets) && is_pixel_shader() &&
+      instr.opcode == FetchOpcode::kTextureFetch &&
+      !instr.attributes.unnormalized_coordinates &&
+      instr.dimension == xenos::FetchOpDimension::k2D &&
+      instr.attributes.mag_filter != xenos::TextureFilter::kLinear &&
+      (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
+  if (may_snap_to_guest_texels) {
+    size_needed_components |= 0b0011;
+  }
   if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked && size_needed_components) {
     // Stacked and 3D textures have different size packing - need to get whether
     // the texture is 3D unconditionally.
@@ -1144,6 +1158,57 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                     dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ));
         }
       }
+    }
+    if (may_snap_to_guest_texels) {
+      // The guest texel's own host texel, as the console would point-sample it, when a point-
+      // sampled resolution-scaled texture is magnified beyond the resolution scale (a buffer of a
+      // lower resolution drawn onto a larger one): a shader blending such point taps with weights
+      // from guest-sized constants (SuperChargers' lighting, a bilateral upsample of its
+      // half-resolution shadow mask: four taps half a guest texel around the pixel, weights from
+      // the guest size) otherwise gets taps moving by host texels against weights on the guest
+      // grid, and the shadow edges came out stair-stepped at resolution scale 2. Reads at the
+      // target's own resolution or smaller keep every host texel.
+      // W and Z as temporaries: the sampler isn't loaded yet, Z is set to 0 below for 2D.
+      a_.OpAnd(dxbc::Dest::R(coord_and_sampler_temp, 0b1000),
+               LoadSystemConstant(SystemConstants::Index::kTexturesResolutionScaled,
+                                  offsetof(SystemConstants, textures_resolution_scaled),
+                                  dxbc::Src::kXXXX),
+               dxbc::Src::LU(uint32_t(1) << tfetch_index));
+      // Guest texels per host pixel across the screen: 1 / scale for a read at the target's own
+      // resolution, half that for a half-resolution buffer.
+      a_.OpDerivRTXCoarse(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
+                          dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kXXXX));
+      a_.OpMul(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
+               dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ),
+               dxbc::Src::R(size_and_is_3d_temp, dxbc::Src::kXXXX));
+      a_.OpLT(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
+              dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ).Abs(),
+              dxbc::Src::LF(0.75f / float(draw_resolution_scale_x_)));
+      a_.OpAnd(dxbc::Dest::R(coord_and_sampler_temp, 0b1000),
+               dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kWWWW),
+               dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ));
+      if (instr.attributes.mag_filter == xenos::TextureFilter::kUseFetchConst) {
+        // The fetch constant's magnification filter (dword 3 bits 19:20), point is 0.
+        a_.OpUBFE(dxbc::Dest::R(coord_and_sampler_temp, 0b0100), dxbc::Src::LU(2),
+                  dxbc::Src::LU(19), RequestTextureFetchConstantWord(tfetch_index, 3));
+        a_.OpIEq(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
+                 dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ), dxbc::Src::LU(0));
+        a_.OpAnd(dxbc::Dest::R(coord_and_sampler_temp, 0b1000),
+                 dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kWWWW),
+                 dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ));
+      }
+      a_.OpIf(true, dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kWWWW));
+      a_.OpMul(dxbc::Dest::R(coord_and_sampler_temp, 0b0011), dxbc::Src::R(coord_and_sampler_temp),
+               dxbc::Src::R(size_and_is_3d_temp));
+      a_.OpRoundNI(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
+                   dxbc::Src::R(coord_and_sampler_temp));
+      // Past the guest texel's centre by a quarter host texel, so one host texel is picked.
+      a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, 0b0011), dxbc::Src::R(coord_and_sampler_temp),
+               dxbc::Src::LF(0.5f + 0.25f / float(draw_resolution_scale_x_),
+                             0.5f + 0.25f / float(draw_resolution_scale_y_), 0.0f, 0.0f));
+      a_.OpDiv(dxbc::Dest::R(coord_and_sampler_temp, 0b0011), dxbc::Src::R(coord_and_sampler_temp),
+               dxbc::Src::R(size_and_is_3d_temp));
+      a_.OpEndIf();
     }
     switch (instr.dimension) {
       case xenos::FetchOpDimension::k1D:
