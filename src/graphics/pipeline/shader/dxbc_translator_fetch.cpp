@@ -11,8 +11,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <sstream>
+#include <string>
 
 #include <fmt/format.h>
 
@@ -26,9 +28,34 @@
 
 REXCVAR_DEFINE_BOOL(draw_resolution_scaled_texture_offsets, true, "GPU/Shader",
                     "Scale texture offsets with draw resolution");
+REXCVAR_DEFINE_STRING(draw_resolution_guest_grid_shaders, "", "GPU/Shader",
+                      "Pixel shaders (microcode hashes in hex, separated by commas) whose "
+                      "point-sampled reads of resolution-scaled textures all snap to the guest "
+                      "texels, as at the console's resolution: for passes that step a buffer from "
+                      "its neighbours one guest texel away (water ripple simulations)");
 
 namespace rex::graphics {
 using namespace ucode;
+
+namespace {
+// Whether draw_resolution_guest_grid_shaders lists the shader.
+bool IsGuestGridShader(uint64_t ucode_hash) {
+  const std::string list = REXCVAR_GET(draw_resolution_guest_grid_shaders);
+  size_t start = 0;
+  while (start < list.size()) {
+    size_t end = list.find_first_of(",; ", start);
+    if (end == std::string::npos) end = list.size();
+    if (end > start) {
+      const std::string item = list.substr(start, end - start);
+      char* item_end = nullptr;
+      const uint64_t hash = std::strtoull(item.c_str(), &item_end, 16);
+      if (item_end && *item_end == '\0' && hash == ucode_hash) return true;
+    }
+    start = end + 1;
+  }
+  return false;
+}
+}  // namespace
 
 void DxbcShaderTranslator::ProcessVertexFetchInstruction(
     const ParsedVertexFetchInstruction& instr) {
@@ -840,6 +867,10 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
       instr.dimension == xenos::FetchOpDimension::k2D &&
       instr.attributes.mag_filter != xenos::TextureFilter::kLinear &&
       (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
+  // A shader listed in draw_resolution_guest_grid_shaders snaps at any size, its reads at the
+  // target's own resolution too.
+  const bool snap_at_any_size =
+      may_snap_to_guest_texels && IsGuestGridShader(current_shader().ucode_data_hash());
   if (may_snap_to_guest_texels) {
     size_needed_components |= 0b0011;
   }
@@ -1167,26 +1198,33 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
       // half-resolution shadow mask: four taps half a guest texel around the pixel, weights from
       // the guest size) otherwise gets taps moving by host texels against weights on the guest
       // grid, and the shadow edges came out stair-stepped at resolution scale 2. Reads at the
-      // target's own resolution or smaller keep every host texel.
+      // target's own resolution or smaller keep every host texel, except in the shaders listed in
+      // draw_resolution_guest_grid_shaders: a pass stepping a buffer from its neighbours one guest
+      // texel away (Swap Force's water ripples: the vertex shader gives the neighbours' coordinates
+      // from a guest-sized constant) otherwise splits into one simulation per host texel of a guest
+      // texel, and the ripples came out grainy at resolution scale 2. Snapped, each guest texel's
+      // host texels step alike, as the console's one texel.
       // W and Z as temporaries: the sampler isn't loaded yet, Z is set to 0 below for 2D.
       a_.OpAnd(dxbc::Dest::R(coord_and_sampler_temp, 0b1000),
                LoadSystemConstant(SystemConstants::Index::kTexturesResolutionScaled,
                                   offsetof(SystemConstants, textures_resolution_scaled),
                                   dxbc::Src::kXXXX),
                dxbc::Src::LU(uint32_t(1) << tfetch_index));
-      // Guest texels per host pixel across the screen: 1 / scale for a read at the target's own
-      // resolution, half that for a half-resolution buffer.
-      a_.OpDerivRTXCoarse(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
-                          dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kXXXX));
-      a_.OpMul(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
-               dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ),
-               dxbc::Src::R(size_and_is_3d_temp, dxbc::Src::kXXXX));
-      a_.OpLT(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
-              dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ).Abs(),
-              dxbc::Src::LF(0.75f / float(draw_resolution_scale_x_)));
-      a_.OpAnd(dxbc::Dest::R(coord_and_sampler_temp, 0b1000),
-               dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kWWWW),
-               dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ));
+      if (!snap_at_any_size) {
+        // Guest texels per host pixel across the screen: 1 / scale for a read at the target's own
+        // resolution, half that for a half-resolution buffer.
+        a_.OpDerivRTXCoarse(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
+                            dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kXXXX));
+        a_.OpMul(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
+                 dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ),
+                 dxbc::Src::R(size_and_is_3d_temp, dxbc::Src::kXXXX));
+        a_.OpLT(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
+                dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ).Abs(),
+                dxbc::Src::LF(0.75f / float(draw_resolution_scale_x_)));
+        a_.OpAnd(dxbc::Dest::R(coord_and_sampler_temp, 0b1000),
+                 dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kWWWW),
+                 dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ));
+      }
       if (instr.attributes.mag_filter == xenos::TextureFilter::kUseFetchConst) {
         // The fetch constant's magnification filter (dword 3 bits 19:20), point is 0.
         a_.OpUBFE(dxbc::Dest::R(coord_and_sampler_temp, 0b0100), dxbc::Src::LU(2),
