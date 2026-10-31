@@ -209,6 +209,7 @@ void XmaContext::ResetDecoderState() {
   carry_valid_ = false;
   input_end_pending_ = false;
   offset_past_end_logged_ = false;
+  next_buffer_packet_ = 0;
   pending_output_limit_ = 0;
   pending_start_skip_ = 0;
   current_frame_remaining_subframes_ = 0;
@@ -309,7 +310,12 @@ const uint8_t* XmaContext::GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_p
     return nullptr;
   }
 
-  return memory()->TranslatePhysical(next_buffer_address);
+  // The stream's packet chain goes on in the next buffer (see next_buffer_packet_).
+  uint32_t packet_in_next = next_packet_index - current_input_packet_count;
+  if (packet_in_next >= data->GetInputBufferPacketCount(next_buffer_index)) {
+    packet_in_next = 0;
+  }
+  return memory()->TranslatePhysical(next_buffer_address) + packet_in_next * kBytesPerPacket;
 }
 
 uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
@@ -321,10 +327,31 @@ uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_pack
     if (packet_frame_offset <= kMaxFrameSizeinBits) {
       return (next_packet_index * kBitsPerPacket) + packet_frame_offset;
     }
-    next_packet_index++;
+    // No frame starts in it: the stream's next packet is where this one's skip count leads (the
+    // next packet, unless other streams' packets are interleaved).
+    const uint8_t skip_count = xma::GetPacketSkipCount(next_packet);
+    next_packet_index += skip_count == 0xFF ? 1 : skip_count + 1;
   }
 
+  next_buffer_packet_ = next_packet_index - current_input_packet_count;
   return kBitsPerPacketHeader;
+}
+
+bool XmaContext::StartInNewBuffer(XMA_CONTEXT_DATA* data) {
+  const uint32_t packet_count = data->GetCurrentInputBufferPacketCount();
+  const uint32_t packet_index = next_buffer_packet_ < packet_count ? next_buffer_packet_ : 0;
+  if (packet_index) {
+    REXAPU_DEBUG("XmaContext {}: multi-stream, goes on at packet {} of the next buffer", id(),
+                 packet_index);
+  }
+  next_buffer_packet_ = 0;
+  const uint32_t frame_offset =
+      xma::GetPacketFrameOffset(GetCurrentInputBuffer(data) + packet_index * kBytesPerPacket);
+  if (frame_offset > kMaxFrameSizeinBits) {
+    return false;
+  }
+  data->input_buffer_read_offset = packet_index * kBitsPerPacket + frame_offset;
+  return true;
 }
 
 memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
@@ -543,17 +570,15 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     if (!data->IsCurrentInputBufferValid()) {
       // The game took the buffer back itself.
       input_end_pending_ = false;
+      next_buffer_packet_ = 0;
     } else if (data->IsInputBufferValid(data->current_buffer ^ 1)) {
       // More input came in meanwhile: the stream goes on from there, as below.
       input_end_pending_ = false;
       SwapInputBuffer(data);
-      const uint32_t first_frame_offset =
-          xma::GetPacketFrameOffset(memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()));
-      if (first_frame_offset > kMaxFrameSizeinBits) {
+      if (!StartInNewBuffer(data)) {
         SwapInputBuffer(data);
         return;
       }
-      data->input_buffer_read_offset = first_frame_offset;
     } else if (carry_valid_) {
       FlushCarry(data);
       return;
@@ -612,6 +637,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
                   id(), static_cast<uint32_t>(data->input_buffer_read_offset), current_input_packet_count);
       offset_past_end_logged_ = true;
     }
+    next_buffer_packet_ = 0;
     if (!data->IsInputBufferValid(data->current_buffer ^ 1)) {
       input_end_pending_ = true;
       return;
@@ -649,6 +675,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
         return;
       }
       SwapInputBuffer(data);
+      // Where no frame starts there, the read offset stays at the buffer's start, as before.
+      StartInNewBuffer(data);
+      return;
     }
     data->input_buffer_read_offset = next_input_offset;
     return;
@@ -792,15 +821,10 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       return;
     }
     SwapInputBuffer(data);
-    if (data->IsAnyInputBufferValid()) {
-      next_input_offset = xma::GetPacketFrameOffset(
-          memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()));
-
-      if (next_input_offset > kMaxFrameSizeinBits) {
-        SwapInputBuffer(data);
-        return;
-      }
+    if (data->IsAnyInputBufferValid() && !StartInNewBuffer(data)) {
+      SwapInputBuffer(data);
     }
+    return;
   }
   data->input_buffer_read_offset = next_input_offset;
 }
