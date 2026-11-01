@@ -501,17 +501,23 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       // re-present the same guest frame, so each guest frame stays on screen for an uneven
       // number of host refreshes -- measured ~136 presents/s with 4-9ms gaps at a 60 cap, visible
       // as uneven frame pacing. Skipped paints re-request at the next UI tick, which is cheap.
-      // Once the guest has brought no frame for 100 ms (a stall, or the game held while a menu
-      // is open, rex/system/frame_gate.h), UI-only presents go on at the cap's rate: at one per
-      // 100 ms the menus' own animations stuttered (a portal overview at 10 FPS).
+      // Only while the guest runs at the cap, though: once it has brought no frame for 100 ms (a
+      // stall, or the game held while a menu is open, rex/system/frame_gate.h), or its frames
+      // come clearly slower than the cap on average (a game loading at 20-40 frames a second),
+      // UI-only presents go on at the cap's rate. At one per 100 ms the menus' own animations
+      // stuttered (a portal overview at 10 FPS), and a menu open over a loading game moved at the
+      // loading's frame rate (Spyro's Adventure: the portal menu that comes up while a save loads
+      // dropped to 36 FPS for the second of the load; its own frames took under 8 ms).
       const auto now = std::chrono::steady_clock::now();
       const uint64_t guest_output_refresh_count =
           guest_output_refresh_count_.load(std::memory_order_acquire);
       const bool new_guest_frame =
           guest_output_refresh_count != ui_thread_last_presented_guest_output_refresh_count_;
       const int32_t frame_cap = REXCVAR_GET(frame_rate_limit);
+      const double cap_frame_ms = frame_cap > 0 ? 1000.0 / frame_cap : 0.0;
       const bool guest_refreshing =
-          now - ui_thread_last_guest_frame_present_time_ < std::chrono::milliseconds(100);
+          now - ui_thread_last_guest_frame_present_time_ < std::chrono::milliseconds(100) &&
+          ui_thread_guest_frame_gap_ms_ < cap_frame_ms * 1.25;
       const bool skip_ui_only_present =
           frame_cap > 0 && draw_ui && !force_paint && !new_guest_frame &&
           (guest_refreshing ||
@@ -522,6 +528,14 @@ void Presenter::PaintFromUIThread(bool force_paint) {
         ui_thread_last_presented_guest_output_refresh_count_ = guest_output_refresh_count;
         ui_thread_last_present_time_ = now;
         if (new_guest_frame) {
+          // The gap to the guest frame before, averaged over about the last eight (a gap over
+          // 100 ms is a stall, handled above, and would hold the average up for long after).
+          const double gap_ms = std::chrono::duration<double, std::milli>(
+                                    now - ui_thread_last_guest_frame_present_time_)
+                                    .count();
+          if (gap_ms < 100.0) {
+            ui_thread_guest_frame_gap_ms_ += (gap_ms - ui_thread_guest_frame_gap_ms_) * 0.125;
+          }
           ui_thread_last_guest_frame_present_time_ = now;
         }
         paint_result = PaintAndPresent(draw_ui);
