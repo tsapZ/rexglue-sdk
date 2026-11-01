@@ -780,8 +780,11 @@ void DxbcShaderTranslator::ProcessScalarAluOperation(
         a_.OpRoundNI(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b1000),
                      dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kWWWW));
       }
+      // Clamped at 0, not -256: a negative address register made the relative constant reads go
+      // before the start of the buffer, and AMD drivers lost the device on that (RX 6000 and later;
+      // xenia-canary 674870d881, BSD-3). The vector kMaxA keeps -256, as there.
       a_.OpMax(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b1000),
-               dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kWWWW), dxbc::Src::LF(-256.0f));
+               dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kWWWW), dxbc::Src::LF(0.0f));
       a_.OpMin(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b1000),
                dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kWWWW), dxbc::Src::LF(255.0f));
       a_.OpFToI(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b1000),
