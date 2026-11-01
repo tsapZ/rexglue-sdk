@@ -454,15 +454,30 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   const auto& regs = register_file();
 
   // A texture that has become outdated (a memory watch fired) gets its new data on the next draw
-  // that uses it: only the used bindings whose textures are outdated are rechecked, and reload into
-  // the same Texture when their fetch constants didn't change. Resetting every binding whenever
-  // any watched texture changed re-derived all of them and rebuilt their descriptors on the next
-  // draws, several times a frame in games with many resolves (Xenia Edge 7fcb7666e0).
+  // that uses it: only the used bindings whose textures are outdated are rechecked, and when their
+  // fetch constants didn't change they look their Texture up again and reload it. Resetting every
+  // binding whenever any watched texture changed re-derived all of them and rebuilt their
+  // descriptors on the next draws, several times a frame in games with many resolves (Xenia Edge
+  // 7fcb7666e0).
   texture_became_outdated_.exchange(false, std::memory_order_acquire);
   InvalidateUsedOutdatedBindings(used_texture_mask);
 
   // Update the texture keys and the textures.
   uint32_t bindings_changed = 0;
+  // Whether a texture is a scaled resolve is decided in FindOrCreateTexture, not in the binding's
+  // key, so the same fetch constant can map to another Texture after its memory was written: a
+  // resolve into an unscaled texture's memory, or the CPU writing over a scaled one, switches it.
+  // An outdated binding therefore looks its Texture up again, and another one needs new
+  // descriptors. Reloading into the old Texture kept the stale side, with drawing resolution
+  // scaling Imaginators' HUD portraits came out in wrong colours.
+  auto refind_outdated_texture = [&](Texture*& texture, const TextureKey& key,
+                                     uint32_t index_bit) {
+    Texture* found = FindOrCreateTexture(key);
+    if (found != texture) {
+      texture = found;
+      bindings_changed |= index_bit;
+    }
+  };
   std::vector<PendingTextureLoad> pending_texture_loads;
   std::vector<PendingSharedMemoryRange> pending_shared_memory_ranges;
   auto queue_pending_texture_load = [&](Texture* texture) {
@@ -533,7 +548,9 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
           binding.texture = FindOrCreateTexture(binding.key);
           load_unsigned_data = true;
         } else if (binding_was_outdated && binding.texture != nullptr) {
-          // The same texture, its memory written: the new data into the same Texture.
+          // The same fetch constant, its memory written: the new data into the Texture it maps
+          // to now.
+          refind_outdated_texture(binding.texture, binding.key, index_bit);
           load_unsigned_data = true;
         }
       } else {
@@ -546,6 +563,9 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
           binding.texture_signed = FindOrCreateTexture(signed_key);
           load_signed_data = true;
         } else if (binding_was_outdated && binding.texture_signed != nullptr) {
+          TextureKey signed_key = binding.key;
+          signed_key.signed_separate = 1;
+          refind_outdated_texture(binding.texture_signed, signed_key, index_bit);
           load_signed_data = true;
         }
       } else {
@@ -558,6 +578,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
         binding.texture = FindOrCreateTexture(binding.key);
         load_unsigned_data = true;
       } else if (binding_was_outdated && binding.texture != nullptr) {
+        refind_outdated_texture(binding.texture, binding.key, index_bit);
         load_unsigned_data = true;
       }
       binding.texture_signed = nullptr;
