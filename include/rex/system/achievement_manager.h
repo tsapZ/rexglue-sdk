@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -37,6 +38,8 @@ enum class AchievementUnlockResult {
   kUnlocked,
   kAlreadyUnlocked,
   kUnknownAchievement,
+  // SetUnlocksHeld: not unlocked (and not stored), as if the title hadn't asked.
+  kHeld,
 };
 
 using AchievementListenerHandle = uint64_t;
@@ -74,6 +77,11 @@ class AchievementManager {
   void LoadUnlockState();
   void SaveUnlockState() const;
 
+  // While held, UnlockAchievement unlocks nothing (kHeld), e.g. while a cheat of the app is on:
+  // `why` goes into the log line of each one held back.
+  void SetUnlocksHeld(bool held, std::string why = {});
+  bool AreUnlocksHeld() const;
+
  private:
   static uint64_t CurrentFileTime();
 
@@ -89,6 +97,8 @@ class AchievementManager {
   std::unordered_map<AchievementListenerHandle, AchievementCallback> unlock_callbacks_;
   std::unordered_map<AchievementListenerHandle, AchievementCallback> notification_callbacks_;
   AchievementListenerHandle next_listener_handle_ = 1;
+  bool unlocks_held_ = false;
+  std::string unlocks_held_why_;
 };
 
 }  // namespace rex::system
