@@ -453,12 +453,13 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   const auto& regs = register_file();
 
-  if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
-    // A texture has become outdated - make sure whether textures are outdated
-    // is rechecked in this draw and in subsequent ones to reload the new data
-    // if needed.
-    ResetTextureBindings();
-  }
+  // A texture that has become outdated (a memory watch fired) gets its new data on the next draw
+  // that uses it: only the used bindings whose textures are outdated are rechecked, and reload into
+  // the same Texture when their fetch constants didn't change. Resetting every binding whenever
+  // any watched texture changed re-derived all of them and rebuilt their descriptors on the next
+  // draws, several times a frame in games with many resolves (Xenia Edge 7fcb7666e0).
+  texture_became_outdated_.exchange(false, std::memory_order_acquire);
+  InvalidateUsedOutdatedBindings(used_texture_mask);
 
   // Update the texture keys and the textures.
   uint32_t bindings_changed = 0;
@@ -493,6 +494,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
     TextureKey old_key = binding.key;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
+    const bool binding_was_outdated = old_key.is_valid && IsBindingOutdated(binding);
     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
     texture_bindings_in_sync_ |= index_bit;
     if (!binding.key.is_valid) {
@@ -530,6 +532,9 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
         if (key_changed || !any_sign_was_not_signed) {
           binding.texture = FindOrCreateTexture(binding.key);
           load_unsigned_data = true;
+        } else if (binding_was_outdated && binding.texture != nullptr) {
+          // The same texture, its memory written: the new data into the same Texture.
+          load_unsigned_data = true;
         }
       } else {
         binding.texture = nullptr;
@@ -540,6 +545,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
           signed_key.signed_separate = 1;
           binding.texture_signed = FindOrCreateTexture(signed_key);
           load_signed_data = true;
+        } else if (binding_was_outdated && binding.texture_signed != nullptr) {
+          load_signed_data = true;
         }
       } else {
         binding.texture_signed = nullptr;
@@ -549,6 +556,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       // be different.
       if (key_changed) {
         binding.texture = FindOrCreateTexture(binding.key);
+        load_unsigned_data = true;
+      } else if (binding_was_outdated && binding.texture != nullptr) {
         load_unsigned_data = true;
       }
       binding.texture_signed = nullptr;
@@ -988,6 +997,23 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
 
   if (swizzled_signs_out != nullptr) {
     *swizzled_signs_out = texture_util::SwizzleSigns(fetch);
+  }
+}
+
+bool TextureCache::IsBindingOutdated(const TextureBinding& binding) {
+  return (binding.texture != nullptr && binding.texture->outdated_mask() != 0) ||
+         (binding.texture_signed != nullptr && binding.texture_signed->outdated_mask() != 0);
+}
+
+void TextureCache::InvalidateUsedOutdatedBindings(uint32_t used_texture_mask) {
+  // Only bindings that are in sync can be stale; the others are processed anyway.
+  uint32_t used_in_sync = used_texture_mask & texture_bindings_in_sync_;
+  uint32_t index = 0;
+  while (rex::bit_scan_forward(used_in_sync, &index)) {
+    used_in_sync &= used_in_sync - 1;
+    if (IsBindingOutdated(texture_bindings_[index])) {
+      texture_bindings_in_sync_ &= ~(UINT32_C(1) << index);
+    }
   }
 }
 
