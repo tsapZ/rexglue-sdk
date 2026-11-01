@@ -545,7 +545,7 @@ class TextureCache {
   // Whether a binding's texture (or its signed version) has memory written since its last load.
   static bool IsBindingOutdated(const TextureBinding& binding);
   // Takes the used bindings whose textures are outdated out of sync, so RequestTextures processes
-  // them again (the same Texture, its new data loaded); the others keep their state.
+  // them again (their Texture looked up again, its new data loaded); the others keep their state.
   void InvalidateUsedOutdatedBindings(uint32_t used_texture_mask);
 
   const TextureBinding* GetValidTextureBinding(uint32_t fetch_constant_index) const {
