@@ -167,8 +167,20 @@ inline uint8_t tzcnt(int64_t v) {
 // Search the value from least significant bit (LSB) to the most significant bit
 // (MSB) for a set bit (1).
 // Returns false if no bits are set and the output index is invalid.
-bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index);
-bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index);
+// Inline here, not in math_*.cpp: the command processor calls it for every register write and
+// draw, and as an out-of-line function in the runtime it was a call across the GPU plugin's DLL
+// boundary each time (Crackdown Recompiled measured -9 % command processor time per draw from
+// inlining it, with LTO).
+inline bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index) {
+  if (!v) return false;
+  *out_first_set_index = static_cast<uint32_t>(std::countr_zero(v));
+  return true;
+}
+inline bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index) {
+  if (!v) return false;
+  *out_first_set_index = static_cast<uint32_t>(std::countr_zero(v));
+  return true;
+}
 inline bool bit_scan_forward(int32_t v, uint32_t* out_first_set_index) {
   return bit_scan_forward(static_cast<uint32_t>(v), out_first_set_index);
 }
