@@ -1785,6 +1785,23 @@ void D3D12CommandProcessor::ShutdownContext() {
 }
 
 void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  // A float, bool or loop constant written with the value it already has changes nothing (the
+  // base class only stores constants), as in WriteRegistersFromMem. Fetch constants go on below:
+  // the same vertex fetch is how vertex data rewritten in place gets requested again.
+  const bool alu_constant = (index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+                             index <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
+                            (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+                             index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31);
+  if (alu_constant && register_file_->values[index] == value) {
+    return;
+  }
+  const bool fetch_unchanged = index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+                               index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 &&
+                               register_file_->values[index] == value;
+  if (fetch_unchanged) {
+    InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
+    return;
+  }
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -1850,8 +1867,22 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
     return (usage_map[last_word] & last_mask) != 0;
   };
 
+  // Constants written with the values they already have (games rewrite whole blocks every draw)
+  // change nothing: no constant buffer, texture binding or vertex buffer to redo for them.
+  auto unchanged = [&]() {
+    for (uint32_t i = 0; i < num_registers; ++i) {
+      if (register_file_->values[start_index + i] != rex::byte_swap(base[i])) {
+        return false;
+      }
+    }
+    return true;
+  };
+
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+    if (unchanged()) {
+      return;
+    }
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
     if (frame_open_) {
       uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
@@ -1878,6 +1909,9 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+    if (unchanged()) {
+      return;
+    }
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
     cbuffer_binding_bool_loop_.up_to_date = false;
     return;
@@ -1885,6 +1919,14 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+    if (unchanged()) {
+      // Vertex data rewritten in place under the same fetch constant is requested again through
+      // this; the textures have memory watches of their own.
+      InvalidateVertexBufferResidencyRange(
+          (start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2,
+          (end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
+      return;
+    }
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
     cbuffer_binding_fetch_.up_to_date = false;
     uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
