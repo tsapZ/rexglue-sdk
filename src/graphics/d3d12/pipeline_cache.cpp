@@ -62,6 +62,11 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
 
+REXCVAR_DEFINE_BOOL(d3d12_await_pipelines_at_submission_end, false, "GPU/D3D12",
+                    "With async shader compilation: finish every pipeline still being created "
+                    "before a submission ends (the old behaviour; a hitch while new shaders "
+                    "compile)");
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -764,7 +769,16 @@ void PipelineCache::EndSubmission() {
     shader_storage_file_flush_needed_ = false;
     pipeline_storage_file_flush_needed_ = false;
   }
-  if (!creation_threads_.empty()) {
+  // With async shader compilation a draw is only recorded once its pipeline exists (the draw is
+  // skipped until then, D3D12CommandProcessor::IssueDraw), so nothing in the submission waits for
+  // the pipelines still being created. Creating the queued ones here on the command processor
+  // thread, and waiting for the creation threads, stalled the guest for as long as new shaders
+  // compiled (Xenia Edge 06fb359dee and the Gears of War 2 port measured hitches of 0.3-3.9 s from
+  // it). Without async compilation every pipeline is created when its draw needs it, so the queue
+  // is empty anyway.
+  if (!creation_threads_.empty() &&
+      (!REXCVAR_GET(async_shader_compilation) ||
+       REXCVAR_GET(d3d12_await_pipelines_at_submission_end))) {
     CreateQueuedPipelinesOnProcessorThread();
     // Await creation of all queued pipelines.
     bool await_creation_completion_event;
