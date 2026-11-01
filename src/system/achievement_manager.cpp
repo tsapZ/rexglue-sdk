@@ -138,6 +138,11 @@ AchievementUnlockResult AchievementManager::UnlockAchievement(
       REXSYS_WARN("Achievement store: ignoring unknown achievement {:08X}", id);
       return AchievementUnlockResult::kUnknownAchievement;
     }
+    if (unlocks_held_ && !unlocked_achievements_.contains(id)) {
+      REXSYS_INFO("Achievement {:08X} not unlocked: {}", id,
+                  unlocks_held_why_.empty() ? std::string("unlocks are held") : unlocks_held_why_);
+      return AchievementUnlockResult::kHeld;
+    }
 
     uint64_t filetime = CurrentFileTime();
     auto [it, inserted] = unlocked_achievements_.emplace(id, filetime);
@@ -175,6 +180,21 @@ bool AchievementManager::ShowAchievementNotification(uint32_t id) {
 bool AchievementManager::IsUnlocked(uint32_t id) const {
   std::lock_guard lock(mutex_);
   return unlocked_achievements_.contains(id);
+}
+
+void AchievementManager::SetUnlocksHeld(bool held, std::string why) {
+  std::lock_guard lock(mutex_);
+  if (held != unlocks_held_) {
+    REXSYS_INFO("Achievement store: unlocks {}{}", held ? "held" : "no longer held",
+                held && !why.empty() ? " (" + why + ")" : std::string());
+  }
+  unlocks_held_ = held;
+  unlocks_held_why_ = std::move(why);
+}
+
+bool AchievementManager::AreUnlocksHeld() const {
+  std::lock_guard lock(mutex_);
+  return unlocks_held_;
 }
 
 uint64_t AchievementManager::GetUnlockTime(uint32_t id) const {
