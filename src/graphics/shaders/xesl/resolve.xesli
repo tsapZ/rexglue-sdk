@@ -38,12 +38,21 @@ push_const_begin_xe(b0, space0)
     #ifndef XE_RESOLVE_RESOLUTION_SCALED
       uint xe_resolve_dest_base;
     #endif
+    #ifdef XE_RESOLVE_DIRECT
+      // Direct resolve (rex SDK): the copy reads the one host render target owning the whole
+      // source span instead of the EDRAM buffer. Its base tile (bits 0:15) and pitch in tiles at
+      // 32bpp (bits 16:31).
+      uint xe_resolve_direct_rt_tiles;
+      // Bits 0:3: the packing (0 = 8_8_8_8, 1 = 2_10_10_10); bits 4:5 and 6:7: the host sample
+      // indices of the guest's 2x MSAA samples 0 and 1.
+      uint xe_resolve_direct_rt_flags;
+    #endif
   #endif
 push_const_end_xe
 
 #define XE_RESOLVE_PUSH_CONST_BINDING push_const_binding_xe(buffer(0))
 
-#ifndef XE_RESOLVE_CLEAR
+#if !defined(XE_RESOLVE_CLEAR) && !defined(XE_RESOLVE_DIRECT)
   #ifdef XE_RESOLVE_COPY_EDRAM_IS_UINT_VECTOR_BUFFER
     uint_vector_buffer_declare_xe(xe_resolve_edram, set=0, binding=0, t0,
                                   space0)

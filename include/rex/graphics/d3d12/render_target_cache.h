@@ -20,6 +20,7 @@
 #include <memory>
 #include <unordered_map>
 #include <utility>
+#include <string>
 #include <vector>
 
 #include <rex/assert.h>
@@ -653,9 +654,13 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   ID3D12PipelineState* GetOrCreateDumpPipeline(DumpPipelineKey key);
   ID3D12PipelineState* GetOrCreateDirectResolvePipeline(DirectResolvePipelineKey key);
-  bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
-                              draw_util::ResolveCopyShaderIndex copy_shader,
-                              bool draw_resolution_scaled);
+  // Direct resolve: the render target to copy from instead of dumping to the EDRAM buffer, when
+  // one render target owns the resolve's whole source span and the copy is one the direct shaders
+  // do (fast 32bpp, 8_8_8_8 or 2_10_10_10 at 1x or 2x MSAA); else nullptr. rt_tiles_out and
+  // rt_flags_out are the shader's xe_resolve_direct_rt_tiles / _flags.
+  D3D12RenderTarget* GetDirectResolveSource(const draw_util::ResolveInfo& resolve_info,
+                                            draw_util::ResolveCopyShaderIndex copy_shader,
+                                            uint32_t& rt_tiles_out, uint32_t& rt_flags_out);
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
@@ -737,9 +742,25 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   std::unordered_map<DirectResolvePipelineKey, ID3D12PipelineState*,
                      DirectResolvePipelineKey::Hasher>
       direct_resolve_pipelines_;
+  // resolve_direct_fast_32bpp_{1x,2x}msaa, at the draw resolution scale and EDRAM size in use.
+  ID3D12PipelineState* direct_resolve_fast_32bpp_pipelines_[2] = {};
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
+  // direct_host_resolve_verify (a debug setting): a direct resolve copied both ways, the destination read
+  // back after each, compared once the submission is done (the scene doesn't matter then).
+  struct DirectResolveVerify {
+    ID3D12Resource* readback[2];  // after the copy from the dump, after the direct copy
+    uint32_t length;
+    uint64_t submission;
+    std::string what;
+  };
+  std::vector<DirectResolveVerify> direct_resolve_verify_pending_;
+  std::vector<uint64_t> direct_resolve_verify_keys_;
+  uint64_t direct_resolve_verify_exact_ = 0;
+  uint64_t direct_resolve_verify_differ_ = 0;
+  // Compares the finished ones (all: releases the rest unchecked).
+  void CheckDirectResolveVerifies(bool release_all);
 
   // Parameter 0 - 2 root constants (red, green).
   ID3D12RootSignature* uint32_rtv_clear_root_signature_ = nullptr;

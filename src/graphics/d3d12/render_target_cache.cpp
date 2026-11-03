@@ -47,6 +47,12 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
 
+REXCVAR_DEFINE_BOOL(direct_host_resolve_verify, false, "GPU",
+                    "Debug: copy a direct resolve both ways (dump and direct), compare the results (slow)");
+
+REXCVAR_DEFINE_BOOL(direct_host_resolve_keep_dump, false, "GPU",
+                    "Debug: with direct_host_resolve, still dump the render targets to the EDRAM buffer");
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -65,6 +71,14 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_4096_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_scaled_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_scaled_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_scaled_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_2xmsaa_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_2xmsaa_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_2xmsaa_scaled_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_2xmsaa_scaled_4096_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_4096_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_scaled_cs.h"
@@ -394,11 +408,23 @@ bool D3D12RenderTargetCache::Initialize() {
     Shutdown();
     return false;
   }
-  // Direct resolve currently shares the root signature shape with the resolve
-  // copy pass (constants + destination UAV + source SRV) and may diverge later.
-  direct_resolve_root_signature_color_ = resolve_copy_root_signature_;
+  // Direct resolve: the resolve copy's root signature with the render target's SRV as the
+  // source and two more constants (xe_resolve_direct_rt_tiles, xe_resolve_direct_rt_flags).
+  {
+    std::array<D3D12_ROOT_PARAMETER, 3> direct_resolve_root_parameters =
+        resolve_copy_root_parameters;
+    direct_resolve_root_parameters[0].Constants.Num32BitValues += 2;
+    D3D12_ROOT_SIGNATURE_DESC direct_resolve_root_signature_desc =
+        resolve_copy_root_signature_desc;
+    direct_resolve_root_signature_desc.pParameters = direct_resolve_root_parameters.data();
+    direct_resolve_root_signature_color_ =
+        ui::d3d12::util::CreateRootSignature(provider, direct_resolve_root_signature_desc);
+    if (direct_resolve_root_signature_color_ == nullptr) {
+      // Not fatal: every resolve then dumps, as without direct resolve.
+      REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the direct resolve root signature");
+    }
+  }
   direct_resolve_root_signature_depth_ = resolve_copy_root_signature_;
-  direct_resolve_root_signature_color_->AddRef();
   direct_resolve_root_signature_depth_->AddRef();
 
   // Create the resolve copying pipelines.
@@ -427,6 +453,53 @@ bool D3D12RenderTargetCache::Initialize() {
         rex::string::to_utf16(resolve_copy_shader_info.debug_name);
     resolve_copy_pipeline->SetName(reinterpret_cast<LPCWSTR>(resolve_copy_pipeline_name.c_str()));
     resolve_copy_pipelines_[i] = resolve_copy_pipeline;
+  }
+
+  // Direct resolve pipelines (1x and 2x MSAA source render targets). A missing one only means
+  // those resolves keep dumping.
+  if (direct_resolve_root_signature_color_) {
+    const bool extended = edram_layout().is_extended();
+    struct Code {
+      const void* data;
+      size_t size;
+    };
+    Code direct_codes[2];
+    if (draw_resolution_scaled) {
+      direct_codes[0] = extended
+          ? Code{shaders::resolve_direct_fast_32bpp_1xmsaa_scaled_4096_cs,
+                 sizeof(shaders::resolve_direct_fast_32bpp_1xmsaa_scaled_4096_cs)}
+          : Code{shaders::resolve_direct_fast_32bpp_1xmsaa_scaled_cs,
+                 sizeof(shaders::resolve_direct_fast_32bpp_1xmsaa_scaled_cs)};
+      direct_codes[1] = extended
+          ? Code{shaders::resolve_direct_fast_32bpp_2xmsaa_scaled_4096_cs,
+                 sizeof(shaders::resolve_direct_fast_32bpp_2xmsaa_scaled_4096_cs)}
+          : Code{shaders::resolve_direct_fast_32bpp_2xmsaa_scaled_cs,
+                 sizeof(shaders::resolve_direct_fast_32bpp_2xmsaa_scaled_cs)};
+    } else {
+      direct_codes[0] = extended
+          ? Code{shaders::resolve_direct_fast_32bpp_1xmsaa_4096_cs,
+                 sizeof(shaders::resolve_direct_fast_32bpp_1xmsaa_4096_cs)}
+          : Code{shaders::resolve_direct_fast_32bpp_1xmsaa_cs,
+                 sizeof(shaders::resolve_direct_fast_32bpp_1xmsaa_cs)};
+      direct_codes[1] = extended
+          ? Code{shaders::resolve_direct_fast_32bpp_2xmsaa_4096_cs,
+                 sizeof(shaders::resolve_direct_fast_32bpp_2xmsaa_4096_cs)}
+          : Code{shaders::resolve_direct_fast_32bpp_2xmsaa_cs,
+                 sizeof(shaders::resolve_direct_fast_32bpp_2xmsaa_cs)};
+    }
+    for (size_t i = 0; i < 2; ++i) {
+      ID3D12PipelineState* pipeline = ui::d3d12::util::CreateComputePipeline(
+          device, direct_codes[i].data, direct_codes[i].size, direct_resolve_root_signature_color_);
+      if (pipeline == nullptr) {
+        REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the {}x MSAA direct resolve pipeline",
+                     i + 1);
+        continue;
+      }
+      std::u16string pipeline_name = rex::string::to_utf16(
+          fmt::format("Resolve Direct Fast 32bpp {}xMSAA", i + 1));
+      pipeline->SetName(reinterpret_cast<LPCWSTR>(pipeline_name.c_str()));
+      direct_resolve_fast_32bpp_pipelines_[i] = pipeline;
+    }
   }
 
   // Using the cvar on emulator initialization so used pipelines are consistent
@@ -1033,7 +1106,65 @@ bool D3D12RenderTargetCache::Initialize() {
   return true;
 }
 
+void D3D12RenderTargetCache::CheckDirectResolveVerifies(bool release_all) {
+  uint64_t completed = command_processor_.GetCompletedSubmission();
+  for (size_t i = 0; i < direct_resolve_verify_pending_.size();) {
+    DirectResolveVerify& v = direct_resolve_verify_pending_[i];
+    if (!release_all && v.submission > completed) {
+      ++i;
+      continue;
+    }
+    if (!release_all) {
+      void* mapped[2] = {};
+      D3D12_RANGE range = {0, v.length};
+      if (SUCCEEDED(v.readback[0]->Map(0, &range, &mapped[0])) &&
+          SUCCEEDED(v.readback[1]->Map(0, &range, &mapped[1]))) {
+        const uint32_t* dump = static_cast<const uint32_t*>(mapped[0]);
+        const uint32_t* direct = static_cast<const uint32_t*>(mapped[1]);
+        uint32_t words = v.length / 4;
+        uint32_t differ = 0;
+        uint32_t first = UINT32_MAX;
+        for (uint32_t w = 0; w < words; ++w) {
+          if (dump[w] != direct[w]) {
+            if (first == UINT32_MAX) first = w;
+            ++differ;
+          }
+        }
+        if (differ) {
+          ++direct_resolve_verify_differ_;
+          // Where the dump's first differing 4 words are in the direct copy (and the other way):
+          // a shifted read shows as one offset.
+          auto find = [words](const uint32_t* in, const uint32_t* what) -> int64_t {
+            for (uint32_t w = 0; w + 4 <= words; ++w) {
+              if (std::memcmp(in + w, what, 16) == 0) return int64_t(w);
+            }
+            return -1;
+          };
+          int64_t dump_in_direct = first + 4 <= words ? find(direct, dump + first) : -1;
+          int64_t direct_in_dump = first + 4 <= words ? find(dump, direct + first) : -1;
+          REXGPU_INFO(
+              "Direct resolve verify: {} | {} of {} words differ, first at word {} (dump {:08X} "
+              "direct {:08X}); the dump's words there are at direct word {}, the direct's at dump "
+              "word {}",
+              v.what, differ, words, first, dump[first], direct[first], dump_in_direct,
+              direct_in_dump);
+        } else {
+          ++direct_resolve_verify_exact_;
+          REXGPU_INFO("Direct resolve verify: {} | exact ({} words)", v.what, words);
+        }
+      }
+      D3D12_RANGE no_write = {0, 0};
+      if (mapped[0]) v.readback[0]->Unmap(0, &no_write);
+      if (mapped[1]) v.readback[1]->Unmap(0, &no_write);
+    }
+    v.readback[0]->Release();
+    v.readback[1]->Release();
+    direct_resolve_verify_pending_.erase(direct_resolve_verify_pending_.begin() + i);
+  }
+}
+
 void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
+  CheckDirectResolveVerifies(true);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
@@ -1064,6 +1195,9 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
     }
   }
   direct_resolve_pipelines_.clear();
+  for (ID3D12PipelineState*& pipeline : direct_resolve_fast_32bpp_pipelines_) {
+    ui::d3d12::util::ReleaseAndNull(pipeline);
+  }
   ui::d3d12::util::ReleaseAndNull(direct_resolve_root_signature_depth_);
   ui::d3d12::util::ReleaseAndNull(direct_resolve_root_signature_color_);
   ui::d3d12::util::ReleaseAndNull(dump_root_signature_depth_);
@@ -1238,6 +1372,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                      uint32_t& written_address_out, uint32_t& written_length_out) {
   written_address_out = 0;
   written_length_out = 0;
+  if (!direct_resolve_verify_pending_.empty()) {
+    CheckDirectResolveVerifies(false);
+  }
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
@@ -1269,18 +1406,65 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
-      bool direct_resolved = false;
+      // Direct resolve: copy from the one render target owning the source span, without the
+      // dump to the EDRAM buffer (resolve_direct_fast_32bpp_*).
+      D3D12RenderTarget* direct_rt = nullptr;
+      uint32_t direct_rt_tiles = 0;
+      uint32_t direct_rt_flags = 0;
+      bool verify = false;
+      std::string verify_what;
       if (GetPath() == Path::kHostRenderTargets) {
         if (REXCVAR_GET(direct_host_resolve)) {
-          direct_resolved =
-              TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
-          if (direct_resolved) {
+          direct_rt =
+              GetDirectResolveSource(resolve_info, copy_shader, direct_rt_tiles, direct_rt_flags);
+          if (direct_rt) {
             ++direct_resolve_success_count_;
           } else {
             ++direct_resolve_fallback_count_;
           }
+          uint64_t total = direct_resolve_success_count_ + direct_resolve_fallback_count_;
+          if (total == 64 || total == 4096 || total == 262144) {
+            REXGPU_INFO("Direct resolve: {} of {} resolves without a dump",
+                        direct_resolve_success_count_, total);
+          }
         }
-        if (!direct_resolved) {
+        // direct_host_resolve_verify (a debug setting): each distinct span twice at most, 8 at a time,
+        // bindless only (the EDRAM source is a system view then, no descriptor to allocate).
+        if (direct_rt && REXCVAR_GET(direct_host_resolve_verify) && bindless_resources_used_ &&
+            direct_resolve_verify_pending_.size() < 8) {
+          uint32_t base, row_length, rows, pitch;
+          resolve_info.GetCopyEdramTileSpan(base, row_length, rows, pitch);
+          RenderTargetKey owner = direct_rt->key();
+          uint64_t key = uint64_t(base) | (uint64_t(pitch) << 12) | (uint64_t(rows) << 24) |
+                         (uint64_t(row_length) << 36) | (uint64_t(owner.base_tiles) << 48);
+          key ^= uint64_t(resolve_info.copy_dest_base) * 0x9E3779B97F4A7C15ull;
+          if (std::count(direct_resolve_verify_keys_.begin(), direct_resolve_verify_keys_.end(),
+                         key) < 2) {
+            direct_resolve_verify_keys_.push_back(key);
+            const draw_util::ResolveEdramInfo& edram = resolve_info.IsCopyingDepth()
+                                                           ? resolve_info.depth_edram_info
+                                                           : resolve_info.color_edram_info;
+            verify_what = fmt::format(
+                "span {}:{} rows {} row length {}, owner {}:{} msaa {} format {}, dest {:08X} | "
+                "resolve msaa {} format {} original base {} offset {},{} (x8) size {}x{} (x8) "
+                "half pixel {} sample {} extended {}",
+                base, pitch, rows, row_length, uint32_t(owner.base_tiles),
+                uint32_t(owner.pitch_tiles_at_32bpp), uint32_t(owner.msaa_samples),
+                uint32_t(owner.GetColorFormat()), resolve_info.copy_dest_base,
+                uint32_t(edram.msaa_samples), uint32_t(edram.format),
+                resolve_info.color_original_base,
+                uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8),
+                uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8),
+                uint32_t(resolve_info.coordinate_info.width_div_8), resolve_info.height_div_8,
+                uint32_t(edram.fill_half_pixel_offset),
+                uint32_t(resolve_info.rb_copy_control.copy_sample_select),
+                resolve_info.edram_extended);
+            verify = true;
+          }
+        }
+        // direct_host_resolve_keep_dump (a debug setting): the dump as well, so a check can tell a
+        // wrong direct copy from a later step that needed the dumped EDRAM buffer.
+        if (!direct_rt || verify || REXCVAR_GET(direct_host_resolve_keep_dump)) {
           // Dump the current contents of the render targets owning the affected
           // range to edram_buffer_.
           uint32_t dump_base;
@@ -1321,8 +1505,12 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_dest;
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_source;
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
+        // Bindless: one-use descriptors only for the scaled destination and a direct source.
         if (command_processor_.RequestOneUseSingleViewDescriptors(
-                bindless_resources_used_ ? uint32_t(draw_resolution_scaled) : 2, descriptors)) {
+                bindless_resources_used_
+                    ? uint32_t(draw_resolution_scaled) + uint32_t(direct_rt != nullptr)
+                    : 2,
+                descriptors)) {
           if (bindless_resources_used_) {
             if (draw_resolution_scaled) {
               descriptor_dest = descriptors[0];
@@ -1330,7 +1518,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
               descriptor_dest = command_processor_.GetSharedMemoryUintPow2BindlessUAVHandlePair(
                   copy_shader_info.dest_bpe_log2);
             }
-            if (copy_shader_info.source_is_raw) {
+            if (direct_rt) {
+              descriptor_source = descriptors[uint32_t(draw_resolution_scaled)];
+            } else if (copy_shader_info.source_is_raw) {
               descriptor_source = command_processor_.GetSystemBindlessViewHandlePair(
                   D3D12CommandProcessor::SystemBindlessView::kEdramRawSRV);
             } else {
@@ -1344,7 +1534,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                                        copy_shader_info.dest_bpe_log2);
             }
             descriptor_source = descriptors[1];
-            if (copy_shader_info.source_is_raw) {
+            if (direct_rt) {
+              // Written below.
+            } else if (copy_shader_info.source_is_raw) {
               WriteEdramRawSRVDescriptor(descriptor_source.first);
             } else {
               WriteEdramUintPow2SRVDescriptor(descriptor_source.first,
@@ -1359,23 +1551,130 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           } else {
             shared_memory.UseForWriting();
           }
-          TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          // direct_host_resolve_verify: the copy from the dump first (the normal one),
+          // the destination read back, then the direct copy below over it, read back again.
+          ID3D12Resource* verify_readback[2] = {};
+          ID3D12Resource* verify_source = nullptr;
+          uint64_t verify_offset = 0;
+          uint32_t verify_length = 0;
+          auto verify_copy_destination = [&](ID3D12Resource* readback) {
+            if (draw_resolution_scaled) {
+              texture_cache.MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
+              texture_cache.TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_COPY_SOURCE);
+            } else {
+              shared_memory.MarkUAVWritesCommitNeeded();
+              shared_memory.UseAsCopySource();
+            }
+            command_processor_.SubmitBarriers();
+            command_list.D3DCopyBufferRegion(readback, 0, verify_source, verify_offset,
+                                             verify_length);
+            if (draw_resolution_scaled) {
+              texture_cache.TransitionCurrentScaledResolveRange(
+                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            } else {
+              shared_memory.UseForWriting();
+            }
+          };
+          if (verify) {
+            if (draw_resolution_scaled) {
+              verify_source = texture_cache.GetCurrentScaledResolveBufferResource();
+              verify_offset =
+                  texture_cache.GetCurrentScaledResolveRangeStartScaled() -
+                  (uint64_t(texture_cache.GetCurrentScaledResolveBufferIndexPublic()) << 30);
+              verify_length = uint32_t(texture_cache.GetCurrentScaledResolveRangeLengthScaled());
+            } else {
+              verify_source = shared_memory.GetBuffer();
+              verify_offset = resolve_info.copy_dest_extent_start;
+              verify_length = resolve_info.copy_dest_extent_length;
+            }
+            verify_length &= ~uint32_t(3);
+            ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+            D3D12_RESOURCE_DESC readback_desc;
+            ui::d3d12::util::FillBufferResourceDesc(readback_desc, verify_length,
+                                                    D3D12_RESOURCE_FLAG_NONE);
+            for (ID3D12Resource*& readback : verify_readback) {
+              if (verify_length && verify_source &&
+                  FAILED(device->CreateCommittedResource(
+                      &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE,
+                      &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                      IID_PPV_ARGS(&readback)))) {
+                readback = nullptr;
+              }
+            }
+            if (!verify_readback[0] || !verify_readback[1]) {
+              ui::d3d12::util::ReleaseAndNull(verify_readback[0]);
+              ui::d3d12::util::ReleaseAndNull(verify_readback[1]);
+              verify = false;
+            }
+          }
+          if (verify) {
+            ui::d3d12::util::DescriptorCpuGpuHandlePair edram_source =
+                copy_shader_info.source_is_raw
+                    ? command_processor_.GetSystemBindlessViewHandlePair(
+                          D3D12CommandProcessor::SystemBindlessView::kEdramRawSRV)
+                    : command_processor_.GetEdramUintPow2BindlessSRVHandlePair(
+                          copy_shader_info.source_bpe_log2);
+            TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
+            command_list.D3DSetComputeRootDescriptorTable(2, edram_source.second);
+            command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
+            if (draw_resolution_scaled) {
+              command_list.D3DSetComputeRoot32BitConstants(
+                  0, sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t),
+                  &copy_shader_constants.dest_relative, 0);
+            } else {
+              command_list.D3DSetComputeRoot32BitConstants(
+                  0, sizeof(copy_shader_constants) / sizeof(uint32_t), &copy_shader_constants, 0);
+            }
+            command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
+            command_processor_.SubmitBarriers();
+            command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
+            verify_copy_destination(verify_readback[0]);
+          }
+          if (direct_rt) {
+            command_processor_.GetD3D12Provider().GetDevice()->CopyDescriptorsSimple(
+                1, descriptor_source.first, direct_rt->descriptor_srv().GetHandle(),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            command_processor_.PushTransitionBarrier(
+                direct_rt->resource(),
+                direct_rt->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          } else {
+            TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          }
 
           // Submit the resolve.
-          command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
+          command_list.D3DSetComputeRootSignature(
+              direct_rt ? direct_resolve_root_signature_color_ : resolve_copy_root_signature_);
           command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
           command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
-          if (draw_resolution_scaled) {
-            command_list.D3DSetComputeRoot32BitConstants(
-                0, sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t),
-                &copy_shader_constants.dest_relative, 0);
-          } else {
-            command_list.D3DSetComputeRoot32BitConstants(
-                0, sizeof(copy_shader_constants) / sizeof(uint32_t), &copy_shader_constants, 0);
+          // The shader's constants: the copy's (without dest_base when scaled), then for a direct
+          // resolve the render target's tiles and flags.
+          uint32_t root_constants[sizeof(copy_shader_constants) / sizeof(uint32_t) + 2];
+          uint32_t root_constant_count =
+              uint32_t((draw_resolution_scaled ? sizeof(copy_shader_constants.dest_relative)
+                                               : sizeof(copy_shader_constants)) /
+                       sizeof(uint32_t));
+          std::memcpy(root_constants, &copy_shader_constants, root_constant_count * sizeof(uint32_t));
+          if (direct_rt) {
+            root_constants[root_constant_count++] = direct_rt_tiles;
+            root_constants[root_constant_count++] = direct_rt_flags;
           }
-          command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
+          command_list.D3DSetComputeRoot32BitConstants(0, root_constant_count, root_constants, 0);
+          command_processor_.SetExternalPipeline(
+              direct_rt ? direct_resolve_fast_32bpp_pipelines_[size_t(
+                              direct_rt->key().msaa_samples == xenos::MsaaSamples::k2X)]
+                        : resolve_copy_pipelines_[size_t(copy_shader)]);
           command_processor_.SubmitBarriers();
           command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
+          if (verify) {
+            verify_copy_destination(verify_readback[1]);
+            direct_resolve_verify_pending_.push_back(
+                {{verify_readback[0], verify_readback[1]},
+                 verify_length,
+                 command_processor_.GetCurrentSubmission(),
+                 std::move(verify_what)});
+          }
 
           // Order the resolve with other work using the destination as a UAV.
           if (draw_resolution_scaled) {
@@ -5608,51 +5907,71 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDirectResolvePipeline(
   return pipeline;
 }
 
-bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
-                                                    draw_util::ResolveCopyShaderIndex copy_shader,
-                                                    bool draw_resolution_scaled) {
+D3D12RenderTargetCache::D3D12RenderTarget* D3D12RenderTargetCache::GetDirectResolveSource(
+    const draw_util::ResolveInfo& resolve_info, draw_util::ResolveCopyShaderIndex copy_shader,
+    uint32_t& rt_tiles_out, uint32_t& rt_flags_out) {
   ++direct_resolve_attempt_count_;
-  (void)copy_shader;
-  (void)draw_resolution_scaled;
-  if (!direct_resolve_root_signature_color_ || !direct_resolve_root_signature_depth_) {
-    return false;
+  // The direct shaders are resolve_fast_32bpp_1x2xmsaa's (no sample averaging, 32bpp).
+  if (copy_shader != draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA ||
+      !direct_resolve_root_signature_color_) {
+    return nullptr;
   }
-
   uint32_t dump_base;
   uint32_t dump_row_length_used;
   uint32_t dump_rows;
   uint32_t dump_pitch;
   resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-  GetResolveCopyDispatchesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
-                                 dump_rectangles_, direct_resolve_dispatches_);
-  if (direct_resolve_dispatches_.empty()) {
-    return false;
+  GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+                                 dump_rectangles_);
+  // Exactly one render target owning the whole span; else parts would come from other render
+  // targets or from what the EDRAM buffer still holds.
+  if (dump_rectangles_.size() != 1) {
+    return nullptr;
   }
-
-  for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
-    const auto* render_target = static_cast<const D3D12RenderTarget*>(rectangle.render_target);
-    if (render_target == nullptr) {
-      return false;
-    }
-    DumpPipelineKey dump_pipeline_key;
-    dump_pipeline_key.msaa_samples = render_target->key().msaa_samples;
-    dump_pipeline_key.resource_format = render_target->key().resource_format;
-    dump_pipeline_key.is_depth = render_target->key().is_depth;
-    if (!GetOrCreateDumpPipeline(dump_pipeline_key)) {
-      return false;
-    }
-    DirectResolvePipelineKey direct_pipeline_key;
-    direct_pipeline_key.dump_pipeline_key = dump_pipeline_key;
-    direct_pipeline_key.copy_shader = copy_shader;
-    direct_pipeline_key.draw_resolution_scaled = draw_resolution_scaled;
-    if (!GetOrCreateDirectResolvePipeline(direct_pipeline_key)) {
-      return false;
-    }
+  const ResolveCopyDumpRectangle& rectangle = dump_rectangles_.front();
+  if (rectangle.row_first != 0 || rectangle.rows != dump_rows || rectangle.row_first_start != 0 ||
+      rectangle.row_last_end != std::min(dump_row_length_used, dump_pitch)) {
+    return nullptr;
   }
-
-  // Dedicated direct resolve dispatches are staged behind the same preflight;
-  // keep using the existing dump path until source-image direct shaders land.
-  return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+  auto* rt = static_cast<D3D12RenderTarget*>(rectangle.render_target);
+  if (rt == nullptr) {
+    return nullptr;
+  }
+  RenderTargetKey rt_key = rt->key();
+  // Only a render target laid out like the resolve reads it: the verify check (2026-11-03, SF
+  // Woodburrow, 63 resolves compared byte for byte) found every such copy exact and one span read
+  // with another pitch than its owner's (0:4 rows 32 from the 0:16 scene) different; those keep the
+  // dump.
+  if (rt_key.pitch_tiles_at_32bpp != dump_pitch) {
+    return nullptr;
+  }
+  // The same for the samples: no resolve read another MSAA mode than its owner's in the check.
+  if (rt_key.msaa_samples != resolve_info.color_edram_info.msaa_samples) {
+    return nullptr;
+  }
+  if (rt_key.is_depth || rt_key.msaa_samples > xenos::MsaaSamples::k2X ||
+      !direct_resolve_fast_32bpp_pipelines_[size_t(rt_key.msaa_samples ==
+                                                   xenos::MsaaSamples::k2X)]) {
+    return nullptr;
+  }
+  // The dump's packing for the render target's format, read through its UNORM SRV.
+  uint32_t packing;
+  switch (rt_key.GetColorFormat()) {
+    case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+      packing = 0;
+      break;
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
+      packing = 1;
+      break;
+    default:
+      return nullptr;
+  }
+  rt_tiles_out = rt_key.base_tiles | (rt_key.pitch_tiles_at_32bpp << 16);
+  rt_flags_out = packing |
+                 (draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_supported_) << 4) |
+                 (draw_util::GetD3D10SampleIndexForGuest2xMSAA(1, msaa_2x_supported_) << 6);
+  return rt;
 }
 
 bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
