@@ -33,7 +33,20 @@ class DeferredCommandList {
                       size_t initial_size_bytes = 1_MiB);
 
   void Reset();
-  void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
+  void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1) {
+    ExecuteStream(command_stream_, command_list, command_list_1);
+  }
+  // Hands the recorded commands over in `stream` and goes on writing into the buffer `stream` held
+  // (cleared), so they can be replayed with ExecuteStream on another thread while this list records
+  // the next submission (the D3D12 command processor's d3d12_async_submission).
+  void SwapStream(std::vector<uintmax_t>& stream) {
+    command_stream_.swap(stream);
+    command_stream_.clear();
+  }
+  // Replays commands recorded by a list of this command processor. Only reads `stream` and the
+  // command processor's pipelines (atomic), so it may run beside the recording of the next stream.
+  void ExecuteStream(const std::vector<uintmax_t>& stream, ID3D12GraphicsCommandList* command_list,
+                     ID3D12GraphicsCommandList1* command_list_1) const;
 
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,

@@ -57,6 +57,13 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Where the command processor thread is the limit (Spyro's Adventure's busy levels), about a tenth
+// of its time went into replaying the recorded commands into the D3D12 command list, mostly inside
+// the driver. A thread of its own does that now while the command processor goes on.
+REXCVAR_DEFINE_BOOL(d3d12_async_submission, true, "GPU/D3D12",
+                    "Replay and submit the recorded commands on a thread of their own")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -916,6 +923,17 @@ bool D3D12CommandProcessor::SetupContext() {
   // Optional - added in Creators Update (SDK 10.0.15063.0).
   command_list_->QueryInterface(IID_PPV_ARGS(&command_list_1_));
 
+  if (REXCVAR_GET(d3d12_async_submission)) {
+    submit_stop_ = false;
+    submit_job_pending_ = false;
+    submit_thread_ = rex::thread::Thread::Create({}, [this]() { SubmitThreadMain(); });
+    if (submit_thread_) {
+      submit_thread_->set_name("GPU Submit");
+    } else {
+      REXGPU_WARN("Failed to create the submit thread, submitting on the command processor's");
+    }
+  }
+
   bindless_resources_used_ = REXCVAR_GET(d3d12_bindless) &&
                              provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
 
@@ -1638,6 +1656,7 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  ShutdownSubmitThread();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -3598,12 +3617,18 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // happens between Xenia submissions.
     ID3D12CommandAllocator* command_allocator =
         command_allocator_writable_first_->command_allocator;
-    command_allocator->Reset();
-    command_list_->Reset(command_allocator, nullptr);
-    deferred_command_list_.Execute(command_list_, command_list_1_);
-    command_list_->Close();
-    ID3D12CommandList* execute_command_lists[] = {command_list_};
-    direct_queue->ExecuteCommandLists(1, execute_command_lists);
+    if (submit_thread_) {
+      // The submit thread replays, submits and signals submission_current_; a swap waits for it
+      // (the presenter's commands follow on the same queue).
+      SubmitRecordedCommands(command_allocator, submission_current_, is_swap);
+    } else {
+      command_allocator->Reset();
+      command_list_->Reset(command_allocator, nullptr);
+      deferred_command_list_.Execute(command_list_, command_list_1_);
+      command_list_->Close();
+      ID3D12CommandList* execute_command_lists[] = {command_list_};
+      direct_queue->ExecuteCommandLists(1, execute_command_lists);
+    }
     command_allocator_writable_first_->last_usage_submission = submission_current_;
     if (command_allocator_submitted_last_) {
       command_allocator_submitted_last_->next = command_allocator_writable_first_;
@@ -3617,7 +3642,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       command_allocator_writable_last_ = nullptr;
     }
 
-    direct_queue->Signal(submission_fence_, submission_current_++);
+    if (!submit_thread_) {
+      direct_queue->Signal(submission_fence_, submission_current_);
+    }
+    ++submission_current_;
 
     submission_open_ = false;
 
@@ -3669,6 +3697,61 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   }
 
   return true;
+}
+
+void D3D12CommandProcessor::SubmitRecordedCommands(ID3D12CommandAllocator* command_allocator,
+                                                   uint64_t fence_value, bool await_submitted) {
+  std::unique_lock<std::mutex> lock(submit_mutex_);
+  // One job at a time: the previous one owns command_list_ and the other stream buffer.
+  submit_done_cv_.wait(lock, [this] { return !submit_job_pending_; });
+  deferred_command_list_.SwapStream(submit_stream_);
+  submit_command_allocator_ = command_allocator;
+  submit_fence_value_ = fence_value;
+  submit_job_pending_ = true;
+  submit_job_cv_.notify_one();
+  if (await_submitted) {
+    submit_done_cv_.wait(lock, [this] { return !submit_job_pending_; });
+  }
+}
+
+void D3D12CommandProcessor::SubmitThreadMain() {
+  ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
+  std::unique_lock<std::mutex> lock(submit_mutex_);
+  while (true) {
+    submit_job_cv_.wait(lock, [this] { return submit_job_pending_ || submit_stop_; });
+    if (!submit_job_pending_) {
+      break;
+    }
+    ID3D12CommandAllocator* command_allocator = submit_command_allocator_;
+    uint64_t fence_value = submit_fence_value_;
+    // The command processor doesn't touch the job (stream, command list) until it is done.
+    lock.unlock();
+    command_allocator->Reset();
+    command_list_->Reset(command_allocator, nullptr);
+    deferred_command_list_.ExecuteStream(submit_stream_, command_list_, command_list_1_);
+    command_list_->Close();
+    ID3D12CommandList* execute_command_lists[] = {command_list_};
+    direct_queue->ExecuteCommandLists(1, execute_command_lists);
+    direct_queue->Signal(submission_fence_, fence_value);
+    lock.lock();
+    submit_stream_.clear();
+    submit_job_pending_ = false;
+    submit_done_cv_.notify_all();
+  }
+}
+
+void D3D12CommandProcessor::ShutdownSubmitThread() {
+  if (!submit_thread_) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(submit_mutex_);
+    submit_stop_ = true;
+  }
+  submit_job_cv_.notify_one();
+  rex::thread::Wait(submit_thread_.get(), false);
+  submit_thread_.reset();
+  submit_stream_.clear();
 }
 
 bool D3D12CommandProcessor::CanEndSubmissionImmediately() const {

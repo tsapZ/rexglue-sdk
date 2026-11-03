@@ -14,8 +14,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -37,6 +39,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/system/kernel_state.h>
+#include <rex/thread.h>
 #include <rex/ui/d3d12/d3d12_descriptor_heap_pool.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
@@ -467,6 +470,32 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   DeferredCommandList deferred_command_list_;
+
+  // Async submission (d3d12_async_submission): EndSubmission hands the recorded commands to the
+  // submit thread, which replays them into command_list_ (the driver's share of the work), submits
+  // them and signals their fence value, while this thread records the next submission. Fence values
+  // and the command allocators' bookkeeping stay on this thread, so every wait on the fence works as
+  // before. The swap's submission waits until it has been submitted, because the presenter puts its
+  // own work on the queue right after the refresher returns.
+  void SubmitThreadMain();
+  // Gives the recorded commands to the submit thread (after the previous job is done); with
+  // `await_submitted`, returns only once they are on the queue.
+  void SubmitRecordedCommands(ID3D12CommandAllocator* command_allocator, uint64_t fence_value,
+                              bool await_submitted);
+  void ShutdownSubmitThread();
+  std::unique_ptr<rex::thread::Thread> submit_thread_;
+  std::mutex submit_mutex_;
+  // The submit thread waits on this for a job or the stop.
+  std::condition_variable submit_job_cv_;
+  // This thread waits on this for the submit thread to finish its job.
+  std::condition_variable submit_done_cv_;
+  // True from the handover until the job is on the queue.
+  bool submit_job_pending_ = false;
+  bool submit_stop_ = false;
+  // The job's commands while one is pending, the spare buffer (empty) otherwise.
+  std::vector<uintmax_t> submit_stream_;
+  ID3D12CommandAllocator* submit_command_allocator_ = nullptr;
+  uint64_t submit_fence_value_ = 0;
 
   bool debug_markers_enabled_ = false;
 
