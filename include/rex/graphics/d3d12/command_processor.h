@@ -750,6 +750,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Last rex::graphics::PixelConstantOverrideGeneration() the pixel float constants were built
   // with; a change forces a re-upload so override settings apply immediately.
   uint64_t pixel_constant_override_generation_ = 0;
+  // pipeline_wait_budget_ms: how long this frame's draws have waited for pipelines so far.
+  int64_t pipeline_wait_used_us_ = 0;
   ConstantBufferBinding cbuffer_binding_bool_loop_;
   ConstantBufferBinding cbuffer_binding_fetch_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_vertex_;

@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -63,6 +64,12 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_async_submission, true, "GPU/D3D12",
                     "Replay and submit the recorded commands on a thread of their own")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(pipeline_wait_budget_ms, 4, "GPU",
+                     "With async shader compilation: how long per frame draws may wait for a "
+                     "pipeline still being created before they are skipped (0 = skip at once)")
+    .range(0, 50)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::d3d12 {
 
@@ -1978,6 +1985,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // coordinates and came out green on the right and bottom). Once per frame, every vertex buffer is
   // requested again.
   InvalidateAllVertexBufferResidency();
+  // A new frame gets the whole pipeline_wait_budget_ms again.
+  pipeline_wait_used_us_ = 0;
 
   if (!graphics_system_)
     return;
@@ -2500,7 +2509,24 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-    return true;
+    // Its pipeline is still being created: wait a little for it, within a budget per frame. Most
+    // take well under a few milliseconds (Giants' ship, 2026-11-03: 0.2-5 ms), and a skipped draw is
+    // an object missing from the picture for a frame or a few (there: frames with a skipped draw 78
+    // -> 7 per run with 4 ms, the rest in loading screens).
+    ID3D12PipelineState* waited = nullptr;
+    const int64_t budget_us = int64_t(REXCVAR_GET(pipeline_wait_budget_ms)) * 1000;
+    if (pipeline_wait_used_us_ < budget_us) {
+      const auto wait_start = std::chrono::steady_clock::now();
+      waited = pipeline_cache_->WaitForPipeline(
+          pipeline_handle,
+          wait_start + std::chrono::microseconds(budget_us - pipeline_wait_used_us_));
+      pipeline_wait_used_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - wait_start)
+                                    .count();
+    }
+    if (!waited) {
+      return true;
+    }
   }
 
   // Update the textures - this may bind pipelines.

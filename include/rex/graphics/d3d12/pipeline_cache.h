@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -95,6 +96,20 @@ class PipelineCache {
   // if failed to create the pipeline.
   ID3D12PipelineState* GetD3D12PipelineByHandle(void* handle) const {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(std::memory_order_acquire);
+  }
+  // Waits until the pipeline behind the handle is created (or has failed) or the deadline has
+  // passed; the pipeline then, nullptr if it isn't there (yet). For a draw that would otherwise be
+  // skipped while the creation threads work on its pipeline.
+  ID3D12PipelineState* WaitForPipeline(void* handle,
+                                       std::chrono::steady_clock::time_point deadline) const {
+    const Pipeline* pipeline = reinterpret_cast<const Pipeline*>(handle);
+    while (!pipeline->done.load(std::memory_order_acquire)) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return nullptr;
+      }
+      std::this_thread::yield();
+    }
+    return pipeline->state.load(std::memory_order_acquire);
   }
 
  private:
@@ -345,6 +360,9 @@ class PipelineCache {
   struct Pipeline {
     // nullptr if creation has failed.
     std::atomic<ID3D12PipelineState*> state{nullptr};
+    // Set once state holds the result (a pipeline or nullptr for a failure), so a pending one can be
+    // told from a failed one (WaitForPipeline).
+    std::atomic<bool> done{false};
     std::atomic<ID3D12RootSignature*> root_signature{nullptr};
     PipelineRuntimeDescription description;
     D3D12Shader::D3D12Translation* pending_vertex_shader = nullptr;
