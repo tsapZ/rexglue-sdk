@@ -41,6 +41,16 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(render_target_update_skip, true, "GPU",
+                    "Skip the render target lookups and EDRAM ownership walks of a draw whose "
+                    "render targets and ranges are already owned since the last draw")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(render_target_update_skip_verify, false, "GPU",
+                    "Debug: check every skipped render target update the long way and log any "
+                    "difference")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
 
 void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format,
@@ -335,6 +345,7 @@ RenderTargetCache::~RenderTargetCache() {
 }
 
 void RenderTargetCache::InitializeCommon() {
+  ++ownership_generation_;
   assert_true(ownership_ranges_.empty());
   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                             std::forward_as_tuple(edram_layout_.tile_count, RenderTargetKey(),
@@ -342,6 +353,7 @@ void RenderTargetCache::InitializeCommon() {
 }
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
+  ++ownership_generation_;
   ownership_ranges_.clear();
   if (!shutting_down) {
     ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
@@ -362,7 +374,9 @@ void RenderTargetCache::ShutdownCommon() {
 }
 
 void RenderTargetCache::ClearCache() {
-  // Keep only render targets currently owning any EDRAM data.
+  // Keep only render targets currently owning any EDRAM data. A render target the last Update
+  // bound with an empty range owns nothing and may go, so update_skip_ must look again.
+  ++ownership_generation_;
   if (!render_targets_.empty()) {
     std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> used_render_targets;
     for (const auto& ownership_range_pair : ownership_ranges_) {
@@ -630,6 +644,16 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       ((height_used << uint32_t(msaa_samples >= xenos::MsaaSamples::k2X)) +
        (xenos::kEdramTileHeightSamples - 1)) /
       xenos::kEdramTileHeightSamples * pitch_tiles_at_32bpp;
+  // The same render targets as the last update that claimed ownership, in the same order, with
+  // ranges no longer than it claimed and nothing changed in the ownership map since: every tile of
+  // every range is owned by its render target already, so ChangeOwnership would neither transfer
+  // nor change anything, and the lookups would return the same render targets (none can have been
+  // deleted: ClearCache bumps the generation).
+  bool skip_ownership = !interlock_barrier_only && REXCVAR_GET(render_target_update_skip) &&
+                        update_skip_.valid &&
+                        update_skip_.ownership_generation == ownership_generation_ &&
+                        update_skip_.used_bits == depth_and_color_rts_used_bits &&
+                        update_skip_.sorted_count == edram_bases_sorted_count;
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_base = rt_base_index.first;
@@ -641,9 +665,16 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     rt_key.is_depth = rt_bit_index == 0;
     rt_key.resource_format = resource_formats[rt_bit_index];
     if (!interlock_barrier_only) {
-      RenderTarget* render_target = GetOrCreateRenderTarget(rt_key);
-      if (!render_target) {
-        return false;
+      RenderTarget* render_target;
+      if (skip_ownership && update_skip_.sorted_bit_indices[i] == rt_bit_index &&
+          update_skip_.keys[rt_bit_index] == rt_key) {
+        render_target = update_skip_.render_targets[rt_bit_index];
+      } else {
+        skip_ownership = false;
+        render_target = GetOrCreateRenderTarget(rt_key);
+        if (!render_target) {
+          return false;
+        }
       }
       rts[rt_bit_index] = render_target;
     }
@@ -657,6 +688,33 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                         ? edram_bases_sorted[i + 1].first
                                         : (edram_layout_.tile_count + edram_bases_sorted[0].first)) -
                                        rt_base);
+    if (skip_ownership && rt_lengths_tiles[i] > update_skip_.lengths_tiles[i]) {
+      skip_ownership = false;
+    }
+  }
+
+  if (skip_ownership && REXCVAR_GET(render_target_update_skip_verify)) {
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      uint32_t rt_bit_index = edram_bases_sorted[i].second;
+      const RenderTargetKey& rt_key = rt_keys[rt_bit_index];
+      bool owned = IsRangeOwnedBy(rt_key, rt_lengths_tiles[i]);
+      auto rt_it = render_targets_.find(rt_key);
+      bool same_rt = rt_it != render_targets_.end() && rt_it->second == rts[rt_bit_index];
+      if (!owned || !same_rt) {
+        if (++update_skip_mismatches_ <= 20) {
+          REXGPU_WARN(
+              "Render target update skip verify: slot {} base {} pitch {} msaa {} format {} "
+              "length {} tiles: {}",
+              rt_bit_index, uint32_t(rt_key.base_tiles), uint32_t(rt_key.pitch_tiles_at_32bpp),
+              uint32_t(1) << uint32_t(rt_key.msaa_samples), uint32_t(rt_key.resource_format),
+              rt_lengths_tiles[i], !owned ? "NOT OWNED" : "DIFFERENT RENDER TARGET");
+        }
+      }
+    }
+    if ((++update_skip_verified_ & 0x3FFF) == 0) {
+      REXGPU_INFO("Render target update skip verify: {} skipped updates checked, {} differ",
+                  update_skip_verified_, update_skip_mismatches_);
+    }
   }
 
   if (interlock_barrier_only) {
@@ -684,11 +742,27 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // draw with whatever contents currently are in the render target in this
   // case).
 
-  for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
-    const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
-    uint32_t rt_bit_index = rt_base_index.second;
-    ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
-                    interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+  if (!skip_ownership) {
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
+      uint32_t rt_bit_index = rt_base_index.second;
+      ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
+                      interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+    }
+    if (!interlock_barrier_only) {
+      // What this update claimed, after its own ChangeOwnership calls bumped the generation.
+      update_skip_.valid = true;
+      update_skip_.ownership_generation = ownership_generation_;
+      update_skip_.used_bits = depth_and_color_rts_used_bits;
+      update_skip_.sorted_count = edram_bases_sorted_count;
+      for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+        uint32_t rt_bit_index = edram_bases_sorted[i].second;
+        update_skip_.sorted_bit_indices[i] = rt_bit_index;
+        update_skip_.lengths_tiles[i] = rt_lengths_tiles[i];
+        update_skip_.keys[rt_bit_index] = rt_keys[rt_bit_index];
+        update_skip_.render_targets[rt_bit_index] = rts[rt_bit_index];
+      }
+    }
   }
 
   if (interlock_barrier_only) {
@@ -1127,6 +1201,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
 
 void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
   assert_true(GetPath() == Path::kPixelShaderInterlock);
+  ++ownership_generation_;
   // Clear ownership - any overlap of data written before the barrier is safe.
   OwnershipRange empty_range(edram_layout_.tile_count, RenderTargetKey(), RenderTargetKey(),
                              RenderTargetKey());
@@ -1238,6 +1313,38 @@ bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey des
   return false;
 }
 
+bool RenderTargetCache::IsRangeOwnedBy(RenderTargetKey dest, uint32_t length_tiles) const {
+  if (length_tiles == 0) {
+    return true;
+  }
+  bool host_depth_encoding_different = dest.is_depth && GetPath() == Path::kHostRenderTargets &&
+                                       IsHostDepthEncodingDifferent(dest.GetDepthFormat());
+  auto owned_in_extent = [&](uint32_t extent_start, uint32_t extent_end) -> bool {
+    // The map has no gaps and starts at 0: the range holding extent_start is the last one
+    // starting at or before it.
+    auto it = ownership_ranges_.upper_bound(extent_start);
+    if (it == ownership_ranges_.begin()) {
+      return false;
+    }
+    for (--it; it != ownership_ranges_.end() && it->first < extent_end; ++it) {
+      if (!it->second.IsOwnedBy(dest, host_depth_encoding_different)) {
+        return false;
+      }
+    }
+    return true;
+  };
+  uint32_t start_tiles = dest.base_tiles & edram_layout_.tile_mask();
+  uint32_t end_tiles = start_tiles + length_tiles;
+  if (!owned_in_extent(start_tiles, std::min(end_tiles, edram_layout_.tile_count))) {
+    return false;
+  }
+  if (end_tiles > edram_layout_.tile_count &&
+      !owned_in_extent(0, std::min(end_tiles & edram_layout_.tile_mask(), start_tiles))) {
+    return false;
+  }
+  return true;
+}
+
 void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,
                                         uint32_t length_tiles,
                                         std::vector<Transfer>* transfers_append_out,
@@ -1249,6 +1356,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
   if (length_tiles == 0) {
     return;
   }
+  ++ownership_generation_;
   uint32_t dest_pitch_tiles = dest.GetPitchTiles();
   bool dest_is_64bpp = dest.Is64bpp();
   bool host_depth_encoding_different = dest.is_depth && GetPath() == Path::kHostRenderTargets &&

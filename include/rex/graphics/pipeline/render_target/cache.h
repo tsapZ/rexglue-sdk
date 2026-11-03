@@ -658,6 +658,9 @@ class RenderTargetCache {
   void ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,
                        uint32_t length_tiles, std::vector<Transfer>* transfers_append_out,
                        const Transfer::Rectangle* resolve_clear_cutout = nullptr);
+  // Whether every tile of the length_tiles from dest's base (with EDRAM addressing wrapping) is
+  // owned by dest, as ChangeOwnership would leave it (render_target_update_skip_verify).
+  bool IsRangeOwnedBy(RenderTargetKey dest, uint32_t length_tiles) const;
 
   // If failed to create, may contain nullptr to prevent attempting to create a
   // render target twice.
@@ -694,6 +697,30 @@ class RenderTargetCache {
   // render targets. They are reordered so for one source, all transfers are
   // consecutive in the array.
   std::vector<Transfer> last_update_transfers_[1 + xenos::kMaxColorRenderTargets];
+
+  // Bumped by everything that changes ownership_ranges_ or may delete render targets (for
+  // update_skip_).
+  uint64_t ownership_generation_ = 0;
+  // The render targets of the last Update that claimed ownership and the ranges it claimed. A draw
+  // with the same render targets in the same slots whose ranges are no longer, with no ownership
+  // change since, would only find every tile already owned by its render target (no transfer, no
+  // change to the map), so Update skips the render target lookups and the ChangeOwnership walks
+  // then (render_target_update_skip).
+  struct UpdateSkipState {
+    bool valid = false;
+    uint64_t ownership_generation = 0;
+    uint32_t used_bits = 0;
+    uint32_t sorted_count = 0;
+    // In EDRAM base order, as Update sorts them.
+    uint32_t sorted_bit_indices[1 + xenos::kMaxColorRenderTargets] = {};
+    uint32_t lengths_tiles[1 + xenos::kMaxColorRenderTargets] = {};
+    // By bit index (0 depth, 1... color).
+    RenderTargetKey keys[1 + xenos::kMaxColorRenderTargets];
+    RenderTarget* render_targets[1 + xenos::kMaxColorRenderTargets] = {};
+  };
+  UpdateSkipState update_skip_;
+  uint64_t update_skip_verified_ = 0;
+  uint64_t update_skip_mismatches_ = 0;
 };
 
 }  // namespace rex::graphics
