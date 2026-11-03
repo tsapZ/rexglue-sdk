@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -386,6 +387,41 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
     if (!EnsureHostGpuMemoryAllocated(range.first, range.second)) {
       return false;
+    }
+  }
+
+  // Almost every draw asks for pages that are valid already (nothing to upload), and the global
+  // critical region below is the one the guest threads take too, so waiting for it showed up in
+  // the command processor's profile (~4 % of its samples, some of them blocked). Look at the
+  // valid bits without it first: a page another thread invalidates right now is the same race as
+  // it invalidating the page just after the locked check, so the answer means the same. Bits only
+  // get set on this thread (MakeRangeValid after an upload or a resolve), other threads only clear
+  // them (MemoryInvalidationCallback), all under the lock; these are relaxed 64-bit loads.
+  {
+    bool all_valid = true;
+    for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+      uint32_t page_first = range.first >> page_size_log2_;
+      uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+      uint32_t block_first = page_first >> 6;
+      uint32_t block_last = page_last >> 6;
+      for (uint32_t i = block_first; i <= block_last && all_valid; ++i) {
+        uint64_t block_valid =
+            std::atomic_ref<uint64_t>(system_page_flags_valid_[i]).load(std::memory_order_relaxed);
+        if (i == block_first) {
+          block_valid |= (uint64_t(1) << (page_first & 63)) - 1;
+        }
+        if (i == block_last && (page_last & 63) != 63) {
+          block_valid |= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
+        }
+        all_valid = block_valid == UINT64_MAX;
+      }
+      if (!all_valid) {
+        break;
+      }
+    }
+    if (all_valid) {
+      COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
+      return true;
     }
   }
 
