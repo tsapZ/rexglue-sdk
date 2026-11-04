@@ -245,6 +245,16 @@ bool DrawExtentEstimator::TriangleCoversRectangle(const Shader& vertex_shader, i
   if (!(std::abs(area) > 1.0)) {
     return false;
   }
+  // With culling on, the triangle must face the side that is drawn. Facing as the host rasterizer
+  // gets it (pipeline_cache: FrontCounterClockwise = face == 0), on the render target with y down,
+  // where a positive area here is clockwise.
+  if (pa_su_sc_mode_cntl.cull_front || pa_su_sc_mode_cntl.cull_back) {
+    bool clockwise = area > 0.0;
+    bool front = pa_su_sc_mode_cntl.face ? clockwise : !clockwise;
+    if (front ? pa_su_sc_mode_cntl.cull_front : pa_su_sc_mode_cntl.cull_back) {
+      return false;
+    }
+  }
   double center = (REXCVAR_GET(half_pixel_offset) &&
                    regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero)
                       ? 0.0

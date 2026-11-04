@@ -31,9 +31,10 @@ class DrawExtentEstimator {
   uint32_t EstimateVertexMaxY(const Shader& vertex_shader);
   uint32_t EstimateMaxY(bool try_to_estimate_vertex_max_y, const Shader& vertex_shader);
   // Whether the draw is a single triangle that, with its vertex shader run here and the viewport
-  // transform applied, contains the guest pixel rectangle [x0, x1) x [y0, y1) with a pixel to spare
-  // on every side, nothing of it clipped away (no user clip planes, no killed vertex, depth in the
-  // clip range at every vertex). For skipping ownership transfers the draw overwrites anyway.
+  // transform applied, covers every pixel center of the guest pixel rectangle [x0, x1) x [y0, y1)
+  // as the rasterizer decides it (the top-left rule), facing a side that isn't culled, nothing of it
+  // clipped away (no user clip planes, no killed vertex, depth in the clip range at every vertex).
+  // For skipping ownership transfers the draw overwrites anyway.
   bool TriangleCoversRectangle(const Shader& vertex_shader, int32_t x0, int32_t y0, int32_t x1,
                                int32_t y1);
 

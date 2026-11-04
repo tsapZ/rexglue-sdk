@@ -754,9 +754,10 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // don't need what another render target left there (SF Woodburrow at scale 2: a third of the
   // transfers went into targets the very next full-screen pass wrote over, 2026-11-04). The draw must
   // write every pixel there: one triangle containing the rows (its vertex shader run on the CPU), no
-  // pixel kill, alpha test or alpha to coverage, no depth or stencil test that can fail, no culling,
-  // all four channels without blending. Depth targets keep their transfers (their stencil would be
-  // lost). Leading tiles in sorted order: claimed without a transfer.
+  // pixel kill, alpha test or alpha to coverage, no depth or stencil test that can fail, facing a
+  // side that isn't culled (Imaginators and SuperChargers draw their full-screen passes with
+  // culling on), all four channels without blending. Depth targets keep their transfers (their
+  // stencil would be lost). Leading tiles in sorted order: claimed without a transfer.
   uint32_t overwritten_tiles[1 + xenos::kMaxColorRenderTargets] = {};
   if (!skip_ownership && !interlock_barrier_only && pixel_shader &&
       REXCVAR_GET(transfer_skip_overwritten)) {
@@ -767,8 +768,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
         vgt_draw_initiator.prim_type == xenos::PrimitiveType::kTriangleList &&
         vgt_draw_initiator.num_indices == 3 && pixel_shader->is_ucode_analyzed() &&
         !pixel_shader->kills_pixels() && !rb_colorcontrol.alpha_test_enable &&
-        !rb_colorcontrol.alpha_to_mask_enable && !pa_su_sc_mode_cntl.cull_front &&
-        !pa_su_sc_mode_cntl.cull_back &&
+        !rb_colorcontrol.alpha_to_mask_enable &&
+        !(pa_su_sc_mode_cntl.cull_front && pa_su_sc_mode_cntl.cull_back) &&
         pa_su_sc_mode_cntl.poly_mode != xenos::PolygonModeEnable::kDualMode &&
         !normalized_depth_control.stencil_enable &&
         (!normalized_depth_control.z_enable ||
