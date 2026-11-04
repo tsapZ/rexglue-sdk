@@ -358,6 +358,10 @@ class CommandProcessor {
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;
+  // Whether the gpu log takes debug lines (for writes to unknown registers), asked once per
+  // primary buffer: asked on every register write, the logger calls were ~3 % of the command
+  // thread's time in Spyro's Adventure.
+  bool log_unknown_register_writes_ = false;
 };
 
 }  // namespace rex::graphics

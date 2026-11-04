@@ -522,8 +522,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
   // GetRegisterInfo is a switch over every known register; ask it only when its debug line would
   // be written. Run for every register write, it was about a fifth of the command processor's time.
-  if (auto* gpu_log = ::rex::GetLoggerRaw(::rex::log::gpu());
-      gpu_log && gpu_log->should_log(spdlog::level::debug) && !regs.GetRegisterInfo(index)) {
+  if (log_unknown_register_writes_ && !regs.GetRegisterInfo(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -782,6 +781,12 @@ void CommandProcessor::ReturnFromWait() {}
 
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
   SCOPE_profile_cpu_f("gpu");
+
+  // For WriteRegister, here rather than on every register write.
+  {
+    auto* gpu_log = ::rex::GetLoggerRaw(::rex::log::gpu());
+    log_unknown_register_writes_ = gpu_log && gpu_log->should_log(spdlog::level::debug);
+  }
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
