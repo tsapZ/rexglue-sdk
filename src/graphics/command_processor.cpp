@@ -41,9 +41,16 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
-REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
-                    "Refresh page-valid state from GPU-written memory at frame end. "
-                    "Disable for minor CPU overhead reduction, but may break memory coherency.")
+// Off by default, as in Xenia: with it on, every page the CPU uploaded loses its valid bit at the
+// end of each frame, so the next frame copies every vertex buffer it draws from guest memory
+// again (Spyro's Adventure: 16.6 MB in ~950 uploads per frame, where the CPU's writes changed
+// 2.9 MB). CPU writes are caught by the page watches anyway (access violations, and file reads
+// trigger the callbacks themselves); only host code writing through TranslatePhysical bypasses
+// them, and that is the GPU's own resolve/memexport data, which this keeps valid either way.
+REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
+                    "Refresh page-valid state from GPU-written memory at frame end: every page "
+                    "the CPU uploaded is uploaded again the next time it is drawn from. Costs "
+                    "a lot of uploads; only for a game whose writes the page watches miss.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
