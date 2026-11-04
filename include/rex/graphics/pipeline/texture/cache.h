@@ -611,6 +611,18 @@ class TextureCache {
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
 
+  // FindOrCreateTexture at a resolution scale: the guest base and mips extents of a key, for
+  // IsRangeScaledResolved. Computing the whole layout for every lookup was ~3 % of the command
+  // thread's time in Spyro's Adventure; the layout depends on the key only. Direct-mapped by the
+  // key's hash; an empty entry has an invalid key, which no lookup has.
+  struct GuestExtentsCacheEntry {
+    TextureKey key;
+    uint32_t base_extent_bytes = 0;
+    uint32_t mips_extent_bytes = 0;
+  };
+  static constexpr size_t kGuestExtentsCacheSize = 256;
+  std::array<GuestExtentsCacheEntry, kGuestExtentsCacheSize> guest_extents_cache_;
+
   uint64_t textures_total_host_memory_usage_ = 0;
 
   Texture* texture_used_first_ = nullptr;

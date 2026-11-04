@@ -794,13 +794,18 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // Check if the texture is a scaled resolve texture.
   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
-    texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
-    if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
-         IsRangeScaledResolved(key.base_page << 12,
-                               scaled_resolve_guest_layout.base.level_data_extent_bytes)) ||
-        (scaled_resolve_guest_layout.mips_total_extent_bytes &&
-         IsRangeScaledResolved(key.mip_page << 12,
-                               scaled_resolve_guest_layout.mips_total_extent_bytes))) {
+    GuestExtentsCacheEntry& extents =
+        guest_extents_cache_[TextureKey::Hasher()(key) & (kGuestExtentsCacheSize - 1)];
+    if (extents.key != key) {
+      texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
+      extents.key = key;
+      extents.base_extent_bytes = scaled_resolve_guest_layout.base.level_data_extent_bytes;
+      extents.mips_extent_bytes = scaled_resolve_guest_layout.mips_total_extent_bytes;
+    }
+    if ((extents.base_extent_bytes &&
+         IsRangeScaledResolved(key.base_page << 12, extents.base_extent_bytes)) ||
+        (extents.mips_extent_bytes &&
+         IsRangeScaledResolved(key.mip_page << 12, extents.mips_extent_bytes))) {
       key.scaled_resolve = 1;
     }
   }
