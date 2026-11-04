@@ -50,6 +50,11 @@ REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native ste
 REXCVAR_DEFINE_BOOL(direct_host_resolve_verify, false, "GPU",
                     "Debug: copy a direct resolve both ways (dump and direct), compare the results (slow)");
 
+REXCVAR_DEFINE_BOOL(transfer_skip_overwritten_verify, false, "GPU",
+                    "Debug: with transfer_skip_overwritten, clear the rows taken over without a "
+                    "transfer to magenta first, so anything the draw doesn't overwrite shows")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(direct_host_resolve_keep_dump, false, "GPU",
                     "Debug: with direct_host_resolve, still dump the render targets to the EDRAM buffer");
 
@@ -1278,6 +1283,29 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                        depth_and_color_render_targets, last_update_transfers());
       SetCommandListRenderTargets(depth_and_color_render_targets);
+      if (REXCVAR_GET(transfer_skip_overwritten_verify)) {
+        const uint32_t* overwritten_rows = last_update_overwritten_rows();
+        for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+          if (!overwritten_rows[i] || !depth_and_color_render_targets[i]) {
+            continue;
+          }
+          auto& rt = *static_cast<D3D12RenderTarget*>(depth_and_color_render_targets[i]);
+          RenderTargetKey rt_key = rt.key();
+          uint32_t msaa_x_log2 = uint32_t(rt_key.msaa_samples >= xenos::MsaaSamples::k4X);
+          uint32_t tile_height =
+              xenos::kEdramTileHeightSamples >> uint32_t(rt_key.msaa_samples >= xenos::MsaaSamples::k2X);
+          D3D12_RECT rect;
+          rect.left = 0;
+          rect.top = 0;
+          rect.right = LONG(((uint32_t(rt_key.pitch_tiles_at_32bpp) * xenos::kEdramTileWidthSamples) >>
+                             msaa_x_log2) *
+                            draw_resolution_scale_x());
+          rect.bottom = LONG(overwritten_rows[i] * tile_height * draw_resolution_scale_y());
+          const float magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+          command_processor_.GetDeferredCommandList().D3DClearRenderTargetView(
+              rt.descriptor_draw().GetHandle(), magenta, 1, &rect);
+        }
+      }
     } break;
     case Path::kPixelShaderInterlock: {
       // For ROV, only the barrier is needed - already scheduled if required.

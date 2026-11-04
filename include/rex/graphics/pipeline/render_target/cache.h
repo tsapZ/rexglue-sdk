@@ -176,6 +176,14 @@ class RenderTargetCache {
 
   virtual bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                       uint32_t normalized_color_mask, const Shader& vertex_shader);
+  // The pixel shader of the next Update's draw, for transfer_skip_overwritten (without one, nothing
+  // is skipped). Update takes it and clears it.
+  void SetNextUpdatePixelShader(const Shader* pixel_shader) {
+    next_update_pixel_shader_ = pixel_shader;
+  }
+  // After an update, per slot (0 depth, 1... color): how many leading rows of tiles of the render
+  // target the draw overwrites, taken over without an ownership transfer.
+  const uint32_t* last_update_overwritten_rows() const { return last_update_overwritten_rows_; }
 
   // Returns bits where 0 is whether a depth render target is currently bound on
   // the host and 1... are whether the same applies to color render targets, and
@@ -719,6 +727,12 @@ class RenderTargetCache {
     RenderTarget* render_targets[1 + xenos::kMaxColorRenderTargets] = {};
   };
   UpdateSkipState update_skip_;
+
+  // transfer_skip_overwritten.
+  const Shader* next_update_pixel_shader_ = nullptr;
+  uint32_t last_update_overwritten_rows_[1 + xenos::kMaxColorRenderTargets] = {};
+  uint64_t transfer_skip_draws_ = 0;
+  uint64_t transfer_skip_tiles_ = 0;
   uint64_t update_skip_verified_ = 0;
   uint64_t update_skip_mismatches_ = 0;
 };

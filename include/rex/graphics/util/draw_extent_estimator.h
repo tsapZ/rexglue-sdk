@@ -30,6 +30,12 @@ class DrawExtentEstimator {
   // The shader must have its ucode analyzed.
   uint32_t EstimateVertexMaxY(const Shader& vertex_shader);
   uint32_t EstimateMaxY(bool try_to_estimate_vertex_max_y, const Shader& vertex_shader);
+  // Whether the draw is a single triangle that, with its vertex shader run here and the viewport
+  // transform applied, contains the guest pixel rectangle [x0, x1) x [y0, y1) with a pixel to spare
+  // on every side, nothing of it clipped away (no user clip planes, no killed vertex, depth in the
+  // clip range at every vertex). For skipping ownership transfers the draw overwrites anyway.
+  bool TriangleCoversRectangle(const Shader& vertex_shader, int32_t x0, int32_t y0, int32_t x1,
+                               int32_t y1);
 
  private:
   class PositionYExportSink : public ShaderInterpreter::ExportSink {
@@ -53,6 +59,26 @@ class DrawExtentEstimator {
     std::optional<float> position_y_;
     std::optional<float> position_w_;
     std::optional<float> point_size_;
+    std::optional<uint32_t> vertex_kill_;
+  };
+
+  class PositionExportSink : public ShaderInterpreter::ExportSink {
+   public:
+    void Export(ucode::ExportRegister export_register, const float* value,
+                uint32_t value_mask) override;
+
+    void Reset() {
+      for (auto& component : position_) {
+        component.reset();
+      }
+      vertex_kill_.reset();
+    }
+
+    const std::optional<float>& position(uint32_t i) const { return position_[i]; }
+    const std::optional<uint32_t>& vertex_kill() const { return vertex_kill_; }
+
+   private:
+    std::optional<float> position_[4];
     std::optional<uint32_t> vertex_kill_;
   };
 

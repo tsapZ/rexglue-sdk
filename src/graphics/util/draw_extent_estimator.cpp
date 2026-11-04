@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstdint>
 
 #include <rex/assert.h>
@@ -76,6 +77,202 @@ void DrawExtentEstimator::PositionYExportSink::Export(ucode::ExportRegister expo
       vertex_kill_ = rex::memory::Reinterpret<uint32_t>(value[2]);
     }
   }
+}
+
+void DrawExtentEstimator::PositionExportSink::Export(ucode::ExportRegister export_register,
+                                                     const float* value, uint32_t value_mask) {
+  if (export_register == ucode::ExportRegister::kVSPosition) {
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (value_mask & (uint32_t(1) << i)) {
+        position_[i] = value[i];
+      }
+    }
+  } else if (export_register == ucode::ExportRegister::kVSPointSizeEdgeFlagKillVertex) {
+    if (value_mask & 0b0100) {
+      vertex_kill_ = rex::memory::Reinterpret<uint32_t>(value[2]);
+    }
+  }
+}
+
+bool DrawExtentEstimator::TriangleCoversRectangle(const Shader& vertex_shader, int32_t x0,
+                                                  int32_t y0, int32_t x1, int32_t y1) {
+  const RegisterFile& regs = register_file_;
+  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  if (vgt_draw_initiator.prim_type != xenos::PrimitiveType::kTriangleList ||
+      vgt_draw_initiator.num_indices != 3 ||
+      (vgt_draw_initiator.source_select != xenos::SourceSelect::kDMA &&
+       vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex)) {
+    return false;
+  }
+  if (xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type) &&
+      regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
+          xenos::VGTOutputPath::kTessellationEnable) {
+    return false;
+  }
+  if (!vertex_shader.is_ucode_analyzed() || !ShaderInterpreter::CanInterpretShader(vertex_shader)) {
+    return false;
+  }
+  auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
+  auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
+  if (pa_cl_clip_cntl.ucp_ena ||
+      (!pa_cl_clip_cntl.clip_disable && (pa_cl_vte_cntl.vtx_xy_fmt || pa_cl_vte_cntl.vtx_z_fmt))) {
+    return false;
+  }
+
+  // The indices, as EstimateVertexMaxY reads them.
+  auto vgt_dma_size = regs.Get<reg::VGT_DMA_SIZE>();
+  const uint16_t* index_buffer_16 = nullptr;
+  const uint32_t* index_buffer_32 = nullptr;
+  xenos::Endian index_endian = vgt_dma_size.swap_mode;
+  if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
+    if (vgt_dma_size.num_words < 3) {
+      return false;
+    }
+    uint32_t index_buffer_base = regs[XE_GPU_REG_VGT_DMA_BASE];
+    if (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16) {
+      if (index_endian == xenos::Endian::k8in32) {
+        index_endian = xenos::Endian::k8in16;
+      } else if (index_endian == xenos::Endian::k16in32) {
+        index_endian = xenos::Endian::kNone;
+      }
+      index_buffer_16 = memory_.TranslatePhysical<const uint16_t*>(
+          index_buffer_base & ~uint32_t(sizeof(uint16_t) - 1));
+    } else {
+      index_buffer_32 = memory_.TranslatePhysical<const uint32_t*>(
+          index_buffer_base & ~uint32_t(sizeof(uint32_t) - 1));
+    }
+  }
+  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  uint32_t reset_index = regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx;
+  uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+  uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
+  uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+
+  float x_scale = pa_cl_vte_cntl.vport_x_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)
+                                                   : 1.0f;
+  float x_offset = pa_cl_vte_cntl.vport_x_offset_ena
+                       ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET)
+                       : 0.0f;
+  float y_scale = pa_cl_vte_cntl.vport_y_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE)
+                                                   : 1.0f;
+  float y_offset = pa_cl_vte_cntl.vport_y_offset_ena
+                       ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET)
+                       : 0.0f;
+  if (pa_su_sc_mode_cntl.vtx_window_offset_enable) {
+    auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    x_offset += float(pa_sc_window_offset.window_x_offset);
+    y_offset += float(pa_sc_window_offset.window_y_offset);
+  }
+  if (!pa_cl_vte_cntl.vtx_xy_fmt) {
+    // The viewport clips too: it must hold the centers of the rectangle's pixels (a full-screen pass
+    // has it exactly the size of the target; half a pixel either way for the pixel center offset).
+    if (x_offset - std::abs(x_scale) > float(x0) + 0.5f ||
+        x_offset + std::abs(x_scale) < float(x1) - 0.5f ||
+        y_offset - std::abs(y_scale) > float(y0) + 0.5f ||
+        y_offset + std::abs(y_scale) < float(y1) - 0.5f) {
+      return false;
+    }
+  }
+
+  float screen_x[3], screen_y[3];
+  shader_interpreter_.SetShader(vertex_shader);
+  PositionExportSink sink;
+  shader_interpreter_.SetExportSink(&sink);
+  bool vertices_usable = true;
+  for (uint32_t i = 0; i < 3 && vertices_usable; ++i) {
+    uint32_t vertex_index = i;
+    if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
+      vertex_index = index_buffer_16 ? uint32_t(index_buffer_16[i]) : index_buffer_32[i];
+      vertex_index = xenos::GpuSwap(vertex_index, index_endian) & 0xFFFFFF;
+      if (pa_su_sc_mode_cntl.multi_prim_ib_ena && vertex_index == reset_index) {
+        vertices_usable = false;
+        break;
+      }
+    }
+    vertex_index =
+        std::min(max_index, std::max(min_index, (vertex_index + index_offset) & 0xFFFFFF));
+    sink.Reset();
+    shader_interpreter_.temp_registers()[0] = float(vertex_index);
+    shader_interpreter_.Execute();
+    if ((sink.vertex_kill().has_value() && (sink.vertex_kill().value() & ~(UINT32_C(1) << 31))) ||
+        !sink.position(0).has_value() || !sink.position(1).has_value()) {
+      vertices_usable = false;
+      break;
+    }
+    float x = sink.position(0).value();
+    float y = sink.position(1).value();
+    if (!pa_cl_vte_cntl.vtx_xy_fmt || !pa_cl_clip_cntl.clip_disable) {
+      if (!sink.position(3).has_value() || !(sink.position(3).value() > 0.0f)) {
+        vertices_usable = false;
+        break;
+      }
+    }
+    if (!pa_cl_clip_cntl.clip_disable) {
+      // Depth within the clip range at every vertex: then nowhere in the triangle is it clipped.
+      if (!sink.position(2).has_value()) {
+        vertices_usable = false;
+        break;
+      }
+      float z = sink.position(2).value();
+      float w = sink.position(3).value();
+      if (!(z <= w && z >= (pa_cl_clip_cntl.dx_clip_space_def ? 0.0f : -w))) {
+        vertices_usable = false;
+        break;
+      }
+    }
+    if (!pa_cl_vte_cntl.vtx_xy_fmt) {
+      float w = sink.position(3).value();
+      x /= w;
+      y /= w;
+    }
+    screen_x[i] = x * x_scale + x_offset;
+    screen_y[i] = y * y_scale + y_offset;
+    if (!std::isfinite(screen_x[i]) || !std::isfinite(screen_y[i])) {
+      vertices_usable = false;
+    }
+  }
+  shader_interpreter_.SetExportSink(nullptr);
+  if (!vertices_usable) {
+    return false;
+  }
+
+  // The centers of the rectangle's corner pixels must be covered by the triangle as the rasterizer
+  // decides it: inside, or exactly on a top or left edge (the top-left rule; a full-screen triangle
+  // has two of its edges right on the viewport's sides). With D3D9 pixel centers (the half-pixel
+  // offset) the centers are at whole coordinates, else half a pixel in.
+  double area = double(screen_x[1] - screen_x[0]) * double(screen_y[2] - screen_y[0]) -
+                double(screen_y[1] - screen_y[0]) * double(screen_x[2] - screen_x[0]);
+  if (!(std::abs(area) > 1.0)) {
+    return false;
+  }
+  double center = (REXCVAR_GET(half_pixel_offset) &&
+                   regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero)
+                      ? 0.0
+                      : 0.5;
+  const double corners_x[4] = {x0 + center, x1 - 1 + center, x0 + center, x1 - 1 + center};
+  const double corners_y[4] = {y0 + center, y0 + center, y1 - 1 + center, y1 - 1 + center};
+  // Inside is where the third vertex is: the edge function is flipped so that inside is positive.
+  double sign = area > 0.0 ? 1.0 : -1.0;
+  for (uint32_t e = 0; e < 3; ++e) {
+    uint32_t a = e, b = (e + 1) % 3;
+    double dx = double(screen_x[b] - screen_x[a]);
+    double dy = double(screen_y[b] - screen_y[a]);
+    double length = std::sqrt(dx * dx + dy * dy);
+    // The inward normal (y down): a top edge is horizontal with the inside below it, a left edge
+    // has the inside to its right.
+    double normal_x = -dy * sign, normal_y = dx * sign;
+    bool top_left = (std::abs(dy) < 1e-6 * length) ? (normal_y > 0.0) : (normal_x > 0.0);
+    for (uint32_t c = 0; c < 4; ++c) {
+      // How far inside the corner pixel's center is, in pixels.
+      double inside = (dx * (corners_y[c] - double(screen_y[a])) -
+                       dy * (corners_x[c] - double(screen_x[a]))) *
+                      sign / length;
+      if (!(inside > 1e-3 || (top_left && inside > -1e-3))) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {

@@ -46,6 +46,11 @@ REXCVAR_DEFINE_BOOL(render_target_update_skip, true, "GPU",
                     "render targets and ranges are already owned since the last draw")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(transfer_skip_overwritten, true, "GPU",
+                    "Skip the ownership transfer into the rows of a color render target that the "
+                    "draw needing them overwrites whole (one triangle covering them, no blending)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(render_target_update_skip_verify, false, "GPU",
                     "Debug: check every skipped render target update the long way and log any "
                     "difference")
@@ -417,6 +422,9 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
   const RegisterFile& regs = register_file();
   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
+  const Shader* pixel_shader = next_update_pixel_shader_;
+  next_update_pixel_shader_ = nullptr;
+  std::memset(last_update_overwritten_rows_, 0, sizeof(last_update_overwritten_rows_));
 
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
@@ -742,12 +750,105 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // draw with whatever contents currently are in the render target in this
   // case).
 
+  // transfer_skip_overwritten: rows of tiles of a color render target that this draw overwrites whole
+  // don't need what another render target left there (SF Woodburrow at scale 2: a third of the
+  // transfers went into targets the very next full-screen pass wrote over, 2026-11-04). The draw must
+  // write every pixel there: one triangle containing the rows (its vertex shader run on the CPU), no
+  // pixel kill, alpha test or alpha to coverage, no depth or stencil test that can fail, no culling,
+  // all four channels without blending. Depth targets keep their transfers (their stencil would be
+  // lost). Leading tiles in sorted order: claimed without a transfer.
+  uint32_t overwritten_tiles[1 + xenos::kMaxColorRenderTargets] = {};
+  if (!skip_ownership && !interlock_barrier_only && pixel_shader &&
+      REXCVAR_GET(transfer_skip_overwritten)) {
+    auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+    auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+    auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+    bool draw_overwrites =
+        vgt_draw_initiator.prim_type == xenos::PrimitiveType::kTriangleList &&
+        vgt_draw_initiator.num_indices == 3 && pixel_shader->is_ucode_analyzed() &&
+        !pixel_shader->kills_pixels() && !rb_colorcontrol.alpha_test_enable &&
+        !rb_colorcontrol.alpha_to_mask_enable && !pa_su_sc_mode_cntl.cull_front &&
+        !pa_su_sc_mode_cntl.cull_back &&
+        pa_su_sc_mode_cntl.poly_mode != xenos::PolygonModeEnable::kDualMode &&
+        !normalized_depth_control.stencil_enable &&
+        (!normalized_depth_control.z_enable ||
+         normalized_depth_control.zfunc == xenos::CompareFunction::kAlways) &&
+        (msaa_samples == xenos::MsaaSamples::k1X ||
+         (regs[XE_GPU_REG_PA_SC_AA_MASK] & 0xFFFF) == 0xFFFF);
+    uint32_t rows = 0;
+    uint32_t pitch_pixels_at_tiles =
+        (pitch_tiles_at_32bpp * xenos::kEdramTileWidthSamples) >> msaa_samples_x_log2;
+    uint32_t tile_height_pixels =
+        xenos::kEdramTileHeightSamples >> uint32_t(msaa_samples >= xenos::MsaaSamples::k2X);
+    if (draw_overwrites) {
+      // Only whole rows of tiles, across the whole pitch, inside the scissor.
+      draw_util::Scissor scissor;
+      draw_util::GetScissor(regs, scissor, false);
+      if (!scissor.offset[0] && !scissor.offset[1] && scissor.extent[0] >= pitch_pixels_at_tiles) {
+        // No further than the rows this update claims (height_used, from the viewport or scissor).
+        rows = std::min(scissor.extent[1], height_used) / tile_height_pixels;
+      }
+    }
+    bool any_candidate = false;
+    for (uint32_t i = 0; rows && i < edram_bases_sorted_count; ++i) {
+      uint32_t rt_bit_index = edram_bases_sorted[i].second;
+      if (!rt_bit_index) {
+        continue;
+      }
+      uint32_t color_index = rt_bit_index - 1;
+      auto blend =
+          regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[color_index]);
+      if (((normalized_color_mask >> (4 * color_index)) & 0xF) != 0xF ||
+          blend.color_srcblend != xenos::BlendFactor::kOne ||
+          blend.color_destblend != xenos::BlendFactor::kZero ||
+          blend.color_comb_fcn != xenos::BlendOp::kAdd ||
+          blend.alpha_srcblend != xenos::BlendFactor::kOne ||
+          blend.alpha_destblend != xenos::BlendFactor::kZero ||
+          blend.alpha_comb_fcn != xenos::BlendOp::kAdd) {
+        continue;
+      }
+      uint32_t tiles = std::min(rt_lengths_tiles[i], rows * rt_keys[rt_bit_index].GetPitchTiles());
+      // Only worth the vertex shader on the CPU when there would be a transfer.
+      if (tiles && WouldOwnershipChangeRequireTransfers(rt_keys[rt_bit_index], 0, tiles)) {
+        overwritten_tiles[i] = tiles;
+        any_candidate = true;
+      }
+    }
+    if (any_candidate &&
+        !draw_extent_estimator_.TriangleCoversRectangle(vertex_shader, 0, 0,
+                                                        int32_t(pitch_pixels_at_tiles),
+                                                        int32_t(rows * tile_height_pixels))) {
+      any_candidate = false;
+    }
+    if (!any_candidate) {
+      std::memset(overwritten_tiles, 0, sizeof(overwritten_tiles));
+    } else {
+      ++transfer_skip_draws_;
+      for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+        if (overwritten_tiles[i]) {
+          last_update_overwritten_rows_[edram_bases_sorted[i].second] = rows;
+          transfer_skip_tiles_ += overwritten_tiles[i];
+        }
+      }
+      if (transfer_skip_draws_ == 1 || (transfer_skip_draws_ & 0xFFF) == 0) {
+        REXGPU_INFO("Transfer skip: {} draws overwrote {} tiles without an ownership transfer",
+                    transfer_skip_draws_, transfer_skip_tiles_);
+      }
+    }
+  }
+
   if (!skip_ownership) {
     for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
       const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
       uint32_t rt_bit_index = rt_base_index.second;
-      ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
-                      interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+      uint32_t overwritten = overwritten_tiles[i];
+      if (overwritten) {
+        ChangeOwnership(rt_keys[rt_bit_index], 0, overwritten, nullptr);
+      }
+      if (rt_lengths_tiles[i] > overwritten) {
+        ChangeOwnership(rt_keys[rt_bit_index], overwritten, rt_lengths_tiles[i] - overwritten,
+                        interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+      }
     }
     if (!interlock_barrier_only) {
       // What this update claimed, after its own ChangeOwnership calls bumped the generation.
