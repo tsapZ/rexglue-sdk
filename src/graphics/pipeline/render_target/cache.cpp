@@ -753,11 +753,12 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // transfer_skip_overwritten: rows of tiles of a color render target that this draw overwrites whole
   // don't need what another render target left there (SF Woodburrow at scale 2: a third of the
   // transfers went into targets the very next full-screen pass wrote over, 2026-11-04). The draw must
-  // write every pixel there: one triangle containing the rows (its vertex shader run on the CPU), no
-  // pixel kill, alpha test or alpha to coverage, no depth or stencil test that can fail, facing a
-  // side that isn't culled (Imaginators and SuperChargers draw their full-screen passes with
-  // culling on), all four channels without blending. Depth targets keep their transfers (their
-  // stencil would be lost). Leading tiles in sorted order: claimed without a transfer.
+  // write every pixel there: one triangle or one rectangle (Swap Force and Trap Team draw some of
+  // theirs as rectangle lists) containing the rows (its vertex shader run on the CPU), no pixel kill,
+  // alpha test or alpha to coverage, no depth or stencil test that can fail, a triangle facing a side
+  // that isn't culled (Imaginators and SuperChargers draw their full-screen passes with culling on),
+  // all four channels without blending. Depth targets keep their transfers (their stencil would be
+  // lost). Leading tiles in sorted order: claimed without a transfer.
   uint32_t overwritten_tiles[1 + xenos::kMaxColorRenderTargets] = {};
   if (!skip_ownership && !interlock_barrier_only && pixel_shader &&
       REXCVAR_GET(transfer_skip_overwritten)) {
@@ -765,7 +766,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
     auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
     bool draw_overwrites =
-        vgt_draw_initiator.prim_type == xenos::PrimitiveType::kTriangleList &&
+        (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kTriangleList ||
+         vgt_draw_initiator.prim_type == xenos::PrimitiveType::kRectangleList) &&
         vgt_draw_initiator.num_indices == 3 && pixel_shader->is_ucode_analyzed() &&
         !pixel_shader->kills_pixels() && !rb_colorcontrol.alpha_test_enable &&
         !rb_colorcontrol.alpha_to_mask_enable &&
@@ -816,9 +818,9 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       }
     }
     if (any_candidate &&
-        !draw_extent_estimator_.TriangleCoversRectangle(vertex_shader, 0, 0,
-                                                        int32_t(pitch_pixels_at_tiles),
-                                                        int32_t(rows * tile_height_pixels))) {
+        !draw_extent_estimator_.ShapeCoversRectangle(vertex_shader, 0, 0,
+                                                     int32_t(pitch_pixels_at_tiles),
+                                                     int32_t(rows * tile_height_pixels))) {
       any_candidate = false;
     }
     if (!any_candidate) {

@@ -94,11 +94,12 @@ void DrawExtentEstimator::PositionExportSink::Export(ucode::ExportRegister expor
   }
 }
 
-bool DrawExtentEstimator::TriangleCoversRectangle(const Shader& vertex_shader, int32_t x0,
-                                                  int32_t y0, int32_t x1, int32_t y1) {
+bool DrawExtentEstimator::ShapeCoversRectangle(const Shader& vertex_shader, int32_t x0,
+                                               int32_t y0, int32_t x1, int32_t y1) {
   const RegisterFile& regs = register_file_;
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
-  if (vgt_draw_initiator.prim_type != xenos::PrimitiveType::kTriangleList ||
+  bool rectangle = vgt_draw_initiator.prim_type == xenos::PrimitiveType::kRectangleList;
+  if ((vgt_draw_initiator.prim_type != xenos::PrimitiveType::kTriangleList && !rectangle) ||
       vgt_draw_initiator.num_indices != 3 ||
       (vgt_draw_initiator.source_select != xenos::SourceSelect::kDMA &&
        vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex)) {
@@ -174,7 +175,9 @@ bool DrawExtentEstimator::TriangleCoversRectangle(const Shader& vertex_shader, i
     }
   }
 
+  // Screen positions, and clip space z and w for a rectangle's fourth vertex.
   float screen_x[3], screen_y[3];
+  float clip_z[3], clip_w[3];
   shader_interpreter_.SetShader(vertex_shader);
   PositionExportSink sink;
   shader_interpreter_.SetExportSink(&sink);
@@ -201,6 +204,8 @@ bool DrawExtentEstimator::TriangleCoversRectangle(const Shader& vertex_shader, i
     }
     float x = sink.position(0).value();
     float y = sink.position(1).value();
+    clip_z[i] = sink.position(2).value_or(0.0f);
+    clip_w[i] = sink.position(3).value_or(1.0f);
     if (!pa_cl_vte_cntl.vtx_xy_fmt || !pa_cl_clip_cntl.clip_disable) {
       if (!sink.position(3).has_value() || !(sink.position(3).value() > 0.0f)) {
         vertices_usable = false;
@@ -236,37 +241,112 @@ bool DrawExtentEstimator::TriangleCoversRectangle(const Shader& vertex_shader, i
     return false;
   }
 
-  // The centers of the rectangle's corner pixels must be covered by the triangle as the rasterizer
-  // decides it: inside, or exactly on a top or left edge (the top-left rule; a full-screen triangle
-  // has two of its edges right on the viewport's sides). With D3D9 pixel centers (the half-pixel
-  // offset) the centers are at whole coordinates, else half a pixel in.
-  double area = double(screen_x[1] - screen_x[0]) * double(screen_y[2] - screen_y[0]) -
-                double(screen_y[1] - screen_y[0]) * double(screen_x[2] - screen_x[0]);
+  // The shape the rasterizer fills, as a convex polygon: the triangle, or for a rectangle list the
+  // strip the host's geometry shader makes of it (pipeline_cache.cpp, PipelineGeometryShader::
+  // kRectangleList): the vertex opposite the longest edge mirrored across that edge, v3 = -va + vb
+  // + vc. The shader compares the edges in the host's clip space, which is scaled per axis, so only
+  // rectangles are taken where no such scaling changes its pick: a right angle at a with both legs
+  // along the axes (the hypotenuse b-c is then the longest under any scaling), the same w at every
+  // vertex (the mirroring is then the same on the screen). In polygon order that is a, b, v3, c; the
+  // strip's second triangle shares the edge b-c, where the top-left rule gives every pixel center to
+  // exactly one of the two.
+  double polygon_x[4], polygon_y[4];
+  uint32_t polygon_size = 3;
+  for (uint32_t i = 0; i < 3; ++i) {
+    polygon_x[i] = screen_x[i];
+    polygon_y[i] = screen_y[i];
+  }
+  if (rectangle) {
+    auto axis_legs = [&](uint32_t a, uint32_t b, uint32_t c) {
+      float bx = screen_x[b] - screen_x[a], by = screen_y[b] - screen_y[a];
+      float cx = screen_x[c] - screen_x[a], cy = screen_y[c] - screen_y[a];
+      bool b_horizontal = std::abs(by) < 1e-3f && std::abs(bx) > 1.0f;
+      bool b_vertical = std::abs(bx) < 1e-3f && std::abs(by) > 1.0f;
+      bool c_horizontal = std::abs(cy) < 1e-3f && std::abs(cx) > 1.0f;
+      bool c_vertical = std::abs(cx) < 1e-3f && std::abs(cy) > 1.0f;
+      return (b_horizontal && c_vertical) || (b_vertical && c_horizontal);
+    };
+    uint32_t a = 3, b = 0, c = 0;
+    for (uint32_t i = 0; i < 3 && a == 3; ++i) {
+      if (axis_legs(i, (i + 1) % 3, (i + 2) % 3)) {
+        a = i;
+        b = (i + 1) % 3;
+        c = (i + 2) % 3;
+      }
+    }
+    if (a == 3) {
+      return false;
+    }
+    if (!pa_cl_vte_cntl.vtx_xy_fmt &&
+        (std::abs(clip_w[b] - clip_w[a]) > 1e-6f * std::abs(clip_w[a]) ||
+         std::abs(clip_w[c] - clip_w[a]) > 1e-6f * std::abs(clip_w[a]))) {
+      return false;
+    }
+    if (!pa_cl_clip_cntl.clip_disable) {
+      // The fourth vertex's depth must be in the clip range too.
+      float z = -clip_z[a] + clip_z[b] + clip_z[c];
+      float w = -clip_w[a] + clip_w[b] + clip_w[c];
+      if (!(w > 0.0f) || !(z <= w && z >= (pa_cl_clip_cntl.dx_clip_space_def ? 0.0f : -w))) {
+        return false;
+      }
+    }
+    polygon_x[0] = screen_x[a];
+    polygon_y[0] = screen_y[a];
+    polygon_x[1] = screen_x[b];
+    polygon_y[1] = screen_y[b];
+    polygon_x[2] = -double(screen_x[a]) + double(screen_x[b]) + double(screen_x[c]);
+    polygon_y[2] = -double(screen_y[a]) + double(screen_y[b]) + double(screen_y[c]);
+    polygon_x[3] = screen_x[c];
+    polygon_y[3] = screen_y[c];
+    polygon_size = 4;
+  }
+
+  // Twice the signed area; positive is clockwise on the render target (y down). Every turn must go
+  // the same way.
+  double area = 0.0;
+  for (uint32_t i = 0; i < polygon_size; ++i) {
+    uint32_t j = (i + 1) % polygon_size;
+    area += polygon_x[i] * polygon_y[j] - polygon_x[j] * polygon_y[i];
+  }
   if (!(std::abs(area) > 1.0)) {
     return false;
   }
-  // With culling on, the triangle must face the side that is drawn. Facing as the host rasterizer
-  // gets it (pipeline_cache: FrontCounterClockwise = face == 0), on the render target with y down,
-  // where a positive area here is clockwise.
-  if (pa_su_sc_mode_cntl.cull_front || pa_su_sc_mode_cntl.cull_back) {
+  for (uint32_t i = 0; i < polygon_size; ++i) {
+    uint32_t j = (i + 1) % polygon_size, k = (i + 2) % polygon_size;
+    double turn = (polygon_x[j] - polygon_x[i]) * (polygon_y[k] - polygon_y[j]) -
+                  (polygon_y[j] - polygon_y[i]) * (polygon_x[k] - polygon_x[j]);
+    if (!(turn * area > 0.0)) {
+      return false;
+    }
+  }
+  // With culling on, a triangle must face the side that is drawn. Facing as the host rasterizer
+  // gets it (pipeline_cache: FrontCounterClockwise = face == 0), on the render target with y down.
+  // Rectangles are never culled (draw_util::IsPrimitivePolygonal: not polygonal).
+  if (!rectangle && (pa_su_sc_mode_cntl.cull_front || pa_su_sc_mode_cntl.cull_back)) {
     bool clockwise = area > 0.0;
     bool front = pa_su_sc_mode_cntl.face ? clockwise : !clockwise;
     if (front ? pa_su_sc_mode_cntl.cull_front : pa_su_sc_mode_cntl.cull_back) {
       return false;
     }
   }
+
+  // The centers of the rectangle's corner pixels must be covered by the shape as the rasterizer
+  // decides it: inside, or exactly on a top or left edge (the top-left rule; a full-screen triangle
+  // has two of its edges right on the viewport's sides). With D3D9 pixel centers (the half-pixel
+  // offset) the centers are at whole coordinates, else half a pixel in. The shape is convex, so
+  // with its corners the whole rectangle is inside.
   double center = (REXCVAR_GET(half_pixel_offset) &&
                    regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero)
                       ? 0.0
                       : 0.5;
   const double corners_x[4] = {x0 + center, x1 - 1 + center, x0 + center, x1 - 1 + center};
   const double corners_y[4] = {y0 + center, y0 + center, y1 - 1 + center, y1 - 1 + center};
-  // Inside is where the third vertex is: the edge function is flipped so that inside is positive.
+  // The edge function is flipped so that inside is positive.
   double sign = area > 0.0 ? 1.0 : -1.0;
-  for (uint32_t e = 0; e < 3; ++e) {
-    uint32_t a = e, b = (e + 1) % 3;
-    double dx = double(screen_x[b] - screen_x[a]);
-    double dy = double(screen_y[b] - screen_y[a]);
+  for (uint32_t e = 0; e < polygon_size; ++e) {
+    uint32_t a = e, b = (e + 1) % polygon_size;
+    double dx = polygon_x[b] - polygon_x[a];
+    double dy = polygon_y[b] - polygon_y[a];
     double length = std::sqrt(dx * dx + dy * dy);
     // The inward normal (y down): a top edge is horizontal with the inside below it, a left edge
     // has the inside to its right.
@@ -274,9 +354,8 @@ bool DrawExtentEstimator::TriangleCoversRectangle(const Shader& vertex_shader, i
     bool top_left = (std::abs(dy) < 1e-6 * length) ? (normal_y > 0.0) : (normal_x > 0.0);
     for (uint32_t c = 0; c < 4; ++c) {
       // How far inside the corner pixel's center is, in pixels.
-      double inside = (dx * (corners_y[c] - double(screen_y[a])) -
-                       dy * (corners_x[c] - double(screen_x[a]))) *
-                      sign / length;
+      double inside =
+          (dx * (corners_y[c] - polygon_y[a]) - dy * (corners_x[c] - polygon_x[a])) * sign / length;
       if (!(inside > 1e-3 || (top_left && inside > -1e-3))) {
         return false;
       }
