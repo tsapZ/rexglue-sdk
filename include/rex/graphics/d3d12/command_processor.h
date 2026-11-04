@@ -16,6 +16,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -475,27 +476,40 @@ class D3D12CommandProcessor : public CommandProcessor {
   // submit thread, which replays them into command_list_ (the driver's share of the work), submits
   // them and signals their fence value, while this thread records the next submission. Fence values
   // and the command allocators' bookkeeping stay on this thread, so every wait on the fence works as
-  // before. The swap's submission waits until it has been submitted, because the presenter puts its
-  // own work on the queue right after the refresher returns.
+  // before. The swap's job takes the presenter's signal for its image along (painting waits for
+  // it), so the swap doesn't wait; where the presenter's callback isn't taken, it waits as before.
   void SubmitThreadMain();
-  // Gives the recorded commands to the submit thread (after the previous job is done); with
-  // `await_submitted`, returns only once they are on the queue.
+  // Gives the recorded commands to the submit thread (when fewer than kSubmitJobsMax are waiting);
+  // `enqueued_callback` is called right after they are on the queue; with `await_submitted`,
+  // returns only once they are.
   void SubmitRecordedCommands(ID3D12CommandAllocator* command_allocator, uint64_t fence_value,
-                              bool await_submitted);
+                              bool await_submitted,
+                              std::function<void()> enqueued_callback = nullptr);
+  // Returns once every job handed to the submit thread is on the queue.
+  void AwaitSubmitThreadJobs();
   void ShutdownSubmitThread();
   std::unique_ptr<rex::thread::Thread> submit_thread_;
   std::mutex submit_mutex_;
   // The submit thread waits on this for a job or the stop.
   std::condition_variable submit_job_cv_;
-  // This thread waits on this for the submit thread to finish its job.
+  // This thread waits on this for the submit thread to finish a job.
   std::condition_variable submit_done_cv_;
-  // True from the handover until the job is on the queue.
-  bool submit_job_pending_ = false;
+  struct SubmitJob {
+    std::vector<uintmax_t> stream;
+    ID3D12CommandAllocator* command_allocator = nullptr;
+    uint64_t fence_value = 0;
+    std::function<void()> enqueued_callback;
+  };
+  // The jobs in order; the submit thread works on the front one and removes it once it is on the
+  // queue. Two, so the swap's small job doesn't wait for the frame handed over just before it at the
+  // primary buffer's end (SSA: ~9 % of the command thread's time went into waiting there).
+  static constexpr size_t kSubmitJobsMax = 2;
+  std::deque<SubmitJob> submit_jobs_;
+  // The streams of finished jobs, cleared, kept for their capacity.
+  std::vector<std::vector<uintmax_t>> submit_spare_streams_;
   bool submit_stop_ = false;
-  // The job's commands while one is pending, the spare buffer (empty) otherwise.
-  std::vector<uintmax_t> submit_stream_;
-  ID3D12CommandAllocator* submit_command_allocator_ = nullptr;
-  uint64_t submit_fence_value_ = 0;
+  // From IssueSwap's refresher to the swap's EndSubmission: the presenter's signal for the image.
+  std::function<void()> swap_enqueued_callback_;
 
   bool debug_markers_enabled_ = false;
 

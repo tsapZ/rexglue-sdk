@@ -614,6 +614,7 @@ bool Presenter::RefreshGuestOutput(
   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
   writable_properties.is_8bpc = false;
   bool is_active = writable_properties.IsActive();
+  guest_output_refresh_enqueued_later_ = false;
   if (is_active) {
     if (!RefreshGuestOutputImpl(guest_output_mailbox_writable_, frontbuffer_width,
                                 frontbuffer_height, refresher, writable_properties.is_8bpc)) {
@@ -684,6 +685,12 @@ bool Presenter::RefreshGuestOutput(
         break;
       case PaintMode::kGuestOutputThreadImmediately:
         // Both painting and window paint requesting are accessible.
+        if (guest_output_refresh_enqueued_later_) {
+          // Painting here would wait for the image's commands to reach the queue: the UI thread
+          // paints it (taking painting over for that, as with a menu open).
+          RequestPaintOrConnectionRecoveryViaWindow(true);
+          break;
+        }
         if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
           paint_result = PaintAndPresent(false);
           if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {

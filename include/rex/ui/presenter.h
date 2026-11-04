@@ -687,6 +687,10 @@ class Presenter {
   virtual bool RefreshGuestOutputImpl(
       uint32_t mailbox_index, uint32_t frontbuffer_width, uint32_t frontbuffer_height,
       std::function<bool(GuestOutputRefreshContext& context)> refresher, bool& is_8bpc_out_ref) = 0;
+  // Set by RefreshGuestOutputImpl (reset before it): the refreshed image's commands reach the
+  // queue only later (the D3D12 command processor's submit thread), so painting it would wait for
+  // them. Then the UI thread paints it even where the guest output thread would paint at once.
+  bool guest_output_refresh_enqueued_later_ = false;
 
   // For guest output capturing (for debugging use thus - shouldn't be adding
   // any noise like dithering that's not present in the original image),

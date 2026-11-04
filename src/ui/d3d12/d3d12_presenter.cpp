@@ -229,12 +229,14 @@ Surface::TypeFlags D3D12Presenter::GetSupportedSurfaceTypes() const {
 
 bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
+  UINT64 guest_output_submission = 0;
   {
     uint32_t guest_output_mailbox_index;
     std::unique_lock<std::mutex> guest_output_consumer_lock(
         ConsumeGuestOutput(guest_output_mailbox_index, nullptr, nullptr));
     if (guest_output_mailbox_index != UINT32_MAX) {
       guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
+      guest_output_submission = guest_output_resources_[guest_output_mailbox_index].first;
     }
     // Incremented the reference count of the guest output resource - safe to
     // leave the consumer critical section now.
@@ -242,6 +244,7 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
   if (!guest_output_resource) {
     return false;
   }
+  AwaitGuestOutputEnqueued(guest_output_submission);
 
   ID3D12Device* device = provider_.GetDevice();
 
@@ -516,6 +519,9 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
     std::function<bool(GuestOutputRefreshContext& context)> refresher, bool& is_8bpc_out_ref) {
   assert_not_zero(frontbuffer_width);
   assert_not_zero(frontbuffer_height);
+  // The previous refresh's signal may still be on its way (TakeEnqueuedCallback): the refresher
+  // submission tracker is this thread's again once it is done.
+  AwaitGuestOutputEnqueued(guest_output_refresh_last_submission_);
   std::pair<UINT64, Microsoft::WRL::ComPtr<ID3D12Resource>>& guest_output_resource_ref =
       guest_output_resources_[mailbox_index];
   if (guest_output_resource_ref.second) {
@@ -554,15 +560,36 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
     }
   }
   D3D12GuestOutputRefreshContext context(is_8bpc_out_ref, guest_output_resource_ref.second.Get());
+  // The signal for this refresh, done when its commands are on the queue: here after the refresher,
+  // or by the refresher's own submission (TakeEnqueuedCallback). Even if the refresher has returned
+  // false, it still might have submitted some commands referencing the resource. It's better to put
+  // an excessive signal and wait slightly longer, for nothing important, while shutting down than
+  // to destroy the resource while it's still in use.
+  UINT64 submission = guest_output_resource_refresher_submission_tracker_.GetCurrentSubmission();
+  context.enqueued_callback_ = [this, submission]() {
+    guest_output_resource_refresher_submission_tracker_.NextSubmission();
+    {
+      std::lock_guard<std::mutex> lock(guest_output_enqueue_mutex_);
+      guest_output_enqueued_submission_ = submission;
+    }
+    guest_output_enqueue_cv_.notify_all();
+  };
   bool refresher_succeeded = refresher(context);
-  // Even if the refresher has returned false, it still might have submitted
-  // some commands referencing the resource. It's better to put an excessive
-  // signal and wait slightly longer, for nothing important, while shutting down
-  // than to destroy the resource while it's still in use.
-  guest_output_resource_ref.first =
-      guest_output_resource_refresher_submission_tracker_.GetCurrentSubmission();
-  guest_output_resource_refresher_submission_tracker_.NextSubmission();
+  guest_output_resource_ref.first = submission;
+  guest_output_refresh_last_submission_ = submission;
+  if (context.enqueued_callback_) {
+    context.enqueued_callback_();
+  } else {
+    // Taken by the refresher: on the queue later.
+    guest_output_refresh_enqueued_later_ = true;
+  }
   return refresher_succeeded;
+}
+
+void D3D12Presenter::AwaitGuestOutputEnqueued(UINT64 submission) {
+  std::unique_lock<std::mutex> lock(guest_output_enqueue_mutex_);
+  guest_output_enqueue_cv_.wait(lock,
+                                [&] { return guest_output_enqueued_submission_ >= submission; });
 }
 
 void D3D12Presenter::PaintContext::DestroySwapChain() {
@@ -613,12 +640,14 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   GuestOutputProperties guest_output_properties;
   GuestOutputPaintConfig guest_output_paint_config;
   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
+  UINT64 guest_output_submission = 0;
   {
     uint32_t guest_output_mailbox_index;
     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
         guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
     if (guest_output_mailbox_index != UINT32_MAX) {
       guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
+      guest_output_submission = guest_output_resources_[guest_output_mailbox_index].first;
     }
     // Incremented the reference count of the guest output resource - safe to
     // leave the consumer critical section now as everything here either will be
@@ -627,6 +656,8 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   }
 
   if (guest_output_resource) {
+    // Its commands must be on the queue before the painting's.
+    AwaitGuestOutputEnqueued(guest_output_submission);
     GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
         guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
         D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,

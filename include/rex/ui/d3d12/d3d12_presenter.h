@@ -12,7 +12,10 @@
 #pragma once
 
 #include <array>
+#include <condition_variable>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <utility>
 
 #include <rex/math.h>
@@ -65,8 +68,21 @@ class D3D12Presenter final : public Presenter {
     // to kGuestOutputInternalState before finishing.
     ID3D12Resource* resource_uav_capable() const { return resource_.Get(); }
 
+    // For a refresher whose commands reach the queue only after it returns (the D3D12 command
+    // processor's submit thread): it takes this and calls it right after they are on the queue,
+    // and painting or capturing this image waits until then. Once taken, it must be called (also
+    // on failure), or everything waiting for this image hangs. Not taken, the presenter calls it
+    // when the refresher returns.
+    std::function<void()> TakeEnqueuedCallback() {
+      std::function<void()> callback;
+      callback.swap(enqueued_callback_);
+      return callback;
+    }
+
    private:
+    friend class D3D12Presenter;
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
+    std::function<void()> enqueued_callback_;
   };
 
   static std::unique_ptr<D3D12Presenter> Create(HostGpuLossCallback host_gpu_loss_callback,
@@ -301,6 +317,14 @@ class D3D12Presenter final : public Presenter {
   // paint_context_.guest_output_resource_paint_refs references taken from
   // guest_output_resources_).
   D3D12SubmissionTracker guest_output_resource_refresher_submission_tracker_;
+  // The last refresher submission whose commands and signal are on the queue (see
+  // TakeEnqueuedCallback): painting and capturing an image wait for its submission to be there.
+  std::mutex guest_output_enqueue_mutex_;
+  std::condition_variable guest_output_enqueue_cv_;
+  UINT64 guest_output_enqueued_submission_ = 0;
+  // The refresher thread's last refresher submission (its signal may still be pending).
+  UINT64 guest_output_refresh_last_submission_ = 0;
+  void AwaitGuestOutputEnqueued(UINT64 submission);
 
   // UI submission tracker with the submission index that can be given to UI
   // drawers (accessible from the UI thread only, at any time).
