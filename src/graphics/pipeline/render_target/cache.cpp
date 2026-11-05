@@ -51,6 +51,13 @@ REXCVAR_DEFINE_BOOL(transfer_skip_overwritten, true, "GPU",
                     "draw needing them overwrites whole (one triangle covering them, no blending)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(transfer_skip_overwritten_depth, true, "GPU",
+                    "With transfer_skip_overwritten, also skip the transfer into the rows of a depth "
+                    "render target that the draw needing them overwrites whole (depth written with the "
+                    "test always passing, stencil off); their stencil then keeps what that host target "
+                    "held before")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(render_target_update_skip_verify, false, "GPU",
                     "Debug: check every skipped render target update the long way and log any "
                     "difference")
@@ -757,19 +764,25 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // theirs as rectangle lists) containing the rows (its vertex shader run on the CPU), no pixel kill,
   // alpha test or alpha to coverage, no depth or stencil test that can fail, a triangle facing a side
   // that isn't culled (Imaginators and SuperChargers draw their full-screen passes with culling on),
-  // all four channels without blending. Depth targets keep their transfers (their stencil would be
-  // lost). Leading tiles in sorted order: claimed without a transfer.
+  // all four channels without blending. Depth targets (transfer_skip_overwritten_depth): depth
+  // written with the test always passing and stencil off; the draw may have no pixel shader then
+  // (depth only). Their stencil keeps what the host target held: in Swap Force's Woodburrow and
+  // Trap Team's Academy at scale 2 (2026-11-05) every such transfer's stencil went on through more
+  // transfers into a color target that was then overwritten whole, or to the end of the frame,
+  // without a draw testing it (debug tool stencil_after.py): 14 transfers, 0.87 ms of 26 ms in SF.
+  // Leading tiles in sorted order: claimed without a transfer.
   uint32_t overwritten_tiles[1 + xenos::kMaxColorRenderTargets] = {};
-  if (!skip_ownership && !interlock_barrier_only && pixel_shader &&
-      REXCVAR_GET(transfer_skip_overwritten)) {
+  if (!skip_ownership && !interlock_barrier_only && REXCVAR_GET(transfer_skip_overwritten) &&
+      (pixel_shader || REXCVAR_GET(transfer_skip_overwritten_depth))) {
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
     auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
     auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
     bool draw_overwrites =
         (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kTriangleList ||
          vgt_draw_initiator.prim_type == xenos::PrimitiveType::kRectangleList) &&
-        vgt_draw_initiator.num_indices == 3 && pixel_shader->is_ucode_analyzed() &&
-        !pixel_shader->kills_pixels() && !rb_colorcontrol.alpha_test_enable &&
+        vgt_draw_initiator.num_indices == 3 &&
+        (!pixel_shader || (pixel_shader->is_ucode_analyzed() && !pixel_shader->kills_pixels())) &&
+        !rb_colorcontrol.alpha_test_enable &&
         !rb_colorcontrol.alpha_to_mask_enable &&
         !(pa_su_sc_mode_cntl.cull_front && pa_su_sc_mode_cntl.cull_back) &&
         pa_su_sc_mode_cntl.poly_mode != xenos::PolygonModeEnable::kDualMode &&
@@ -796,6 +809,16 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     for (uint32_t i = 0; rows && i < edram_bases_sorted_count; ++i) {
       uint32_t rt_bit_index = edram_bases_sorted[i].second;
       if (!rt_bit_index) {
+        // Depth: draw_overwrites already has stencil off and the test, if on, always passing.
+        if (!REXCVAR_GET(transfer_skip_overwritten_depth) || !normalized_depth_control.z_enable ||
+            !normalized_depth_control.z_write_enable) {
+          continue;
+        }
+        uint32_t tiles = std::min(rt_lengths_tiles[i], rows * rt_keys[0].GetPitchTiles());
+        if (tiles && WouldOwnershipChangeRequireTransfers(rt_keys[0], 0, tiles)) {
+          overwritten_tiles[i] = tiles;
+          any_candidate = true;
+        }
         continue;
       }
       uint32_t color_index = rt_bit_index - 1;

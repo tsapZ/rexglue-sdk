@@ -52,7 +52,8 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve_verify, false, "GPU",
 
 REXCVAR_DEFINE_BOOL(transfer_skip_overwritten_verify, false, "GPU",
                     "Debug: with transfer_skip_overwritten, clear the rows taken over without a "
-                    "transfer to magenta first, so anything the draw doesn't overwrite shows")
+                    "transfer to magenta first (depth targets: depth 0, stencil 0xFF), so anything "
+                    "the draw doesn't overwrite shows")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(direct_host_resolve_keep_dump, false, "GPU",
@@ -1285,7 +1286,7 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
       SetCommandListRenderTargets(depth_and_color_render_targets);
       if (REXCVAR_GET(transfer_skip_overwritten_verify)) {
         const uint32_t* overwritten_rows = last_update_overwritten_rows();
-        for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
           if (!overwritten_rows[i] || !depth_and_color_render_targets[i]) {
             continue;
           }
@@ -1301,6 +1302,14 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
                              msaa_x_log2) *
                             draw_resolution_scale_x());
           rect.bottom = LONG(overwritten_rows[i] * tile_height * draw_resolution_scale_y());
+          if (!i) {
+            // Depth: the nearest depth (what isn't overwritten hides what is drawn behind it) and
+            // every stencil bit set (a later stencil test then behaves differently).
+            command_processor_.GetDeferredCommandList().D3DClearDepthStencilView(
+                rt.descriptor_draw().GetHandle(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                0.0f, 0xFF, 1, &rect);
+            continue;
+          }
           const float magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
           command_processor_.GetDeferredCommandList().D3DClearRenderTargetView(
               rt.descriptor_draw().GetHandle(), magenta, 1, &rect);
