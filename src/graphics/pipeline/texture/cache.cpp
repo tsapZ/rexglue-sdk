@@ -80,6 +80,20 @@ REXCVAR_DEFINE_INT32(resolution_scale, 1, "Graphics",
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
 
+// At a resolution scale, every texture lookup asked whether the texture's memory holds scaled
+// resolve data, twice (base and mips), each time under the global lock. The answer depends only
+// on the key and the scaled resolve page bits, which change at resolves to new memory and CPU
+// writes over resolved memory: it is kept with the key until they change.
+REXCVAR_DEFINE_BOOL(texture_scaled_resolve_cache, true, "GPU",
+                    "Keep whether a texture is a scaled resolve until the scaled resolve pages "
+                    "change")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(texture_scaled_resolve_cache_verify, false, "GPU",
+                    "Debug: with texture_scaled_resolve_cache, check every kept answer the long "
+                    "way and log any difference")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // DEFINE_int32(
 //     draw_resolution_scale_x, 1,
 //     "Integer pixel width scale used for scaling the rendering resolution "
@@ -331,6 +345,7 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
     uint32_t block_first = page_first >> 5;
     uint32_t block_last = page_last >> 5;
     auto global_lock = global_critical_region_.Acquire();
+    bool pages_changed = false;
     for (uint32_t i = block_first; i <= block_last; ++i) {
       uint32_t add_bits = UINT32_MAX;
       if (i == block_first) {
@@ -339,8 +354,12 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
       if (i == block_last && (page_last & 31) != 31) {
         add_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
       }
+      pages_changed |= (scaled_resolve_pages_[i] & add_bits) != add_bits;
       scaled_resolve_pages_[i] |= add_bits;
       scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
+    }
+    if (pages_changed) {
+      scaled_resolve_pages_generation_.fetch_add(1, std::memory_order_release);
     }
   }
 
@@ -801,11 +820,40 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
       extents.key = key;
       extents.base_extent_bytes = scaled_resolve_guest_layout.base.level_data_extent_bytes;
       extents.mips_extent_bytes = scaled_resolve_guest_layout.mips_total_extent_bytes;
+      extents.scaled_resolve_generation = UINT64_MAX;
     }
-    if ((extents.base_extent_bytes &&
-         IsRangeScaledResolved(key.base_page << 12, extents.base_extent_bytes)) ||
-        (extents.mips_extent_bytes &&
-         IsRangeScaledResolved(key.mip_page << 12, extents.mips_extent_bytes))) {
+    // The generation is read before the pages: a change in between makes the next lookup check
+    // again.
+    const uint64_t scaled_resolve_generation =
+        scaled_resolve_pages_generation_.load(std::memory_order_acquire);
+    if (extents.scaled_resolve_generation != scaled_resolve_generation ||
+        !REXCVAR_GET(texture_scaled_resolve_cache)) {
+      extents.scaled_resolve =
+          (extents.base_extent_bytes &&
+           IsRangeScaledResolved(key.base_page << 12, extents.base_extent_bytes)) ||
+          (extents.mips_extent_bytes &&
+           IsRangeScaledResolved(key.mip_page << 12, extents.mips_extent_bytes));
+      extents.scaled_resolve_generation = scaled_resolve_generation;
+    } else if (REXCVAR_GET(texture_scaled_resolve_cache_verify)) {
+      const bool scaled_resolve_now =
+          (extents.base_extent_bytes &&
+           IsRangeScaledResolved(key.base_page << 12, extents.base_extent_bytes)) ||
+          (extents.mips_extent_bytes &&
+           IsRangeScaledResolved(key.mip_page << 12, extents.mips_extent_bytes));
+      if (scaled_resolve_now != extents.scaled_resolve &&
+          ++scaled_resolve_cache_mismatches_ <= 20) {
+        REXGPU_WARN(
+            "Texture scaled resolve cache verify: base page {:05X} mip page {:05X} is {} now, "
+            "kept {}",
+            uint32_t(key.base_page), uint32_t(key.mip_page), scaled_resolve_now,
+            extents.scaled_resolve);
+      }
+      if ((++scaled_resolve_cache_verified_ & 0xFFFF) == 0) {
+        REXGPU_INFO("Texture scaled resolve cache verify: {} kept answers checked, {} differ",
+                    scaled_resolve_cache_verified_, scaled_resolve_cache_mismatches_);
+      }
+    }
+    if (extents.scaled_resolve) {
       key.scaled_resolve = 1;
     }
   }
@@ -1139,6 +1187,7 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
   uint32_t resolve_block_last = resolve_page_last >> 5;
   uint32_t resolve_l2_block_first = resolve_block_first >> 6;
   uint32_t resolve_l2_block_last = resolve_block_last >> 6;
+  bool pages_changed = false;
   for (uint32_t i = resolve_l2_block_first; i <= resolve_l2_block_last; ++i) {
     uint64_t resolve_l2_block = scaled_resolve_pages_l2_[i];
     if (REXCVAR_GET(pre_mask_resolve_l2_block)) {
@@ -1161,11 +1210,17 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
       if (resolve_block_index == resolve_block_last && (resolve_page_last & 31) != 31) {
         resolve_keep_bits |= ~((UINT32_C(1) << ((resolve_page_last & 31) + 1)) - 1);
       }
+      if (scaled_resolve_pages_[resolve_block_index] & ~resolve_keep_bits) {
+        pages_changed = true;
+      }
       scaled_resolve_pages_[resolve_block_index] &= resolve_keep_bits;
       if (scaled_resolve_pages_[resolve_block_index] == 0) {
         scaled_resolve_pages_l2_[i] &= ~(UINT64_C(1) << resolve_block_relative_index);
       }
     }
+  }
+  if (pages_changed) {
+    scaled_resolve_pages_generation_.fetch_add(1, std::memory_order_release);
   }
 }
 

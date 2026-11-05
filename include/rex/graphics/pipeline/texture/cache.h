@@ -615,11 +615,20 @@ class TextureCache {
   // IsRangeScaledResolved. Computing the whole layout for every lookup was ~3 % of the command
   // thread's time in Spyro's Adventure; the layout depends on the key only. Direct-mapped by the
   // key's hash; an empty entry has an invalid key, which no lookup has.
+  // With texture_scaled_resolve_cache, also IsRangeScaledResolved's answer for the key, made at
+  // scaled_resolve_pages_generation_ == scaled_resolve_generation (each check takes the global
+  // lock: ~4 % of the command thread's time in Spyro's Adventure, two checks per lookup).
   struct GuestExtentsCacheEntry {
     TextureKey key;
     uint32_t base_extent_bytes = 0;
     uint32_t mips_extent_bytes = 0;
+    uint64_t scaled_resolve_generation = UINT64_MAX;
+    bool scaled_resolve = false;
   };
+  // Counts the changes of scaled_resolve_pages_ (bits set or cleared, under the global lock).
+  std::atomic<uint64_t> scaled_resolve_pages_generation_{0};
+  uint64_t scaled_resolve_cache_verified_ = 0;
+  uint64_t scaled_resolve_cache_mismatches_ = 0;
   static constexpr size_t kGuestExtentsCacheSize = 256;
   std::array<GuestExtentsCacheEntry, kGuestExtentsCacheSize> guest_extents_cache_;
 
