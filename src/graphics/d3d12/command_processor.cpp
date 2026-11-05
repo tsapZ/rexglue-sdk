@@ -74,6 +74,14 @@ REXCVAR_DEFINE_BOOL(d3d12_swap_no_wait, true, "GPU/D3D12",
                     "instead)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Type-0 packets bring whole blocks of render state with every draw; stored one register at a time
+// through the virtual WriteRegister, they were about 9 % of the command thread's time in Spyro's
+// Adventure's busy levels (13 of 150 samples).
+REXCVAR_DEFINE_BOOL(d3d12_register_ranges_bulk, true, "GPU/D3D12",
+                    "Store blocks of render state registers in one go (none of them does anything "
+                    "on a write)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(pipeline_wait_budget_ms, 4, "GPU",
                      "With async shader compilation: how long per frame draws may wait for a "
                      "pipeline still being created before they are skipped (0 = skip at once)")
@@ -1969,6 +1977,16 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
     }
     InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
+    return;
+  }
+
+  // d3d12_register_ranges_bulk: the render state from RB_SURFACE_INFO up to the constants does
+  // nothing on a write but get stored, here and in the base class (the scratch, coherency and
+  // gamma ramp registers with side effects are all below it), so a block of it is stored in one go
+  // instead of one virtual WriteRegister call with its range checks per register.
+  if (start_index >= XE_GPU_REG_RB_SURFACE_INFO && end_index < XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      !log_unknown_register_writes() && REXCVAR_GET(d3d12_register_ranges_bulk)) {
+    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
     return;
   }
 

@@ -163,6 +163,8 @@ class CommandProcessor {
 
   virtual void WriteRegister(uint32_t index, uint32_t value);
   uint32_t ReadRegisterValue(uint32_t index) const;
+  // Whether WriteRegister writes a debug line for writes to unknown registers.
+  bool log_unknown_register_writes() const { return log_unknown_register_writes_; }
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
   virtual void WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,
                                           uint32_t num_registers);
