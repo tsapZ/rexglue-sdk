@@ -25,6 +25,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <toml++/toml.hpp>
+#include <rex/filesystem.h>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -692,12 +693,12 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
   try {
     toml::table config;
     try {
-      config = toml::parse_file(config_path.string());
+      config = toml::parse_file(rex::path_to_utf8(config_path));
     } catch (const toml::parse_error&) {
       // A key set twice makes the file invalid; read it as LoadConfig does (cvar.cpp).
       std::ifstream in(config_path, std::ios::binary);
       const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-      config = toml::parse(rex::cvar::CommentOutRepeatedKeys(text), config_path.string());
+      config = toml::parse(rex::cvar::CommentOutRepeatedKeys(text), rex::path_to_utf8(config_path));
     }
     auto* log_table = config["log"].as_table();
     if (!log_table)
