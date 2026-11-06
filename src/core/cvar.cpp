@@ -24,6 +24,7 @@
 #include <rex/platform/env.h>
 
 #include <toml++/toml.hpp>
+#include <rex/filesystem.h>
 
 namespace rex::cvar {
 
@@ -684,20 +685,20 @@ std::vector<std::string> Init(int argc, char** argv) {
 
 void LoadConfig(const std::filesystem::path& config_path) {
   if (!std::filesystem::exists(config_path)) {
-    REXLOG_DEBUG("Config file not found: {}", config_path.string());
+    REXLOG_DEBUG("Config file not found: {}", rex::path_to_utf8(config_path));
     return;
   }
 
   try {
-    auto config = toml::parse_file(config_path.string());
+    auto config = toml::parse_file(rex::path_to_utf8(config_path));
     ApplyTomlTable(config);
-    REXLOG_DEBUG("Loaded config from {}", config_path.string());
+    REXLOG_DEBUG("Loaded config from {}", rex::path_to_utf8(config_path));
   } catch (const toml::parse_error& err) {
     // This runs before InitLogging sets up the log file sink (config loads first so log cvars
     // have final values -- see the caller), so REXLOG_ERROR alone would be invisible here; also
     // print to stderr, matching the CLI11 parse-error workaround below.
-    fprintf(stderr, "cvar: failed to parse config %s: %s\n", config_path.string().c_str(), err.what());
-    REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
+    fprintf(stderr, "cvar: failed to parse config %s: %s\n", rex::path_to_utf8(config_path).c_str(), err.what());
+    REXLOG_ERROR("Failed to parse config {}: {}", rex::path_to_utf8(config_path), err.what());
   }
 }
 
@@ -750,12 +751,12 @@ void SaveConfig(const std::filesystem::path& config_path) {
   try {
     std::ofstream file(config_path);
     if (!file) {
-      REXLOG_ERROR("SaveConfig: failed to open {}", config_path.string());
+      REXLOG_ERROR("SaveConfig: failed to open {}", rex::path_to_utf8(config_path));
       return;
     }
     file << "# Auto-generated cvar configuration\n";
     file << content;
-    REXLOG_INFO("Saved config to {}", config_path.string());
+    REXLOG_INFO("Saved config to {}", rex::path_to_utf8(config_path));
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());
   }

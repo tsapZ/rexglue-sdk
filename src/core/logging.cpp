@@ -21,6 +21,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <toml++/toml.hpp>
+#include <rex/filesystem.h>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -544,7 +545,7 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
     return result;
 
   try {
-    auto config = toml::parse_file(config_path.string());
+    auto config = toml::parse_file(rex::path_to_utf8(config_path));
     auto* log_table = config["log"].as_table();
     if (!log_table)
       return result;
