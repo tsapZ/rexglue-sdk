@@ -1281,9 +1281,29 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
     case Path::kHostRenderTargets: {
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
+      // The cutout (transfer_skip_overwritten_partial) only leaves rectangles out, no clear values.
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
-                                       depth_and_color_render_targets, last_update_transfers());
+                                       depth_and_color_render_targets, last_update_transfers(),
+                                       nullptr, last_update_transfer_cutout());
       SetCommandListRenderTargets(depth_and_color_render_targets);
+      if (REXCVAR_GET(transfer_skip_overwritten_verify) && last_update_transfer_cutout()) {
+        // The left-out rectangle magenta before the draw: it shows wherever the draw didn't cover it.
+        const Transfer::Rectangle& cutout = *last_update_transfer_cutout();
+        D3D12_RECT rect;
+        rect.left = LONG(cutout.x_pixels * draw_resolution_scale_x());
+        rect.top = LONG(cutout.y_pixels * draw_resolution_scale_y());
+        rect.right = LONG((cutout.x_pixels + cutout.width_pixels) * draw_resolution_scale_x());
+        rect.bottom = LONG((cutout.y_pixels + cutout.height_pixels) * draw_resolution_scale_y());
+        const float magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+        for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+          if ((last_update_transfer_cutout_bits() & (uint32_t(1) << i)) &&
+              depth_and_color_render_targets[i]) {
+            auto& rt = *static_cast<D3D12RenderTarget*>(depth_and_color_render_targets[i]);
+            command_processor_.GetDeferredCommandList().D3DClearRenderTargetView(
+                rt.descriptor_draw().GetHandle(), magenta, 1, &rect);
+          }
+        }
+      }
       if (REXCVAR_GET(transfer_skip_overwritten_verify)) {
         const uint32_t* overwritten_rows = last_update_overwritten_rows();
         for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {

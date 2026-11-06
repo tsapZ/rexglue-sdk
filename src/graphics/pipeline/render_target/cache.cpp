@@ -58,6 +58,12 @@ REXCVAR_DEFINE_BOOL(transfer_skip_overwritten_depth, true, "GPU",
                     "held before")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(transfer_skip_overwritten_partial, true, "GPU",
+                    "With transfer_skip_overwritten, leave the part a draw overwrites whole out of "
+                    "the ownership transfers into its color render targets when the draw is narrower "
+                    "than the render target (only the edges outside it are copied)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(render_target_update_skip_verify, false, "GPU",
                     "Debug: check every skipped render target update the long way and log any "
                     "difference")
@@ -432,6 +438,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   const Shader* pixel_shader = next_update_pixel_shader_;
   next_update_pixel_shader_ = nullptr;
   std::memset(last_update_overwritten_rows_, 0, sizeof(last_update_overwritten_rows_));
+  last_update_transfer_cutout_ = {};
+  last_update_transfer_cutout_bits_ = 0;
 
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
@@ -791,7 +799,21 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
          normalized_depth_control.zfunc == xenos::CompareFunction::kAlways) &&
         (msaa_samples == xenos::MsaaSamples::k1X ||
          (regs[XE_GPU_REG_PA_SC_AA_MASK] & 0xFFFF) == 0xFFFF);
+    // Whether the draw writes all four channels of a color render target without blending.
+    auto color_overwritten = [&](uint32_t color_index) {
+      auto blend =
+          regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[color_index]);
+      return ((normalized_color_mask >> (4 * color_index)) & 0xF) == 0xF &&
+             blend.color_srcblend == xenos::BlendFactor::kOne &&
+             blend.color_destblend == xenos::BlendFactor::kZero &&
+             blend.color_comb_fcn == xenos::BlendOp::kAdd &&
+             blend.alpha_srcblend == xenos::BlendFactor::kOne &&
+             blend.alpha_destblend == xenos::BlendFactor::kZero &&
+             blend.alpha_comb_fcn == xenos::BlendOp::kAdd;
+    };
     uint32_t rows = 0;
+    uint32_t cutout_width = 0;
+    uint32_t cutout_height = 0;
     uint32_t pitch_pixels_at_tiles =
         (pitch_tiles_at_32bpp * xenos::kEdramTileWidthSamples) >> msaa_samples_x_log2;
     uint32_t tile_height_pixels =
@@ -800,9 +822,19 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       // Only whole rows of tiles, across the whole pitch, inside the scissor.
       draw_util::Scissor scissor;
       draw_util::GetScissor(regs, scissor, false);
-      if (!scissor.offset[0] && !scissor.offset[1] && scissor.extent[0] >= pitch_pixels_at_tiles) {
-        // No further than the rows this update claims (height_used, from the viewport or scissor).
-        rows = std::min(scissor.extent[1], height_used) / tile_height_pixels;
+      if (!scissor.offset[0] && !scissor.offset[1]) {
+        if (scissor.extent[0] >= pitch_pixels_at_tiles) {
+          // No further than the rows this update claims (height_used, from the viewport or
+          // scissor).
+          rows = std::min(scissor.extent[1], height_used) / tile_height_pixels;
+        } else if (REXCVAR_GET(transfer_skip_overwritten_partial)) {
+          // transfer_skip_overwritten_partial: narrower than the pitch, so no whole rows, but the
+          // transfers can still leave out the rectangle the draw writes (Swap Force draws its
+          // full-screen passes 1264x704 into 1280-wide render targets: in Woodburrow at scale 2,
+          // 18 such transfers took 0.6 ms of 26 ms, 2026-11-06). Checked below, after the rows.
+          cutout_width = scissor.extent[0];
+          cutout_height = std::min(scissor.extent[1], height_used);
+        }
       }
     }
     bool any_candidate = false;
@@ -821,16 +853,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
         }
         continue;
       }
-      uint32_t color_index = rt_bit_index - 1;
-      auto blend =
-          regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[color_index]);
-      if (((normalized_color_mask >> (4 * color_index)) & 0xF) != 0xF ||
-          blend.color_srcblend != xenos::BlendFactor::kOne ||
-          blend.color_destblend != xenos::BlendFactor::kZero ||
-          blend.color_comb_fcn != xenos::BlendOp::kAdd ||
-          blend.alpha_srcblend != xenos::BlendFactor::kOne ||
-          blend.alpha_destblend != xenos::BlendFactor::kZero ||
-          blend.alpha_comb_fcn != xenos::BlendOp::kAdd) {
+      if (!color_overwritten(rt_bit_index - 1)) {
         continue;
       }
       uint32_t tiles = std::min(rt_lengths_tiles[i], rows * rt_keys[rt_bit_index].GetPitchTiles());
@@ -861,6 +884,39 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                     transfer_skip_draws_, transfer_skip_tiles_);
       }
     }
+    // The narrower draw: every render target it would transfer into must be a color one it writes
+    // whole (the cutout is one for all of them; a depth target's stencil would keep the old host
+    // contents there, so none with depth), and its shape must cover the rectangle.
+    if (cutout_width && cutout_height) {
+      uint32_t transfer_bits = 0;
+      bool cutout_usable = true;
+      for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+        uint32_t rt_bit_index = edram_bases_sorted[i].second;
+        if (!WouldOwnershipChangeRequireTransfers(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i])) {
+          continue;
+        }
+        if (!rt_bit_index || !color_overwritten(rt_bit_index - 1)) {
+          cutout_usable = false;
+          break;
+        }
+        transfer_bits |= uint32_t(1) << rt_bit_index;
+      }
+      if (cutout_usable && transfer_bits &&
+          draw_extent_estimator_.ShapeCoversRectangle(vertex_shader, 0, 0, int32_t(cutout_width),
+                                                      int32_t(cutout_height))) {
+        last_update_transfer_cutout_.x_pixels = 0;
+        last_update_transfer_cutout_.y_pixels = 0;
+        last_update_transfer_cutout_.width_pixels = cutout_width;
+        last_update_transfer_cutout_.height_pixels = cutout_height;
+        last_update_transfer_cutout_bits_ = transfer_bits;
+        ++transfer_cutout_draws_;
+        if (transfer_cutout_draws_ == 1 || (transfer_cutout_draws_ & 0xFFF) == 0) {
+          REXGPU_INFO("Transfer skip: {} draws narrower than their render targets left what they "
+                      "overwrite out of the transfers",
+                      transfer_cutout_draws_);
+        }
+      }
+    }
   }
 
   if (!skip_ownership) {
@@ -873,7 +929,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       }
       if (rt_lengths_tiles[i] > overwritten) {
         ChangeOwnership(rt_keys[rt_bit_index], overwritten, rt_lengths_tiles[i] - overwritten,
-                        interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+                        interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index],
+                        last_update_transfer_cutout());
       }
     }
     if (!interlock_barrier_only) {

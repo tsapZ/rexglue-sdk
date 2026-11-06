@@ -513,6 +513,14 @@ class RenderTargetCache {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_transfers_;
   }
+  // transfer_skip_overwritten_partial: the rectangle at the render targets' origin that the last
+  // update's draw overwrites whole in every render target it transfers into (narrower than the
+  // pitch, so not whole rows), to leave out of those transfers; null if none.
+  const Transfer::Rectangle* last_update_transfer_cutout() const {
+    return last_update_transfer_cutout_.width_pixels ? &last_update_transfer_cutout_ : nullptr;
+  }
+  // The slots (bit 0 depth, 1... color) the cutout was checked for: those needing a transfer.
+  uint32_t last_update_transfer_cutout_bits() const { return last_update_transfer_cutout_bits_; }
 
   HostDepthStoreRenderTargetConstant GetHostDepthStoreRenderTargetConstant(
       uint32_t pitch_tiles, bool msaa_2x_supported) const {
@@ -731,8 +739,11 @@ class RenderTargetCache {
   // transfer_skip_overwritten.
   const Shader* next_update_pixel_shader_ = nullptr;
   uint32_t last_update_overwritten_rows_[1 + xenos::kMaxColorRenderTargets] = {};
+  Transfer::Rectangle last_update_transfer_cutout_ = {};
+  uint32_t last_update_transfer_cutout_bits_ = 0;
   uint64_t transfer_skip_draws_ = 0;
   uint64_t transfer_skip_tiles_ = 0;
+  uint64_t transfer_cutout_draws_ = 0;
   uint64_t update_skip_verified_ = 0;
   uint64_t update_skip_mismatches_ = 0;
 };
