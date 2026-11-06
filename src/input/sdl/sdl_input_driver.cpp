@@ -99,7 +99,9 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
       if (!REXCVAR_GET(hid_mappings_file).empty()) {
         std::filesystem::path mappings_path(REXCVAR_GET(hid_mappings_file));
         if (!std::filesystem::exists(mappings_path)) {
-          REXLOG_WARN("SDL GameControllerDB: file '{}' does not exist.",
+          // The file is optional and no setup ships one: SDL's own mappings then do the job. Not a
+          // warning, it stood in every log and read like a problem in players' reports.
+          REXLOG_INFO("SDL GameControllerDB: no '{}' (optional), using SDL's own mappings.",
                       REXCVAR_GET(hid_mappings_file));
         } else {
           auto mappings_result =
