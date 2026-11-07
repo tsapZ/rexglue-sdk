@@ -12,8 +12,15 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -184,6 +191,37 @@ class D3D12TextureCache final : public TextureCache {
   // place. True when it was replaced (nothing else to load then).
   class D3D12Texture;
   bool DumpOrReplaceTexture(D3D12Texture& texture);
+  // A replacement file to load, and what came of it.
+  struct ReplacementJob {
+    TextureKey key;
+    std::filesystem::path path;
+    D3D12_RESOURCE_DESC desc;
+    int family = -1;
+    uint32_t width = 0, height = 0;
+    std::string name;
+  };
+  struct ReplacementResult {
+    TextureKey key;
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource, upload;
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 16> layouts;
+    std::string name;
+    uint32_t guest_width = 0, guest_height = 0, width = 0, height = 0, mips = 0;
+    uint64_t make_us = 0;
+  };
+  bool MakeReplacement(const ReplacementJob& job, ReplacementResult& out) const;
+  void ApplyReplacement(D3D12Texture& texture, ReplacementResult& result, bool in_use);
+  // texture_replace_async: workers make the resources, BeginFrame puts them in.
+  void QueueReplacement(ReplacementJob job);
+  void ReplacementWorker();
+  void ApplyReadyReplacements();
+  void StopReplacementWorkers();
+  std::mutex replacement_mutex_;
+  std::condition_variable replacement_wake_;
+  std::deque<ReplacementJob> replacement_jobs_;
+  std::vector<ReplacementResult> replacement_results_;
+  std::atomic<bool> replacement_results_ready_{false};
+  bool replacement_stop_ = false;
+  std::vector<std::thread> replacement_workers_;
   static constexpr uint32_t kLoadGuestXThreadsPerGroupLog2 = 2;
   static constexpr uint32_t kLoadGuestYBlocksPerGroupLog2 = 5;
 
@@ -275,10 +313,11 @@ class D3D12TextureCache final : public TextureCache {
 
     // A replacement from texture_replace_dir (its own size and mip count) in place of the
     // resource made for the guest texture; the guest's data isn't loaded into it any more.
-    // `upload` holds the replacement's data until the texture goes.
+    // `upload` holds the replacement's data until the texture goes. in_use: frames under way may
+    // draw with the old resource and descriptors, so they stay until the texture goes too.
     void SetReplacement(Microsoft::WRL::ComPtr<ID3D12Resource> resource,
                         D3D12_RESOURCE_STATES state, Microsoft::WRL::ComPtr<ID3D12Resource> upload,
-                        uint32_t mip_levels);
+                        uint32_t mip_levels, bool in_use);
     uint32_t replaced_mip_levels() const { return replaced_mip_levels_; }
     // Looked at once for texture_dump_dir / texture_replace_dir (on its first load).
     bool files_checked = false;
@@ -286,6 +325,8 @@ class D3D12TextureCache final : public TextureCache {
    private:
     uint32_t replaced_mip_levels_ = 0;
     Microsoft::WRL::ComPtr<ID3D12Resource> replacement_upload_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> replaced_original_;
+    std::vector<uint32_t> retired_srv_descriptors_;
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
     std::unique_ptr<D3D12Texture> texture_3d_as_2d_;

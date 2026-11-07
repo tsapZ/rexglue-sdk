@@ -519,6 +519,11 @@ class TextureCache {
   // create the texture - if it's nullptr, occasionally a recreation attempt
   // should be made.
   Texture* FindOrCreateTexture(TextureKey key);
+  // The texture with this key if there is one; never makes one.
+  Texture* FindExistingTexture(const TextureKey& key) const {
+    auto it = textures_.find(key);
+    return it != textures_.end() ? it->second.get() : nullptr;
+  }
 
   static const LoadShaderInfo& GetLoadShaderInfo(LoadShaderIndex load_shader_index) {
     assert_true(load_shader_index < kLoadShaderCount);

@@ -52,6 +52,10 @@ REXCVAR_DEFINE_STRING(texture_dump_dir, "", "GPU/D3D12",
                       "top level as a DDS named by the hash of its content, into this folder (once "
                       "each), to make replacements from; empty = off")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(texture_replace_async, true, "GPU/D3D12",
+                    "Load replacement textures on worker threads: the game's own texture shows until "
+                    "the file is ready, instead of the game waiting for every file");
+
 REXCVAR_DEFINE_STRING(texture_replace_dir, "", "GPU/D3D12",
                       "Load <hash>.dds from this folder in place of the game's texture of that "
                       "content (the names texture_dump_dir gives): the same block format, any size "
@@ -400,6 +404,7 @@ D3D12TextureCache::D3D12TextureCache(const RegisterFile& register_file,
       bindless_resources_used_(bindless_resources_used) {}
 
 D3D12TextureCache::~D3D12TextureCache() {
+  StopReplacementWorkers();
   // While the texture descriptor cache still exists (referenced by
   // ~D3D12Texture), destroy all textures.
   DestroyAllTextures(true);
@@ -699,6 +704,7 @@ void D3D12TextureCache::BeginSubmission(uint64_t new_submission_index) {
 
 void D3D12TextureCache::BeginFrame() {
   TextureCache::BeginFrame();
+  ApplyReadyReplacements();
 
   std::memset(unsupported_format_features_used_, 0, sizeof(unsupported_format_features_used_));
 }
@@ -1451,12 +1457,18 @@ D3D12TextureCache::D3D12Texture::D3D12Texture(D3D12TextureCache& texture_cache,
 void D3D12TextureCache::D3D12Texture::SetReplacement(Microsoft::WRL::ComPtr<ID3D12Resource> resource,
                                                      D3D12_RESOURCE_STATES state,
                                                      Microsoft::WRL::ComPtr<ID3D12Resource> upload,
-                                                     uint32_t mip_levels) {
+                                                     uint32_t mip_levels, bool in_use) {
   auto& d3d12_texture_cache = static_cast<D3D12TextureCache&>(texture_cache());
   for (const auto& descriptor_pair : srv_descriptors_) {
-    d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_pair.second);
+    // Frames under way may still read through them.
+    if (in_use) {
+      retired_srv_descriptors_.push_back(descriptor_pair.second);
+    } else {
+      d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_pair.second);
+    }
   }
   srv_descriptors_.clear();
+  if (in_use) replaced_original_ = std::move(resource_);
   resource_ = std::move(resource);
   resource_state_ = state;
   replacement_upload_ = std::move(upload);
@@ -1468,6 +1480,9 @@ void D3D12TextureCache::D3D12Texture::SetReplacement(Microsoft::WRL::ComPtr<ID3D
 
 D3D12TextureCache::D3D12Texture::~D3D12Texture() {
   auto& d3d12_texture_cache = static_cast<D3D12TextureCache&>(texture_cache());
+  for (uint32_t descriptor_index : retired_srv_descriptors_) {
+    d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_index);
+  }
   for (const auto& descriptor_pair : srv_descriptors_) {
     d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_pair.second);
   }
@@ -2277,6 +2292,8 @@ constexpr uint32_t FourCC(char a, char b, char c, char d) {
   return uint32_t(uint8_t(a)) | uint32_t(uint8_t(b)) << 8 | uint32_t(uint8_t(c)) << 16 |
          uint32_t(uint8_t(d)) << 24;
 }
+constexpr uint32_t kFourCC[3] = {FourCC('D', 'X', 'T', '1'), FourCC('D', 'X', 'T', '3'),
+                                 FourCC('D', 'X', 'T', '5')};
 
 // 0 BC1, 1 BC2, 2 BC3, or -1 for the formats this doesn't handle.
 int BlockFamily(xenos::TextureFormat format) {
@@ -2397,8 +2414,6 @@ bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
       XXH3_64bits_withSeed(linear.data(), linear.size(),
                            uint64_t(family) | uint64_t(width) << 8 | uint64_t(height) << 24);
   const std::string name = fmt::format("{:016X}.dds", hash);
-  static const uint32_t kFourCC[3] = {FourCC('D', 'X', 'T', '1'), FourCC('D', 'X', 'T', '3'),
-                                      FourCC('D', 'X', 'T', '5')};
 
   // The dump: once per content, written on a thread of its own.
   if (!dump_dir.empty()) {
@@ -2438,11 +2453,33 @@ bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
   const auto& index = ReplacementIndex();
   const auto it = index.find(hash);
   if (it == index.end()) return false;
+  ReplacementJob job;
+  job.key = key;
+  job.path = it->second;
+  job.desc = texture.resource()->GetDesc();
+  job.family = family;
+  job.width = width;
+  job.height = height;
+  job.name = name;
+  if (REXCVAR_GET(texture_replace_async)) {
+    QueueReplacement(std::move(job));
+    // The guest's own texture until the replacement is ready (ApplyReadyReplacements).
+    return false;
+  }
+  ReplacementResult result;
+  if (!MakeReplacement(job, result)) return false;
+  ApplyReplacement(texture, result, false);
+  return true;
+}
+
+// Reads the file and makes the resources, without touching anything of the GPU thread: D3D12's
+// device methods may be called from any thread.
+bool D3D12TextureCache::MakeReplacement(const ReplacementJob& job, ReplacementResult& out) const {
   const auto load_start = std::chrono::steady_clock::now();
-  // One read of the whole file: this runs on the GPU thread while the game waits, and reading it
-  // through stream iterators byte by byte made a figure change stutter with an HD pack (a 1024x1024
-  // DXT5 with mips is about 1.4 MB, and a new character brings dozens).
-  std::ifstream in(it->second, std::ios::binary | std::ios::ate);
+  // One read of the whole file: reading it through stream iterators byte by byte made a figure
+  // change stutter with an HD pack (a 1024x1024 DXT5 with mips is about 1.4 MB, and a new character
+  // brings dozens).
+  std::ifstream in(job.path, std::ios::binary | std::ios::ate);
   const std::streamoff file_size = in ? std::streamoff(in.tellg()) : std::streamoff(0);
   std::vector<uint8_t> file(file_size > 0 ? size_t(file_size) : 0);
   if (!file.empty()) {
@@ -2450,96 +2487,167 @@ bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
     if (!in.read(reinterpret_cast<char*>(file.data()), std::streamsize(file.size()))) file.clear();
   }
   if (file.size() < 4 + sizeof(DdsHeader) || std::memcmp(file.data(), "DDS ", 4) != 0) return false;
-  DdsHeader h;
-  std::memcpy(&h, file.data() + 4, sizeof(h));
+  DdsHeader header;
+  std::memcpy(&header, file.data() + 4, sizeof(header));
   size_t data_offset = 4 + sizeof(DdsHeader);
   int dds_family = -1;
   for (int f = 0; f < 3; ++f) {
-    if (h.pixel_format.four_cc == kFourCC[f]) dds_family = f;
+    if (header.pixel_format.four_cc == kFourCC[f]) dds_family = f;
   }
-  if (h.pixel_format.four_cc == FourCC('D', 'X', '1', '0') && file.size() >= data_offset + 20) {
+  if (header.pixel_format.four_cc == FourCC('D', 'X', '1', '0') && file.size() >= data_offset + 20) {
     uint32_t dxgi_format;
     std::memcpy(&dxgi_format, file.data() + data_offset, 4);
     dds_family = BlockFamily(DXGI_FORMAT(dxgi_format));
     data_offset += 20;
   }
-  const uint32_t mips = std::max(uint32_t(1), h.mip_map_count);
-  if (dds_family != family || !h.width || !h.height || (h.width & 3) || (h.height & 3) ||
-      mips > 16 || h.width > 16384 || h.height > 16384) {
-    REXGPU_WARN("Texture replacement: {} is not a {}x{}-compatible DXT{} DDS", it->second.string(),
-                width, height, family == 0 ? 1 : family == 1 ? 3 : 5);
+  const uint32_t mips = std::max(uint32_t(1), header.mip_map_count);
+  if (dds_family != job.family || !header.width || !header.height || (header.width & 3) ||
+      (header.height & 3) || mips > 16 || header.width > 16384 || header.height > 16384) {
+    REXGPU_WARN("Texture replacement: {} is not a {}x{}-compatible DXT{} DDS", job.path.string(),
+                job.width, job.height, job.family == 0 ? 1 : job.family == 1 ? 3 : 5);
     return false;
   }
-  D3D12_RESOURCE_DESC desc = texture.resource()->GetDesc();
-  desc.Width = h.width;
-  desc.Height = h.height;
+  D3D12_RESOURCE_DESC desc = job.desc;
+  desc.Width = header.width;
+  desc.Height = header.height;
   desc.MipLevels = UINT16(mips);
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
-  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 16> layouts;
   std::array<UINT, 16> rows;
   std::array<UINT64, 16> row_bytes;
   UINT64 upload_size = 0;
-  device->GetCopyableFootprints(&desc, 0, mips, 0, layouts.data(), rows.data(), row_bytes.data(),
+  device->GetCopyableFootprints(&desc, 0, mips, 0, out.layouts.data(), rows.data(), row_bytes.data(),
                                 &upload_size);
   // The file's levels one after the other, each its blocks row by row.
   size_t needed = data_offset;
   for (uint32_t m = 0; m < mips; ++m) needed += size_t(rows[m]) * row_bytes[m];
   if (file.size() < needed) {
-    REXGPU_WARN("Texture replacement: {} is too short for {} mips", it->second.string(), mips);
+    REXGPU_WARN("Texture replacement: {} is too short for {} mips", job.path.string(), mips);
     return false;
   }
-  Microsoft::WRL::ComPtr<ID3D12Resource> resource, upload;
   D3D12_RESOURCE_DESC upload_desc;
   ui::d3d12::util::FillBufferResourceDesc(upload_desc, upload_size, D3D12_RESOURCE_FLAG_NONE);
   if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
                                              provider.GetHeapFlagCreateNotZeroed(), &desc,
                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                             IID_PPV_ARGS(&resource))) ||
+                                             IID_PPV_ARGS(&out.resource))) ||
       FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesUpload,
                                              provider.GetHeapFlagCreateNotZeroed(), &upload_desc,
                                              D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                             IID_PPV_ARGS(&upload)))) {
+                                             IID_PPV_ARGS(&out.upload)))) {
     return false;
   }
   uint8_t* mapped = nullptr;
   D3D12_RANGE no_read = {0, 0};
-  if (FAILED(upload->Map(0, &no_read, reinterpret_cast<void**>(&mapped)))) return false;
+  if (FAILED(out.upload->Map(0, &no_read, reinterpret_cast<void**>(&mapped)))) return false;
   const uint8_t* source = file.data() + data_offset;
   for (uint32_t m = 0; m < mips; ++m) {
     for (UINT row = 0; row < rows[m]; ++row) {
-      std::memcpy(mapped + layouts[m].Offset + UINT64(row) * layouts[m].Footprint.RowPitch, source,
-                  size_t(row_bytes[m]));
+      std::memcpy(mapped + out.layouts[m].Offset + UINT64(row) * out.layouts[m].Footprint.RowPitch,
+                  source, size_t(row_bytes[m]));
       source += row_bytes[m];
     }
   }
-  upload->Unmap(0, nullptr);
+  out.upload->Unmap(0, nullptr);
+  out.key = job.key;
+  out.name = job.name;
+  out.guest_width = job.width;
+  out.guest_height = job.height;
+  out.width = header.width;
+  out.height = header.height;
+  out.mips = mips;
+  out.make_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - load_start)
+                             .count());
+  return true;
+}
+
+// On the GPU thread, with its command list open. in_use: frames under way may already draw with
+// the guest's texture.
+void D3D12TextureCache::ApplyReplacement(D3D12Texture& texture, ReplacementResult& result,
+                                         bool in_use) {
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
-  for (uint32_t m = 0; m < mips; ++m) {
+  for (uint32_t m = 0; m < result.mips; ++m) {
     D3D12_TEXTURE_COPY_LOCATION dst, src;
-    dst.pResource = resource.Get();
+    dst.pResource = result.resource.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dst.SubresourceIndex = m;
-    src.pResource = upload.Get();
+    src.pResource = result.upload.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint = layouts[m];
+    src.PlacedFootprint = result.layouts[m];
     command_list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
   }
-  texture.SetReplacement(std::move(resource), D3D12_RESOURCE_STATE_COPY_DEST, std::move(upload),
-                         mips);
-  static std::atomic<uint32_t> replaced{0};
-  // The time the GPU thread spent on it (reading, the two resources, the copy), for the log.
-  static std::atomic<uint64_t> spent_us{0};
-  const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                                   std::chrono::steady_clock::now() - load_start)
-                                   .count());
-  const uint64_t total_us = spent_us += us;
-  const uint32_t count = ++replaced;
-  if (count <= 20 || count % 100 == 0) {
-    REXGPU_INFO("Texture replacement: {} ({}x{} -> {}x{}, {} mips, {:.1f} ms), {} so far, {} ms in all", name,
-                width, height, h.width, h.height, mips, double(us) / 1000.0, count, total_us / 1000);
+  texture.SetReplacement(std::move(result.resource), D3D12_RESOURCE_STATE_COPY_DEST,
+                         std::move(result.upload), result.mips, in_use);
+  static uint32_t replaced = 0;
+  // The time reading and making it took (on a worker with texture_replace_async), for the log.
+  static uint64_t spent_us = 0;
+  spent_us += result.make_us;
+  ++replaced;
+  if (replaced <= 20 || replaced % 100 == 0) {
+    REXGPU_INFO("Texture replacement: {} ({}x{} -> {}x{}, {} mips, {:.1f} ms), {} so far, {} ms in all", result.name,
+                result.guest_width, result.guest_height, result.width, result.height, result.mips,
+                double(result.make_us) / 1000.0, replaced, spent_us / 1000);
   }
-  return true;
+}
+
+void D3D12TextureCache::QueueReplacement(ReplacementJob job) {
+  std::lock_guard lock(replacement_mutex_);
+  if (replacement_workers_.empty()) {
+    for (int i = 0; i < 2; ++i) replacement_workers_.emplace_back([this] { ReplacementWorker(); });
+  }
+  replacement_jobs_.push_back(std::move(job));
+  replacement_wake_.notify_one();
+}
+
+void D3D12TextureCache::ReplacementWorker() {
+  std::unique_lock lock(replacement_mutex_);
+  while (true) {
+    replacement_wake_.wait(lock, [this] { return replacement_stop_ || !replacement_jobs_.empty(); });
+    if (replacement_stop_) return;
+    ReplacementJob job = std::move(replacement_jobs_.front());
+    replacement_jobs_.pop_front();
+    lock.unlock();
+    ReplacementResult result;
+    const bool made = MakeReplacement(job, result);
+    lock.lock();
+    if (made) {
+      replacement_results_.push_back(std::move(result));
+      replacement_results_ready_.store(true, std::memory_order_relaxed);
+    }
+  }
+}
+
+void D3D12TextureCache::ApplyReadyReplacements() {
+  if (!replacement_results_ready_.load(std::memory_order_relaxed)) return;
+  std::vector<ReplacementResult> ready;
+  {
+    std::lock_guard lock(replacement_mutex_);
+    ready.swap(replacement_results_);
+    replacement_results_ready_.store(false, std::memory_order_relaxed);
+  }
+  bool applied = false;
+  for (ReplacementResult& result : ready) {
+    // Looked up again: the texture may have gone since the file was queued.
+    Texture* found = FindExistingTexture(result.key);
+    if (!found) continue;
+    D3D12Texture& texture = static_cast<D3D12Texture&>(*found);
+    if (texture.replaced_mip_levels()) continue;
+    ApplyReplacement(texture, result, true);
+    applied = true;
+  }
+  // The bindings hold descriptors of the old resources.
+  if (applied) ResetTextureBindings();
+}
+
+void D3D12TextureCache::StopReplacementWorkers() {
+  {
+    std::lock_guard lock(replacement_mutex_);
+    replacement_stop_ = true;
+  }
+  replacement_wake_.notify_all();
+  for (std::thread& worker : replacement_workers_) worker.join();
+  replacement_workers_.clear();
 }
 
 }  // namespace rex::graphics::d3d12
