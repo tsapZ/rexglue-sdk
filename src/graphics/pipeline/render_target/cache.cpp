@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iterator>
@@ -40,6 +41,14 @@ REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
 REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(gpu_transfer_report, false, "GPU",
+                    "Log the EDRAM ownership transfers between render targets by kind every few seconds");
+
+REXCVAR_DEFINE_BOOL(gpu_native_surfaces, false, "GPU",
+                    "Drop the EDRAM ownership transfers between render targets, except the kinds the game "
+                    "needs, and log the counts every few seconds")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(render_target_update_skip, true, "GPU",
                     "Skip the render target lookups and EDRAM ownership walks of a draw whose "
@@ -931,7 +940,14 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
         ChangeOwnership(rt_keys[rt_bit_index], overwritten, rt_lengths_tiles[i] - overwritten,
                         interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index],
                         last_update_transfer_cutout());
+        if (!interlock_barrier_only &&
+            (REXCVAR_GET(gpu_transfer_report) || REXCVAR_GET(gpu_native_surfaces))) {
+          NoteNativeSurfaceTransfers(last_update_transfers_[rt_bit_index], rt_keys[rt_bit_index]);
+        }
       }
+    }
+    if (REXCVAR_GET(gpu_transfer_report) || REXCVAR_GET(gpu_native_surfaces)) {
+      ReportNativeSurfaceTransfers();
     }
     if (!interlock_barrier_only) {
       // What this update claimed, after its own ChangeOwnership calls bumped the generation.
@@ -1527,6 +1543,41 @@ bool RenderTargetCache::IsRangeOwnedBy(RenderTargetKey dest, uint32_t length_til
     return false;
   }
   return true;
+}
+
+void RenderTargetCache::NoteNativeSurfaceTransfers(std::vector<Transfer>& transfers,
+                                                   const RenderTargetKey& dest_key) {
+  auto kind_of = [](const RenderTargetKey& key) {
+    return native_surfaces::SurfaceKind{key.is_depth != 0, key.resource_format, uint32_t(key.msaa_samples)};
+  };
+  const native_surfaces::SurfaceKind dest_kind = kind_of(dest_key);
+  const bool drop = REXCVAR_GET(gpu_native_surfaces);
+  auto dropped_begin = std::remove_if(transfers.begin(), transfers.end(), [&](const Transfer& transfer) {
+    const native_surfaces::SurfaceKind source_kind = kind_of(transfer.source->key());
+    const uint32_t tiles = transfer.end_tiles - transfer.start_tiles;
+    if (!drop || native_surfaces::KeepTransfer(source_kind, dest_kind)) {
+      native_surface_kept_.Record(source_kind, dest_kind, tiles);
+      return false;
+    }
+    native_surface_dropped_.Record(source_kind, dest_kind, tiles);
+    return true;
+  });
+  transfers.erase(dropped_begin, transfers.end());
+}
+
+void RenderTargetCache::ReportNativeSurfaceTransfers() {
+  const auto now = std::chrono::steady_clock::now();
+  const double seconds = std::chrono::duration<double>(now - native_surface_last_report_).count();
+  if (seconds < 5.0) {
+    return;
+  }
+  native_surface_last_report_ = now;
+  if (!native_surface_kept_.empty()) {
+    REXGPU_INFO("TRANSFERS kept {}", native_surface_kept_.ReportAndReset(seconds));
+  }
+  if (!native_surface_dropped_.empty()) {
+    REXGPU_INFO("TRANSFERS dropped {}", native_surface_dropped_.ReportAndReset(seconds));
+  }
 }
 
 void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,

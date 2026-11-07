@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -22,6 +23,7 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/edram_layout.h>
+#include <rex/graphics/pipeline/render_target/native_surfaces.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
@@ -674,6 +676,11 @@ class RenderTargetCache {
   void ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,
                        uint32_t length_tiles, std::vector<Transfer>* transfers_append_out,
                        const Transfer::Rectangle* resolve_clear_cutout = nullptr);
+  // gpu_transfer_report, gpu_native_surfaces: counts the transfers into dest_key by kind; with
+  // gpu_native_surfaces also removes those KeepTransfer doesn't keep.
+  void NoteNativeSurfaceTransfers(std::vector<Transfer>& transfers, const RenderTargetKey& dest_key);
+  // Logs the counts every few seconds.
+  void ReportNativeSurfaceTransfers();
   // Whether every tile of the length_tiles from dest's base (with EDRAM addressing wrapping) is
   // owned by dest, as ChangeOwnership would leave it (render_target_update_skip_verify).
   bool IsRangeOwnedBy(RenderTargetKey dest, uint32_t length_tiles) const;
@@ -713,6 +720,11 @@ class RenderTargetCache {
   // render targets. They are reordered so for one source, all transfers are
   // consecutive in the array.
   std::vector<Transfer> last_update_transfers_[1 + xenos::kMaxColorRenderTargets];
+
+  // gpu_transfer_report, gpu_native_surfaces: the counts since the last report.
+  native_surfaces::TransferCounters native_surface_kept_;
+  native_surfaces::TransferCounters native_surface_dropped_;
+  std::chrono::steady_clock::time_point native_surface_last_report_ = std::chrono::steady_clock::now();
 
   // Bumped by everything that changes ownership_ranges_ or may delete render targets (for
   // update_skip_).
