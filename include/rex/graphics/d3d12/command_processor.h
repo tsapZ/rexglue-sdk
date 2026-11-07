@@ -222,6 +222,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
+  int EdramOwnerMsaaSamplesLog2(uint32_t base_tiles) const override {
+    return render_target_cache_ ? render_target_cache_->OwnerMsaaSamplesLog2(base_tiles) : -1;
+  }
 
  private:
   static constexpr uint32_t kQueueFrames = 3;

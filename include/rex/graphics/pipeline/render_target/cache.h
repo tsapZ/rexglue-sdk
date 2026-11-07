@@ -127,6 +127,8 @@ class RenderTargetCache {
   virtual ~RenderTargetCache();
 
   virtual Path GetPath() const = 0;
+  // The sample count (log2) of the render target that last used the EDRAM tile, -1 if none did.
+  int OwnerMsaaSamplesLog2(uint32_t tile) const;
 
   // Resolution scaling on the EDRAM side is performed by multiplying the EDRAM
   // tile size by the resolution scale.

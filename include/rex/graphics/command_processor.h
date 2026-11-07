@@ -241,6 +241,10 @@ class CommandProcessor {
   virtual bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                          IndexBufferInfo* index_buffer_info, bool major_mode_explicit) = 0;
   virtual bool IssueCopy() = 0;
+  // gpu_msaa_fill_at_1x: the sample count (log2) of the render target that last used the EDRAM
+  // tile, -1 if unknown.
+  virtual int EdramOwnerMsaaSamplesLog2(uint32_t /*base_tiles*/) const { return -1; }
+  int MsaaFillOwnerSamplesLog2();
 
   // "Actual" is for the command processor thread, to be read by the
   // implementations.

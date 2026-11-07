@@ -1545,6 +1545,14 @@ bool RenderTargetCache::IsRangeOwnedBy(RenderTargetKey dest, uint32_t length_til
   return true;
 }
 
+int RenderTargetCache::OwnerMsaaSamplesLog2(uint32_t tile) const {
+  auto it = ownership_ranges_.upper_bound(tile);
+  if (it == ownership_ranges_.begin()) return -1;
+  --it;
+  if (tile >= it->second.end_tiles || it->second.render_target.IsEmpty()) return -1;
+  return int(it->second.render_target.msaa_samples);
+}
+
 void RenderTargetCache::NoteNativeSurfaceTransfers(std::vector<Transfer>& transfers,
                                                    const RenderTargetKey& dest_key) {
   auto kind_of = [](const RenderTargetKey& key) {
