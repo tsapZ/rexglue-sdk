@@ -51,6 +51,11 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(hide_idle_cursor, true, "General",
+                    "Hide the mouse cursor while it isn't used; moving the mouse brings it back "
+                    "for a few seconds")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex {
 
 // --- ReXApp ---
@@ -361,6 +366,10 @@ bool ReXApp::SetupPresentation() {
     }
   });
   window_->Open();
+  if (REXCVAR_GET(hide_idle_cursor)) {
+    window_->SetCursorAutoHideDelayMs(3000);
+    window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kAutoHidden);
+  }
 
   auto* graphics_system = config_.graphics.get();
   if (graphics_system && graphics_system->presenter()) {
