@@ -164,24 +164,26 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
         system::X_VIDEO_MODE video_mode;
         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
-        double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
-        // If frame_rate_limit asks for more than the configured video_mode_refresh_rate, raise
-        // the guest vblank rate to match automatically -- otherwise this thread would still only
-        // mark vblank at the old (lower) rate, silently capping anything paced off vblank
-        // interrupts even though ThrottleGuestTickRate (xboxkrnl_video.cpp) and the host present
-        // loop (d3d12_presenter.cpp) were both told to go faster. No separate cvar to keep in
-        // sync by hand: frame_rate_limit alone is enough.
-        const int32_t frame_rate_limit_value = REXCVAR_GET(frame_rate_limit);
-        if (frame_rate_limit_value > 0) {
-          refresh_rate_hz = std::max(refresh_rate_hz, double(frame_rate_limit_value));
-        }
+        const double video_mode_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
         uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
-        uint64_t vsync_interval_ticks =
-            std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
+          // If frame_rate_limit asks for more than the configured video_mode_refresh_rate, raise
+          // the guest vblank rate to match automatically -- otherwise this thread would still only
+          // mark vblank at the old (lower) rate, silently capping anything paced off vblank
+          // interrupts even though ThrottleGuestTickRate (xboxkrnl_video.cpp) and the host present
+          // loop (d3d12_presenter.cpp) were both told to go faster. No separate cvar to keep in
+          // sync by hand: frame_rate_limit alone is enough. Read in every round: the setting is
+          // live (hot reload, the game's settings menu), and read once a raised limit did nothing
+          // until the next start.
+          double refresh_rate_hz = video_mode_rate_hz;
+          const int32_t frame_rate_limit_value = REXCVAR_GET(frame_rate_limit);
+          if (frame_rate_limit_value > 0) {
+            refresh_rate_hz = std::max(refresh_rate_hz, double(frame_rate_limit_value));
+          }
+          const uint64_t interval_ticks =
+              std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
-          uint64_t interval_ticks = vsync_interval_ticks;
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;
