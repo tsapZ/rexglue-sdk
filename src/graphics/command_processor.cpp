@@ -44,9 +44,9 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(gpu_msaa_fill_at_1x, false, "GPU",
-                    "Run Direct3D's 4x MSAA fills (clears drawn with its embedded shaders) as 1x draws at twice "
-                    "the size on the same EDRAM, so the 1x render target that owns that EDRAM keeps it and "
-                    "nothing is copied to a 4x render target and back");
+                    "Run Direct3D's 4x MSAA fills (clears drawn with its embedded shaders) at the sample count "
+                    "of the render target that owns their EDRAM (1x or 2x, the size scaled to match), so that "
+                    "render target keeps it and nothing is copied to a 4x render target and back");
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
@@ -226,12 +226,15 @@ class MsaaFillAt1x {
   MsaaFillAt1x& operator=(const MsaaFillAt1x&) = delete;
   ~MsaaFillAt1x() { Restore(); }
 
-  void Apply() {
+  // samples: 1x or 2x. A 4x pixel is 2x2 samples, a 2x one 1x2 (one above the other), a 1x one a
+  // single sample: at 2x only the width doubles.
+  void Apply(xenos::MsaaSamples samples) {
     for (size_t i = 0; i < kRegisters.size(); ++i) {
       saved_[i] = regs_[kRegisters[i]];
     }
     applied_ = true;
-    DoubleSurface();
+    double_y_ = samples == xenos::MsaaSamples::k1X;
+    DoubleSurface(samples);
     DoubleViewport();
     DoubleWindow();
   }
@@ -253,10 +256,10 @@ class MsaaFillAt1x {
     applied_ = false;
   }
 
-  void DoubleSurface() {
+  void DoubleSurface(xenos::MsaaSamples samples) {
     auto surface_info = regs_.Get<reg::RB_SURFACE_INFO>();
     surface_info.surface_pitch = surface_info.surface_pitch * 2;
-    surface_info.msaa_samples = xenos::MsaaSamples::k1X;
+    surface_info.msaa_samples = samples;
     regs_[XE_GPU_REG_RB_SURFACE_INFO] = surface_info.value;
   }
 
@@ -267,8 +270,14 @@ class MsaaFillAt1x {
     float centre = regs_.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
     DoubleAxis(vte.vport_x_scale_ena, vte.vport_x_offset_ena, XE_GPU_REG_PA_CL_VPORT_XSCALE,
                XE_GPU_REG_PA_CL_VPORT_XOFFSET, centre);
-    DoubleAxis(vte.vport_y_scale_ena, vte.vport_y_offset_ena, XE_GPU_REG_PA_CL_VPORT_YSCALE,
-               XE_GPU_REG_PA_CL_VPORT_YOFFSET, centre);
+    if (double_y_) {
+      DoubleAxis(vte.vport_y_scale_ena, vte.vport_y_offset_ena, XE_GPU_REG_PA_CL_VPORT_YSCALE,
+                 XE_GPU_REG_PA_CL_VPORT_YOFFSET, centre);
+    } else if (!vte.vport_y_scale_ena || !vte.vport_y_offset_ena) {
+      // Turned on below for both axes: Y keeps its values.
+      KeepAxis(vte.vport_y_scale_ena, vte.vport_y_offset_ena, XE_GPU_REG_PA_CL_VPORT_YSCALE,
+               XE_GPU_REG_PA_CL_VPORT_YOFFSET);
+    }
     vte.vport_x_scale_ena = 1;
     vte.vport_x_offset_ena = 1;
     vte.vport_y_scale_ena = 1;
@@ -284,38 +293,50 @@ class MsaaFillAt1x {
     regs_[offset_register] = rex::memory::Reinterpret<uint32_t>(offset * 2.0f + centre);
   }
 
+  void KeepAxis(uint32_t scale_enabled, uint32_t offset_enabled, uint32_t scale_register,
+                uint32_t offset_register) {
+    float scale = scale_enabled ? regs_.Get<float>(scale_register) : 1.0f;
+    float offset = offset_enabled ? regs_.Get<float>(offset_register) : 0.0f;
+    regs_[scale_register] = rex::memory::Reinterpret<uint32_t>(scale);
+    regs_[offset_register] = rex::memory::Reinterpret<uint32_t>(offset);
+  }
+
+  uint32_t Y(uint32_t value) const { return double_y_ ? DoubledScissor(value) : value; }
+
   void DoubleWindow() {
     auto window_offset = regs_.Get<reg::PA_SC_WINDOW_OFFSET>();
     window_offset.window_x_offset = window_offset.window_x_offset * 2;
-    window_offset.window_y_offset = window_offset.window_y_offset * 2;
+    if (double_y_) window_offset.window_y_offset = window_offset.window_y_offset * 2;
     regs_[XE_GPU_REG_PA_SC_WINDOW_OFFSET] = window_offset.value;
     auto window_tl = regs_.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
     window_tl.tl_x = DoubledScissor(window_tl.tl_x);
-    window_tl.tl_y = DoubledScissor(window_tl.tl_y);
+    window_tl.tl_y = Y(window_tl.tl_y);
     regs_[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL] = window_tl.value;
     auto window_br = regs_.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
     window_br.br_x = DoubledScissor(window_br.br_x);
-    window_br.br_y = DoubledScissor(window_br.br_y);
+    window_br.br_y = Y(window_br.br_y);
     regs_[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] = window_br.value;
     auto screen_tl = regs_.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
     screen_tl.tl_x = int32_t(DoubledScissor(uint32_t(std::max(int32_t(screen_tl.tl_x), int32_t(0)))));
-    screen_tl.tl_y = int32_t(DoubledScissor(uint32_t(std::max(int32_t(screen_tl.tl_y), int32_t(0)))));
+    screen_tl.tl_y = int32_t(Y(uint32_t(std::max(int32_t(screen_tl.tl_y), int32_t(0)))));
     regs_[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL] = screen_tl.value;
     auto screen_br = regs_.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
     screen_br.br_x = int32_t(DoubledScissor(uint32_t(std::max(int32_t(screen_br.br_x), int32_t(0)))));
-    screen_br.br_y = int32_t(DoubledScissor(uint32_t(std::max(int32_t(screen_br.br_y), int32_t(0)))));
+    screen_br.br_y = int32_t(Y(uint32_t(std::max(int32_t(screen_br.br_y), int32_t(0)))));
     regs_[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR] = screen_br.value;
   }
 
   RegisterFile& regs_;
   std::array<uint32_t, kRegisters.size()> saved_{};
   bool applied_ = false;
+  bool double_y_ = true;
 };
 
-void ReportMsaaFillAt1x() {
-  static uint64_t count = 0;
-  if ((count++ & 0x3FFF) == 0) {
-    REXGPU_INFO("MSAAFILL1X {} 4x fills drawn at 1x", count);
+void ReportMsaaFillAt1x(xenos::MsaaSamples samples) {
+  static uint64_t counts[2] = {};
+  const uint32_t i = samples == xenos::MsaaSamples::k1X ? 0 : 1;
+  if ((counts[i]++ & 0x3FFF) == 0) {
+    REXGPU_INFO("MSAAFILL1X {} 4x fills drawn at 1x, {} at 2x", counts[0], counts[1]);
   }
 }
 
@@ -1778,8 +1799,12 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       MsaaFillAt1x msaa_fill_at_1x(*register_file_);
       if (REXCVAR_GET(gpu_msaa_fill_at_1x) &&
           IsMsaaFillAt1xEligible(*register_file_, active_vertex_shader_, active_pixel_shader_)) {
-        msaa_fill_at_1x.Apply();
-        ReportMsaaFillAt1x();
+        const int owner = MsaaFillOwnerSamplesLog2();
+        if (owner == 0 || owner == 1) {
+          const auto samples = owner == 0 ? xenos::MsaaSamples::k1X : xenos::MsaaSamples::k2X;
+          msaa_fill_at_1x.Apply(samples);
+          ReportMsaaFillAt1x(samples);
+        }
       }
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
@@ -1943,6 +1968,37 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
       return false;
   }
   return true;
+}
+
+// The sample count (log2) of the render targets that own the EDRAM a fill writes, if they all
+// agree; -1 when they differ, none is known yet, or there is no render target cache.
+int CommandProcessor::MsaaFillOwnerSamplesLog2() {
+  const RegisterFile& regs = *register_file_;
+  int owner = -1;
+  bool mixed = false;
+  auto add = [&](uint32_t base_tiles) {
+    const int samples = EdramOwnerMsaaSamplesLog2(base_tiles);
+    if (samples < 0 || (owner >= 0 && owner != samples)) {
+      mixed = true;
+    } else {
+      owner = samples;
+    }
+  };
+  const auto depth_control = regs.Get<reg::RB_DEPTHCONTROL>();
+  if (depth_control.z_enable || depth_control.stencil_enable) {
+    add(regs.Get<reg::RB_DEPTH_INFO>().depth_base);
+  }
+  if (regs.Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kColorDepth &&
+      active_pixel_shader_) {
+    const uint32_t color_mask =
+        draw_util::GetNormalizedColorMask(regs, active_pixel_shader_->writes_color_targets());
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if ((color_mask >> (4 * i)) & 0b1111) {
+        add(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]).color_base);
+      }
+    }
+  }
+  return mixed ? -1 : owner;
 }
 
 bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* reader,
