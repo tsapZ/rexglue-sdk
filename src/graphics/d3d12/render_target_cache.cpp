@@ -248,7 +248,10 @@ bool D3D12RenderTargetCache::Initialize() {
     // TODO(Triang3l): Make ROV the default when it's optimized better (for
     // instance, using static shader modifications to pass render target
     // parameters).
-    path_ = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kIntel
+    // Intel Arc and its iGPUs don't have that problem and take the faster path too (Xenia Canary
+    // does the same, December 2025).
+    path_ = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kIntel &&
+                    !provider.IsIntelArcGpu()
                 ? Path::kPixelShaderInterlock
                 : Path::kHostRenderTargets;
 #else
@@ -434,7 +437,7 @@ bool D3D12RenderTargetCache::Initialize() {
   use_stencil_reference_output_ =
       REXCVAR_GET(native_stencil_value_output) &&
       provider.IsPSSpecifiedStencilReferenceSupported() &&
-      (REXCVAR_GET(native_stencil_value_output_d3d12_intel) ||
+      (REXCVAR_GET(native_stencil_value_output_d3d12_intel) || provider.IsIntelArcGpu() ||
        provider.GetAdapterVendorID() != ui::GraphicsProvider::GpuVendorID::kIntel);
 
   if (path_ == Path::kHostRenderTargets) {

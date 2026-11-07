@@ -12,6 +12,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include <rex/ui/d3d12/d3d12_api.h>
 #include <rex/ui/graphics_provider.h>
@@ -80,6 +81,13 @@ class D3D12Provider : public GraphicsProvider {
 
   // Adapter info.
   GpuVendorID GetAdapterVendorID() const { return adapter_vendor_id_; }
+  // Intel Arc and the "Intel(R) Graphics" iGPUs of the same architecture (Core Ultra): unlike the
+  // older Intel GPUs they draw Direct3D 9's stencil clears right (Xenia Canary, December 2025).
+  bool IsIntelArcGpu() const {
+    return adapter_vendor_id_ == GpuVendorID::kIntel &&
+           (adapter_description_.rfind("Intel(R) Arc(TM)", 0) == 0 ||
+            adapter_description_.rfind("Intel(R) Graphics", 0) == 0);
+  }
 
   // Device features.
   D3D12_HEAP_FLAGS GetHeapFlagCreateNotZeroed() const { return heap_flag_create_not_zeroed_; }
@@ -158,6 +166,7 @@ class D3D12Provider : public GraphicsProvider {
   uint32_t descriptor_sizes_[D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES];
 
   GpuVendorID adapter_vendor_id_;
+  std::string adapter_description_;  // UTF-8, as DXGI names the adapter
 
   D3D12_HEAP_FLAGS heap_flag_create_not_zeroed_;
   D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER programmable_sample_positions_tier_;
