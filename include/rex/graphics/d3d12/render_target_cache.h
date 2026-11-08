@@ -808,6 +808,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   // gpu_native_resolves: textures written and fallbacks since the last report.
   uint64_t native_resolve_written_ = 0;
+  // Of them, written although not up to date before (the resolve covered the texture).
+  uint64_t native_resolve_covered_ = 0;
   std::array<uint64_t, size_t(NativeResolvePair::kCount)> native_resolve_written_pairs_ = {};
   std::array<uint64_t, size_t(NativeResolveFallback::kCount)> native_resolve_fallbacks_ = {};
   std::chrono::steady_clock::time_point native_resolve_last_report_ =

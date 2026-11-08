@@ -204,6 +204,8 @@ class D3D12TextureCache final : public TextureCache {
     uint32_t not_up_to_date = 0;
     uint32_t replacement = 0;
     uint32_t outside = 0;
+    // Written although not up to date before, as the resolve covered the whole texture.
+    uint32_t covered = 0;
     // Shader modes: the texture was created without D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.
     uint32_t no_uav = 0;
     // Shader modes: native_resolve_cs pipeline not created.
