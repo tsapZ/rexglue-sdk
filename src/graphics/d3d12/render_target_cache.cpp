@@ -6314,6 +6314,7 @@ bool D3D12RenderTargetCache::IsNativeResolveEligible(const draw_util::ResolveInf
       xenos::MsaaSamples::k1X) {
     reason = NativeResolveFallback::kMsaa;
   } else if (!is_depth && resolve_info.copy_dest_info.copy_dest_exp_bias != 0 &&
+             source_color_format != xenos::ColorRenderTargetFormat::k_16_16_FLOAT &&
              source_color_format != xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT &&
              source_color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT) {
     reason = NativeResolveFallback::kExpBias;
@@ -6344,6 +6345,9 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
       is_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
   const int32_t exp_bias = resolve_info.copy_dest_info.copy_dest_exp_bias;
   const bool swap_red_blue = resolve_info.copy_dest_info.copy_dest_swap != 0;
+  // Only with resolution scaling. The fill is done by native_resolve_cs, so copied pairs are
+  // written by it with the identity (kScale by 1) instead.
+  const bool fill_half_pixel_offset = edram_info.fill_half_pixel_offset != 0;
   D3D12TextureCache::NativeResolveWrite write;
   NativeResolvePair pair;
   xenos::TextureFormat texture_format;
@@ -6359,6 +6363,8 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
     } else if (source_format == xenos::DepthRenderTargetFormat::kD24FS8) {
       pair = NativeResolvePair::kD24FS8;
       texture_format = xenos::TextureFormat::k_24_8_FLOAT;
+      // The host keeps guest float24 depth [0, 2) as [0, 1).
+      write.scale = 2.0f;
     } else {
       fallback(NativeResolveFallback::kDepth);
       return;
@@ -6374,7 +6380,7 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
     if (source_format == xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT) {
       pair = NativeResolvePair::k16161616Float;
       texture_format = xenos::TextureFormat::k_16_16_16_16_FLOAT;
-      if (exp_bias) {
+      if (exp_bias || fill_half_pixel_offset) {
         write.mode = D3D12TextureCache::NativeResolveMode::kScale;
         write.source_srv_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         write.dest_uav_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -6389,12 +6395,22 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
     } else if (source_format == xenos::ColorRenderTargetFormat::k_16_16_FLOAT) {
       pair = NativeResolvePair::k1616Float;
       texture_format = xenos::TextureFormat::k_16_16_FLOAT;
+      if (exp_bias || fill_half_pixel_offset) {
+        write.mode = D3D12TextureCache::NativeResolveMode::kScale;
+        write.source_srv_format = DXGI_FORMAT_R16G16_FLOAT;
+        write.dest_uav_format = DXGI_FORMAT_R16G16_FLOAT;
+      }
     } else if (source_format == xenos::ColorRenderTargetFormat::k_8_8_8_8) {
       // R8G8B8A8_UNORM render target, R8G8B8A8_TYPELESS texture - copyable without the swap.
       pair = NativeResolvePair::k8888;
       texture_format = xenos::TextureFormat::k_8_8_8_8;
       if (swap_red_blue) {
         write.mode = D3D12TextureCache::NativeResolveMode::kSwapRedBlue;
+        write.source_srv_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        write.dest_uav_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      } else if (fill_half_pixel_offset && !exp_bias) {
+        // Unorm to float to unorm with the scale of 1 round-trips with round-to-nearest stores.
+        write.mode = D3D12TextureCache::NativeResolveMode::kScale;
         write.source_srv_format = DXGI_FORMAT_R8G8B8A8_UNORM;
         write.dest_uav_format = DXGI_FORMAT_R8G8B8A8_UNORM;
       }
@@ -6436,10 +6452,17 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
     fallback(NativeResolveFallback::kEndian);
     return;
   }
-  // The resolve shader replicates the edge into the half-pixel offset gap with scaling.
-  if (edram_info.fill_half_pixel_offset) {
-    fallback(NativeResolveFallback::kHalfPixelFill);
-    return;
+  // The resolve shaders replicate the first surely covered host column / row (scale / 2) into the
+  // half-pixel offset gap before it with resolution scaling, so does native_resolve_cs. Copied
+  // pairs are left to the resolve, as the copy can't do the fill and the textures of some formats
+  // aren't created with unordered access.
+  if (fill_half_pixel_offset) {
+    if (write.mode == D3D12TextureCache::NativeResolveMode::kCopy) {
+      fallback(NativeResolveFallback::kHalfPixelFill);
+      return;
+    }
+    write.fill_x = resolve_info.coordinate_info.draw_resolution_scale_x >> 1;
+    write.fill_y = resolve_info.coordinate_info.draw_resolution_scale_y >> 1;
   }
 
   // The single render target owning the whole resolve area, as dumped by DumpRenderTargets.
