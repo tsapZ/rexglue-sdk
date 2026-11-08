@@ -1428,7 +1428,7 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
   ForEachTextureAtBasePage(write.base_page, [&](Texture& texture) {
     const TextureKey& key = texture.key();
     if (!key.tiled || key.dimension != xenos::DataDimension::k2DOrStacked ||
-        key.depth_or_array_size_minus_1 != 0 || key.mip_max_level != 0 || key.packed_mips ||
+        key.depth_or_array_size_minus_1 != 0 || key.mip_max_level != 0 || IsBaseInPackedMipTail(key) ||
         key.signed_separate || key.format != write.format || key.pitch != write.pitch ||
         key.endianness != write.endianness || bool(key.scaled_resolve) != scaled ||
         texture.GetGuestMipsSize() != 0) {
@@ -1520,6 +1520,8 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
       constants.dest_offset[1] = int32_t(write.dest_y * scale_y);
       constants.size[0] = width * scale_x;
       constants.size[1] = height * scale_y;
+      constants.fill[0] = write.fill_x;
+      constants.fill[1] = write.fill_y;
       command_list.D3DSetComputeRoot32BitConstants(0, sizeof(constants) / sizeof(uint32_t),
                                                    &constants, 0);
       command_list.D3DDispatch((constants.size[0] + 7) >> 3, (constants.size[1] + 7) >> 3, 1);
@@ -1534,6 +1536,9 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
       ++counts.written;
       return;
     }
+
+    // The half-pixel offset gap fill needs a shader mode.
+    assert_true(!write.fill_x && !write.fill_y);
 
     // Referenced by the command list now.
     texture.MarkAsUsed();
@@ -1803,7 +1808,8 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
   if (REXCVAR_GET(gpu_native_resolves) && key.tiled &&
       key.dimension == xenos::DataDimension::k2DOrStacked && key.depth_or_array_size_minus_1 == 0 &&
       key.mip_max_level == 0 &&
-      (key.format == xenos::TextureFormat::k_16_16_16_16_FLOAT ||
+      (key.format == xenos::TextureFormat::k_16_16_FLOAT ||
+       key.format == xenos::TextureFormat::k_16_16_16_16_FLOAT ||
        key.format == xenos::TextureFormat::k_8_8_8_8 ||
        key.format == xenos::TextureFormat::k_24_8 ||
        key.format == xenos::TextureFormat::k_24_8_FLOAT)) {

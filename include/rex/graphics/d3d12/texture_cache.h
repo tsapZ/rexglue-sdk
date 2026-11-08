@@ -186,6 +186,11 @@ class D3D12TextureCache final : public TextureCache {
     NativeResolveMode mode = NativeResolveMode::kCopy;
     // kScale multiplier.
     float scale = 1.0f;
+    // Shader modes: resolution-scaled host pixel columns / rows at the left / top of the rectangle
+    // taken from the first column / row after them - the half-pixel offset gap fill of the resolve
+    // shaders (ResolveEdramInfo::fill_half_pixel_offset).
+    uint32_t fill_x = 0;
+    uint32_t fill_y = 0;
     // Shader modes: the non-shader-visible SRV of the source to copy if source_srv_format is
     // DXGI_FORMAT_UNKNOWN, otherwise a 2D source SRV with source_srv_format is created.
     D3D12_CPU_DESCRIPTOR_HANDLE source_srv = {};
@@ -549,6 +554,7 @@ class D3D12TextureCache final : public TextureCache {
     int32_t source_offset[2];
     int32_t dest_offset[2];
     uint32_t size[2];
+    uint32_t fill[2];
   };
   Microsoft::WRL::ComPtr<ID3D12RootSignature> native_resolve_root_signature_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> native_resolve_pipeline_;

@@ -293,6 +293,11 @@ class TextureCache {
   // Visits the textures with the base level at the 4 KB physical page. The visitor must not create
   // or destroy textures.
   void ForEachTextureAtBasePage(uint32_t base_page, const std::function<void(Texture&)>& visit);
+  // A single-level texture with packed mips keeps its base level outside the mip tail unless it is
+  // 16 texels or smaller on a side.
+  static bool IsBaseInPackedMipTail(const TextureKey& key) {
+    return key.packed_mips && texture_util::GetPackedMipLevel(key.GetWidth(), key.GetHeight()) == 0;
+  }
 
   // gpu_native_resolves: for a texture whose base level the host has just written with the data
   // the guest memory now contains, marks it up to date and watches its memory again.
