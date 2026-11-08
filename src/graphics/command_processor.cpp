@@ -43,7 +43,7 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
-REXCVAR_DEFINE_BOOL(gpu_msaa_fill_at_1x, false, "GPU",
+REXCVAR_DEFINE_BOOL(gpu_msaa_fill_at_1x, true, "GPU",
                     "Run Direct3D's 4x MSAA fills (clears drawn with its embedded shaders) at the sample count "
                     "of the render target that owns their EDRAM (1x or 2x, the size scaled to match), so that "
                     "render target keeps it and nothing is copied to a 4x render target and back");
