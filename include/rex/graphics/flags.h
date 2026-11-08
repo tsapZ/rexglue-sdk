@@ -50,6 +50,7 @@ REXCVAR_DECLARE(bool, direct_host_resolve);
 REXCVAR_DECLARE(bool, gpu_transfer_report);
 REXCVAR_DECLARE(bool, gpu_native_surfaces);
 REXCVAR_DECLARE(bool, gpu_native_resolves);
+REXCVAR_DECLARE(bool, gpu_texture_load_report);
 
 // GPU Textures
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);

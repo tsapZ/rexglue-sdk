@@ -638,6 +638,12 @@ class TextureCache {
   uint64_t current_submission_index_ = 0;
   uint64_t current_submission_time_ = 0;
 
+  // gpu_texture_load_report: base levels loaded from guest memory since the last report, of resolved
+  // textures (TextureKey::scaled_resolve) and of the rest.
+  std::atomic<uint64_t> load_report_resolved_{0};
+  std::atomic<uint64_t> load_report_other_{0};
+  uint64_t load_report_last_ms_ = 0;
+
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
   // The textures in textures_ by TextureKey::base_page.
   std::unordered_multimap<uint32_t, Texture*> textures_by_base_page_;

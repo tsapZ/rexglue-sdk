@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <utility>
 
@@ -44,6 +45,10 @@ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_hard, 768, "GPU",
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft_lifetime, 30, "GPU",
                      "Soft texture cache memory limit lifetime (seconds)")
     .range(1, 3600);
+
+REXCVAR_DEFINE_BOOL(gpu_texture_load_report, false, "GPU",
+                    "Debug: log the texture loads from memory every five seconds (TEXLOADS), "
+                    "resolved textures and the rest");
 
 REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
@@ -333,6 +338,18 @@ void TextureCache::BeginSubmission(uint64_t new_submission_index) {
 }
 
 void TextureCache::BeginFrame() {
+  if (REXCVAR_GET(gpu_texture_load_report)) {
+    const uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    if (!load_report_last_ms_) {
+      load_report_last_ms_ = now_ms;
+    } else if (now_ms - load_report_last_ms_ >= 5000) {
+      REXGPU_INFO("TEXLOADS resolved {} other {} in {} ms", load_report_resolved_.exchange(0),
+                  load_report_other_.exchange(0), now_ms - load_report_last_ms_);
+      load_report_last_ms_ = now_ms;
+    }
+  }
   // In case there was a failure to create something in the previous frame, make
   // sure bindings are reset so a new attempt will surely be made if the texture
   // is requested again.
@@ -472,6 +489,10 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 
   Texture& texture = *pending_load.texture;
   TextureKey texture_key = texture.key();
+  if (pending_load.load_base) {
+    (texture_key.scaled_resolve ? load_report_resolved_ : load_report_other_)
+        .fetch_add(1, std::memory_order_relaxed);
+  }
   if (texture_key.scaled_resolve) {
     // Make sure all the scaled resolve memory is resident and accessible from
     // the shader, including any possible padding that hasn't yet been touched
