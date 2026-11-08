@@ -68,6 +68,7 @@ namespace rex::graphics::d3d12 {
 // Generated with `xb buildshaders`.
 namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/native_resolve_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/native_resolve_ms_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_16bpb_cs.h"
@@ -668,9 +669,13 @@ bool D3D12TextureCache::Initialize() {
       *(native_resolve_pipeline_.ReleaseAndGetAddressOf()) = ui::d3d12::util::CreateComputePipeline(
           device, shaders::native_resolve_cs, sizeof(shaders::native_resolve_cs),
           native_resolve_root_signature_.Get());
+      *(native_resolve_ms_pipeline_.ReleaseAndGetAddressOf()) = ui::d3d12::util::CreateComputePipeline(
+          device, shaders::native_resolve_ms_cs, sizeof(shaders::native_resolve_ms_cs),
+          native_resolve_root_signature_.Get());
     }
     if (!native_resolve_root_signature_ || !native_resolve_pipeline_) {
       native_resolve_pipeline_.Reset();
+      native_resolve_ms_pipeline_.Reset();
       native_resolve_root_signature_.Reset();
       REXGPU_WARN("D3D12TextureCache: Failed to create the native resolve pipeline");
     }
@@ -1496,7 +1501,9 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
     ID3D12Resource* texture_resource = d3d12_texture.resource();
 
     if (write.mode != NativeResolveMode::kCopy) {
-      if (!native_resolve_pipeline_) {
+      ID3D12PipelineState* pipeline =
+          write.source_samples ? native_resolve_ms_pipeline_.Get() : native_resolve_pipeline_.Get();
+      if (!pipeline) {
         ++counts.no_pipeline;
         return;
       }
@@ -1519,12 +1526,17 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
       } else {
         D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
         srv_desc.Format = write.source_srv_format;
-        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv_desc.Texture2D.MostDetailedMip = 0;
-        srv_desc.Texture2D.MipLevels = 1;
-        srv_desc.Texture2D.PlaneSlice = 0;
-        srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+        if (write.source_samples) {
+          srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+          srv_desc.Texture2DMS.UnusedField_NothingToDefine = 0;
+        } else {
+          srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+          srv_desc.Texture2D.MostDetailedMip = 0;
+          srv_desc.Texture2D.MipLevels = 1;
+          srv_desc.Texture2D.PlaneSlice = 0;
+          srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+        }
         device->CreateShaderResourceView(write.source, &srv_desc, descriptors[0].first);
       }
       D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc;
@@ -1547,7 +1559,7 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
       command_processor_.SubmitBarriers();
 
       DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
-      command_processor_.SetExternalPipeline(native_resolve_pipeline_.Get());
+      command_processor_.SetExternalPipeline(pipeline);
       command_list.D3DSetComputeRootSignature(native_resolve_root_signature_.Get());
       command_list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
       command_list.D3DSetComputeRootDescriptorTable(2, descriptors[1].second);
@@ -1562,6 +1574,7 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
       constants.size[1] = height * scale_y;
       constants.fill[0] = write.fill_x;
       constants.fill[1] = write.fill_y;
+      constants.samples = write.source_samples;
       command_list.D3DSetComputeRoot32BitConstants(0, sizeof(constants) / sizeof(uint32_t),
                                                    &constants, 0);
       command_list.D3DDispatch((constants.size[0] + 7) >> 3, (constants.size[1] + 7) >> 3, 1);
@@ -1577,8 +1590,8 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
       return;
     }
 
-    // The half-pixel offset gap fill needs a shader mode.
-    assert_true(!write.fill_x && !write.fill_y);
+    // The half-pixel offset gap fill and a multisampled source need a shader mode.
+    assert_true(!write.fill_x && !write.fill_y && !write.source_samples);
 
     // Referenced by the command list now.
     texture.MarkAsUsed();
