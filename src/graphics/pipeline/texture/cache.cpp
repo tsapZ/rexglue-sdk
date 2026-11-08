@@ -310,6 +310,13 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     assert_true(found_texture_it != textures_.end());
     if (found_texture_it != textures_.end()) {
       assert_true(found_texture_it->second.get() == texture);
+      auto by_base_page_range = textures_by_base_page_.equal_range(texture->key().base_page);
+      for (auto it = by_base_page_range.first; it != by_base_page_range.second; ++it) {
+        if (it->second == texture) {
+          textures_by_base_page_.erase(it);
+          break;
+        }
+      }
       textures_.erase(found_texture_it);
       // `texture` is invalid now.
     }
@@ -366,6 +373,32 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
   // Invalidate textures. Toggling individual textures between scaled and
   // unscaled also relies on invalidation through shared memory.
   shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
+}
+
+void TextureCache::CaptureUpToDateBeforeResolve(uint32_t start, uint32_t length) {
+  if (length == 0) {
+    return;
+  }
+  start &= 0x1FFFFFFF;
+  length = std::min(length, 0x20000000 - start);
+  uint32_t page_first = start >> 12;
+  uint32_t page_last = (start + length - 1) >> 12;
+  auto global_lock = global_critical_region_.Acquire();
+  if (textures_by_base_page_.size() < size_t(page_last - page_first + 1)) {
+    // Fewer textures than pages - cheaper to check every texture.
+    for (auto& pair : textures_by_base_page_) {
+      if (pair.first >= page_first && pair.first <= page_last) {
+        pair.second->CaptureBaseUpToDateBeforeResolve(global_lock);
+      }
+    }
+    return;
+  }
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    auto range = textures_by_base_page_.equal_range(page);
+    for (auto it = range.first; it != range.second; ++it) {
+      it->second->CaptureBaseUpToDateBeforeResolve(global_lock);
+    }
+  }
 }
 
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle) {
@@ -796,6 +829,18 @@ void TextureCache::Texture::WatchCallback(
   }
 }
 
+void TextureCache::ForEachTextureAtBasePage(uint32_t base_page,
+                                            const std::function<void(Texture&)>& visit) {
+  auto range = textures_by_base_page_.equal_range(base_page);
+  for (auto it = range.first; it != range.second; ++it) {
+    visit(*it->second);
+  }
+}
+
+void TextureCache::MakeTextureUpToDateAndWatch(Texture& texture) {
+  texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+}
+
 void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu) {
@@ -806,6 +851,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
+  textures_by_base_page_.clear();
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
 }
@@ -957,6 +1003,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     }
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
+    textures_by_base_page_.emplace(uint32_t(key.base_page), texture);
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");

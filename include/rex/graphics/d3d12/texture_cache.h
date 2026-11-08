@@ -160,6 +160,68 @@ class D3D12TextureCache final : public TextureCache {
     GetCurrentScaledResolveBuffer().SetUAVBarrierPending();
   }
 
+  // gpu_native_resolves: how the source is written into the textures.
+  enum class NativeResolveMode : uint32_t {
+    // The values of the native_resolve.cs.hlsl modes.
+    // out = in * scale.
+    kScale,
+    // out = in.bgra.
+    kSwapRedBlue,
+    // out.r = depth.
+    kDepthToRed,
+    // CopyTextureRegion.
+    kCopy,
+  };
+  // gpu_native_resolves: a resolve rectangle to copy from a host render target straight into the
+  // textures viewing the resolve destination. Coordinates and sizes are in guest pixels, unscaled.
+  struct NativeResolveWrite {
+    // Physical 4 KB page of the texture base the destination coordinates are relative to.
+    uint32_t base_page;
+    xenos::TextureFormat format;
+    // In TextureKey::pitch units (32 texels).
+    uint32_t pitch;
+    xenos::Endian endianness;
+    // Subresource 0 is read. With kCopy, the format must be in the same typeless family as the
+    // textures'.
+    ID3D12Resource* source;
+    uint32_t source_x;
+    uint32_t source_y;
+    uint32_t dest_x;
+    uint32_t dest_y;
+    uint32_t width;
+    uint32_t height;
+    NativeResolveMode mode = NativeResolveMode::kCopy;
+    // kScale multiplier.
+    float scale = 1.0f;
+    // Shader modes: the non-shader-visible SRV of the source to copy if source_srv_format is
+    // DXGI_FORMAT_UNKNOWN, otherwise a 2D source SRV with source_srv_format is created.
+    D3D12_CPU_DESCRIPTOR_HANDLE source_srv = {};
+    DXGI_FORMAT source_srv_format = DXGI_FORMAT_UNKNOWN;
+    // Shader modes: the format of the UAV of the textures.
+    DXGI_FORMAT dest_uav_format = DXGI_FORMAT_UNKNOWN;
+  };
+  struct NativeResolveWriteCounts {
+    uint32_t written = 0;
+    uint32_t incompatible = 0;
+    uint32_t not_up_to_date = 0;
+    uint32_t replacement = 0;
+    uint32_t outside = 0;
+    // Shader modes: the texture was created without D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.
+    uint32_t no_uav = 0;
+    // Shader modes: native_resolve_cs pipeline not created.
+    uint32_t no_pipeline = 0;
+    // Shader modes: failed to get the one-use descriptors.
+    uint32_t descriptors = 0;
+  };
+  // Writes the rectangle into every texture at write.base_page that is a single-level unsigned 2D
+  // tiled texture with the format, pitch and endianness of the resolve, matching resolution
+  // scaling, and up to date before the resolve (CaptureUpToDateBeforeResolve), then marks those
+  // up to date. source_state is the current state of the source, updated if it's transitioned.
+  // kCopy uses CopyTextureRegion, the other modes native_resolve_cs.
+  void WriteNativeResolveToTextures(const NativeResolveWrite& write,
+                                    D3D12_RESOURCE_STATES& source_state,
+                                    NativeResolveWriteCounts& counts);
+
   // Returns the ID3D12Resource of the front buffer texture (in
   // NON_PIXEL_SHADER_RESOURCE state), or nullptr in case of failure, and writes
   // the description of its SRV. May call LoadTextureData, so the same
@@ -519,6 +581,18 @@ class D3D12TextureCache final : public TextureCache {
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_;
   // Load pipelines for resolution-scaled resolve targets.
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_scaled_;
+
+  // gpu_native_resolves: native_resolve_cs, created only with the cvar enabled.
+  // Root parameter 0 - NativeResolveConstants, 1 - source SRV table, 2 - destination UAV table.
+  struct NativeResolveConstants {
+    uint32_t mode;
+    float scale;
+    int32_t source_offset[2];
+    int32_t dest_offset[2];
+    uint32_t size[2];
+  };
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> native_resolve_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> native_resolve_pipeline_;
 
   std::vector<SRVDescriptorCachePage> srv_descriptor_cache_;
   uint32_t srv_descriptor_cache_allocated_;
