@@ -1467,7 +1467,14 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
       }
       return;
     }
-    if (!texture.base_up_to_date_before_resolve()) {
+    uint32_t texture_width = key.GetWidth();
+    uint32_t texture_height = key.GetHeight();
+    // A texture the resolve covers completely gets all its texels from it: what it held before
+    // doesn't matter, so it may be written even if it wasn't up to date (memory resolved into with
+    // two formats in a frame outdates each format's texture every time).
+    const bool covered = !write.dest_x && !write.dest_y && write.width >= texture_width &&
+                         write.height >= texture_height;
+    if (!texture.base_up_to_date_before_resolve() && !covered) {
       ++counts.not_up_to_date;
       return;
     }
@@ -1477,11 +1484,12 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
       ++counts.replacement;
       return;
     }
-    uint32_t texture_width = key.GetWidth();
-    uint32_t texture_height = key.GetHeight();
     if (write.dest_x >= texture_width || write.dest_y >= texture_height) {
       ++counts.outside;
       return;
+    }
+    if (!texture.base_up_to_date_before_resolve()) {
+      ++counts.covered;
     }
     uint32_t width = std::min(write.width, texture_width - write.dest_x);
     uint32_t height = std::min(write.height, texture_height - write.dest_y);

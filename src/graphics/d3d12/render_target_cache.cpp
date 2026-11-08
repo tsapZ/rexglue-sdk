@@ -6550,6 +6550,7 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
   render_target.SetResourceState(rt_state_before);
 
   native_resolve_written_ += counts.written;
+  native_resolve_covered_ += counts.covered;
   native_resolve_written_pairs_[size_t(pair)] += counts.written;
   CountNativeResolveFallback(NativeResolveFallback::kTextureIncompatible, counts.incompatible);
   CountNativeResolveFallback(NativeResolveFallback::kTextureNotUpToDate, counts.not_up_to_date);
@@ -6585,10 +6586,11 @@ void D3D12RenderTargetCache::ReportNativeResolves() {
     }
   }
   if (native_resolve_written_ || fallback_total) {
-    REXGPU_INFO("NATIVERESOLVE written {}{} fallback {}{}", native_resolve_written_,
-                written_pairs, fallback_total, fallbacks);
+    REXGPU_INFO("NATIVERESOLVE written {}{} covered={} fallback {}{}", native_resolve_written_,
+                written_pairs, native_resolve_covered_, fallback_total, fallbacks);
   }
   native_resolve_written_ = 0;
+  native_resolve_covered_ = 0;
   native_resolve_written_pairs_.fill(0);
   native_resolve_fallbacks_.fill(0);
 }
