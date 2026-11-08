@@ -184,6 +184,9 @@ class D3D12TextureCache final : public TextureCache {
     uint32_t width;
     uint32_t height;
     NativeResolveMode mode = NativeResolveMode::kCopy;
+    // A multisampled source (shader modes only, native_resolve_ms_cs): bits 0-1 the number of host
+    // samples read per pixel (1, or 2 averaged), bits 4-5 and 6-7 their indices. 0: single-sampled.
+    uint32_t source_samples = 0;
     // kScale multiplier.
     float scale = 1.0f;
     // Shader modes: resolution-scaled host pixel columns / rows at the left / top of the rectangle
@@ -557,9 +560,12 @@ class D3D12TextureCache final : public TextureCache {
     int32_t dest_offset[2];
     uint32_t size[2];
     uint32_t fill[2];
+    uint32_t samples;  // NativeResolveWrite::source_samples
   };
   Microsoft::WRL::ComPtr<ID3D12RootSignature> native_resolve_root_signature_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> native_resolve_pipeline_;
+  // The same with a multisampled source (native_resolve_ms.cs.hlsl), same root signature.
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> native_resolve_ms_pipeline_;
 
   std::vector<SRVDescriptorCachePage> srv_descriptor_cache_;
   uint32_t srv_descriptor_cache_allocated_;

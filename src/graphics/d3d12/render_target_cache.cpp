@@ -6307,8 +6307,10 @@ bool D3D12RenderTargetCache::IsNativeResolveEligible(const draw_util::ResolveInf
   const auto source_color_format = xenos::GetStorageColorFormat(
       xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format));
   NativeResolveFallback reason;
-  if ((is_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info).msaa_samples !=
-      xenos::MsaaSamples::k1X) {
+  // Multisampled: 2x color only (native_resolve_ms_cs).
+  const xenos::MsaaSamples msaa =
+      (is_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info).msaa_samples;
+  if (msaa != xenos::MsaaSamples::k1X && (is_depth || msaa != xenos::MsaaSamples::k2X)) {
     reason = NativeResolveFallback::kMsaa;
   } else if (!is_depth && resolve_info.copy_dest_info.copy_dest_exp_bias != 0 &&
              source_color_format != xenos::ColorRenderTargetFormat::k_16_16_FLOAT &&
@@ -6426,6 +6428,42 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
     }
     // A negative bias is applied the same way.
     write.scale = std::ldexp(1.0f, exp_bias);
+    // A 2x MSAA source: one sample (k0 / k1) or the mean of both (k01, and k0123 on 2x), as the guest's
+    // resolve shaders take them; it can't be copied, so native_resolve_ms_cs writes it (kScale, by 1
+    // for the pairs that would have been copied).
+    if (edram_info.msaa_samples == xenos::MsaaSamples::k2X) {
+      const xenos::CopySampleSelect select = resolve_info.copy_dest_coordinate_info.copy_sample_select;
+      const uint32_t host0 = draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_supported_);
+      const uint32_t host1 = draw_util::GetD3D10SampleIndexForGuest2xMSAA(1, msaa_2x_supported_);
+      if (select == xenos::CopySampleSelect::k0) {
+        write.source_samples = 1 | (host0 << 4);
+      } else if (select == xenos::CopySampleSelect::k1) {
+        write.source_samples = 1 | (host1 << 4);
+      } else if (select == xenos::CopySampleSelect::k01 || select == xenos::CopySampleSelect::k0123) {
+        write.source_samples = 2 | (host0 << 4) | (host1 << 6);
+      } else {
+        fallback(NativeResolveFallback::kMsaa);
+        return;
+      }
+      if (write.mode == D3D12TextureCache::NativeResolveMode::kCopy) {
+        write.mode = D3D12TextureCache::NativeResolveMode::kScale;
+        switch (pair) {
+          case NativeResolvePair::k16161616Float:
+            write.source_srv_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            break;
+          case NativeResolvePair::k1616Float:
+            write.source_srv_format = DXGI_FORMAT_R16G16_FLOAT;
+            break;
+          case NativeResolvePair::k8888:
+            write.source_srv_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            break;
+          default:
+            fallback(NativeResolveFallback::kMsaa);
+            return;
+        }
+        write.dest_uav_format = write.source_srv_format;
+      }
+    }
   }
   // For depth, ResolveInfo has replaced the destination format with k_24_8 or k_24_8_FLOAT.
   if (uint32_t(resolve_info.copy_dest_info.copy_dest_format) != uint32_t(texture_format)) {
@@ -6495,7 +6533,7 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
     fallback(NativeResolveFallback::kSourceFormat);
     return;
   }
-  if (rt_key.msaa_samples != xenos::MsaaSamples::k1X) {
+  if (rt_key.msaa_samples != edram_info.msaa_samples) {
     fallback(NativeResolveFallback::kMsaa);
     return;
   }
@@ -6515,7 +6553,9 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
   const uint32_t height = resolve_info.height_div_8 << 3;
   write.source_x = (rt_offset_tiles % rt_pitch_tiles) * tile_width_pixels +
                    (resolve_info.coordinate_info.edram_offset_x_div_8 << 3);
-  write.source_y = (rt_offset_tiles / rt_pitch_tiles) * xenos::kEdramTileHeightSamples +
+  write.source_y = (rt_offset_tiles / rt_pitch_tiles) *
+                       (xenos::kEdramTileHeightSamples >>
+                        uint32_t(rt_key.msaa_samples >= xenos::MsaaSamples::k2X)) +
                    (resolve_info.coordinate_info.edram_offset_y_div_8 << 3);
   if (!width || !height || write.source_x + width > rt_key.GetWidth() ||
       write.source_y + height >
