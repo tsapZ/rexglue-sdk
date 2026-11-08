@@ -50,6 +50,12 @@ REXCVAR_DEFINE_BOOL(gpu_native_surfaces, false, "GPU",
                     "needs, and log the counts every few seconds")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_STRING(gpu_native_surfaces_keep, "", "GPU",
+                      "With gpu_native_surfaces: the transfer kinds this game still needs, as the "
+                      "report names them (\"C2x1->D0x1\" for one pair, \"C2x1\" for all from or to it), "
+                      "comma-separated")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(render_target_update_skip, true, "GPU",
                     "Skip the render target lookups and EDRAM ownership walks of a draw whose "
                     "render targets and ranges are already owned since the last draw")
@@ -1560,10 +1566,12 @@ void RenderTargetCache::NoteNativeSurfaceTransfers(std::vector<Transfer>& transf
   };
   const native_surfaces::SurfaceKind dest_kind = kind_of(dest_key);
   const bool drop = REXCVAR_GET(gpu_native_surfaces);
+  const std::string& keep = REXCVAR_GET(gpu_native_surfaces_keep);
   auto dropped_begin = std::remove_if(transfers.begin(), transfers.end(), [&](const Transfer& transfer) {
     const native_surfaces::SurfaceKind source_kind = kind_of(transfer.source->key());
     const uint32_t tiles = transfer.end_tiles - transfer.start_tiles;
-    if (!drop || native_surfaces::KeepTransfer(source_kind, dest_kind)) {
+    if (!drop || native_surfaces::KeepTransfer(source_kind, dest_kind) ||
+        native_surfaces::KeepByList(source_kind, dest_kind, keep)) {
       native_surface_kept_.Record(source_kind, dest_kind, tiles);
       return false;
     }

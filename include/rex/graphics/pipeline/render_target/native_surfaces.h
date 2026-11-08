@@ -33,6 +33,35 @@ inline bool KeepTransfer(const SurfaceKind& source, const SurfaceKind& dest) {
   return source.is_depth || source.format == kColorFormat16_16;
 }
 
+// A kind as the report names it: "C2x1" is colour format 2 at 1x, "D0x4" depth format 0 at 4x.
+inline std::string KindName(const SurfaceKind& kind) {
+  return std::string(kind.is_depth ? "D" : "C") + std::to_string(kind.format) + "x" +
+         std::to_string(1u << kind.msaa_samples_log2);
+}
+
+// A game's own keep list on top of KeepTransfer (gpu_native_surfaces_keep), in the report's names,
+// separated by commas: "C2x1->D0x1" keeps that one pair, "C2x1" every transfer from or to it.
+inline bool KeepByList(const SurfaceKind& source, const SurfaceKind& dest, const std::string& list) {
+  if (list.empty()) {
+    return false;
+  }
+  const std::string from = KindName(source), to = KindName(dest);
+  const std::string pair = from + "->" + to;
+  size_t start = 0;
+  while (start <= list.size()) {
+    size_t end = list.find(',', start);
+    if (end == std::string::npos) end = list.size();
+    std::string item = list.substr(start, end - start);
+    item.erase(0, item.find_first_not_of(' '));
+    item.erase(item.find_last_not_of(' ') + 1);
+    if (item == pair || (item.find("->") == std::string::npos && (item == from || item == to))) {
+      return true;
+    }
+    start = end + 1;
+  }
+  return false;
+}
+
 class TransferCounters {
  public:
   void Record(const SurfaceKind& source, const SurfaceKind& dest, uint32_t tiles) {
