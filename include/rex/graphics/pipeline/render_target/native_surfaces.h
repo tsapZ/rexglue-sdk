@@ -57,6 +57,12 @@ inline bool KeepByList(const SurfaceKind& source, const SurfaceKind& dest, const
     if (item == pair || (item.find("->") == std::string::npos && (item == from || item == to))) {
       return true;
     }
+    // "D<->C": every transfer between a depth and a colour target. Giants, SuperChargers,
+    // Imaginators and Spyro's Adventure need theirs (2026-11-08: dark floors, white or blown-out
+    // pictures, wrong lighting without them).
+    if (item == "D<->C" && source.is_depth != dest.is_depth) {
+      return true;
+    }
     start = end + 1;
   }
   return false;
