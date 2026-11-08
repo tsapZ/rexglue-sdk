@@ -50,9 +50,10 @@ REXCVAR_DEFINE_BOOL(gpu_native_surfaces, false, "GPU",
                     "needs, and log the counts every few seconds")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_BOOL(gpu_native_resolves, false, "GPU",
+REXCVAR_DEFINE_BOOL(gpu_native_resolves, true, "GPU",
                     "A resolve also copies its result from the host render target straight into "
-                    "the textures that view the destination, so they skip the reload from memory")
+                    "the textures that view the destination, so they skip the reload from memory "
+                    "(false: they reload, as before)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_STRING(gpu_native_surfaces_keep, "", "GPU",
