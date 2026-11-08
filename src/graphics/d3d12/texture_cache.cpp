@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -1433,6 +1434,31 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
         key.endianness != write.endianness || bool(key.scaled_resolve) != scaled ||
         texture.GetGuestMipsSize() != 0) {
       ++counts.incompatible;
+      if (REXCVAR_GET(gpu_texture_load_report)) {
+        // Each kind once (a debug report): what the texture is against what the resolve wrote.
+        static std::set<uint64_t> logged;
+        const uint64_t kind = uint64_t(key.format) | (uint64_t(write.format) << 6) |
+                              (uint64_t(key.pitch) << 12) | (uint64_t(write.pitch) << 21) |
+                              (uint64_t(key.mip_max_level) << 30) | (uint64_t(key.dimension) << 34) |
+                              (uint64_t(key.tiled) << 36) | (uint64_t(key.packed_mips) << 37) |
+                              (uint64_t(key.endianness) << 38) | (uint64_t(write.endianness) << 40) |
+                              (uint64_t(key.scaled_resolve) << 42) |
+                              (uint64_t(key.depth_or_array_size_minus_1 != 0) << 43) |
+                              (uint64_t(key.signed_separate) << 44) |
+                              (uint64_t(texture.GetGuestMipsSize() != 0) << 45);
+        if (logged.size() < 64 && logged.insert(kind).second) {
+          REXGPU_INFO(
+              "NATIVERESOLVE incompatible: texture format {} {}x{} pitch {} mips {} dim {} tiled {} "
+              "packed {} endian {} scaled {} array {} signed {} guest mips {}; resolve format {} pitch {} "
+              "endian {} {}x{}",
+              uint32_t(key.format), key.GetWidth(), key.GetHeight(), uint32_t(key.pitch),
+              uint32_t(key.mip_max_level), uint32_t(key.dimension), uint32_t(key.tiled),
+              uint32_t(key.packed_mips), uint32_t(key.endianness), uint32_t(key.scaled_resolve),
+              key.depth_or_array_size_minus_1, uint32_t(key.signed_separate),
+              texture.GetGuestMipsSize(), uint32_t(write.format), write.pitch,
+              uint32_t(write.endianness), write.width, write.height);
+        }
+      }
       return;
     }
     if (!texture.base_up_to_date_before_resolve()) {

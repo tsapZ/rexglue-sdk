@@ -6483,8 +6483,9 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
     fallback(NativeResolveFallback::kNoSource);
     return;
   }
+  // The last row ends at the pitch at most (as GetDirectResolveSource checks it).
   if (rectangle.row_first != 0 || rectangle.rows != dump_rows || rectangle.row_first_start != 0 ||
-      rectangle.row_last_end != dump_row_length_used) {
+      rectangle.row_last_end != std::min(dump_row_length_used, dump_pitch)) {
     fallback(NativeResolveFallback::kPartialSource);
     return;
   }
