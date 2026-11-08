@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -667,6 +668,63 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
                          uint32_t dump_pitch);
 
+  // gpu_native_resolves: why a resolve or a texture was not written natively.
+  enum class NativeResolveFallback : uint32_t {
+    kDepth,
+    kMsaa,
+    kExpBias,
+    kSwap,
+    kNoSource,
+    kMultipleSources,
+    kPartialSource,
+    kSourceFormat,
+    kDestFormat,
+    kDestArray,
+    kDestBaseAdjusted,
+    kEndian,
+    kHalfPixelFill,
+    kSourcePlacement,
+    kTextureIncompatible,
+    kTextureNotUpToDate,
+    kTextureReplacement,
+    kTextureOutside,
+    kTextureNoUAV,
+    kNoPipeline,
+    kDescriptors,
+    kCount,
+  };
+  static const char* const kNativeResolveFallbackNames[size_t(NativeResolveFallback::kCount)];
+  // gpu_native_resolves: the source render target and destination texture formats written.
+  enum class NativeResolvePair : uint32_t {
+    // Color k_16_16_16_16_FLOAT to k_16_16_16_16_FLOAT, copied or scaled by the exponent bias.
+    k16161616Float,
+    // Color k_16_16_FLOAT to k_16_16_FLOAT, copied.
+    k1616Float,
+    // Color k_2_10_10_10_FLOAT to k_16_16_16_16_FLOAT, scaled by the exponent bias.
+    k2101010FloatTo16161616Float,
+    // Color k_8_8_8_8 to k_8_8_8_8, copied or with red and blue swapped.
+    k8888,
+    // Depth kD24S8 to k_24_8.
+    kD24S8,
+    // Depth kD24FS8 to k_24_8_FLOAT.
+    kD24FS8,
+    kCount,
+  };
+  static const char* const kNativeResolvePairNames[size_t(NativeResolvePair::kCount)];
+  // Whether a host render target resolve copy may be written to the textures natively, counting
+  // the reason if not.
+  bool IsNativeResolveEligible(const draw_util::ResolveInfo& resolve_info);
+  // After DumpRenderTargets and MarkRangeAsResolved for the resolve, copies the resolved region
+  // from the source host render target into the texture cache textures viewing the destination
+  // that were up to date before the resolve, and marks them up to date.
+  void WriteResolveToTextures(const draw_util::ResolveInfo& resolve_info,
+                              D3D12TextureCache& texture_cache);
+  void CountNativeResolveFallback(NativeResolveFallback reason, uint64_t count = 1) {
+    native_resolve_fallbacks_[size_t(reason)] += count;
+  }
+  // Logs the native resolve counts every few seconds.
+  void ReportNativeResolves();
+
   bool use_stencil_reference_output_ = false;
 
   bool gamma_render_target_as_unorm16_ = false;
@@ -747,6 +805,13 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
+
+  // gpu_native_resolves: textures written and fallbacks since the last report.
+  uint64_t native_resolve_written_ = 0;
+  std::array<uint64_t, size_t(NativeResolvePair::kCount)> native_resolve_written_pairs_ = {};
+  std::array<uint64_t, size_t(NativeResolveFallback::kCount)> native_resolve_fallbacks_ = {};
+  std::chrono::steady_clock::time_point native_resolve_last_report_ =
+      std::chrono::steady_clock::now();
   // direct_host_resolve_verify (a debug setting): a direct resolve copied both ways, the destination read
   // back after each, compared once the submission is done (the scene doesn't matter then).
   struct DirectResolveVerify {

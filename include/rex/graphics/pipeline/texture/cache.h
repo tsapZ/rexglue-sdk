@@ -81,6 +81,9 @@ class TextureCache {
   virtual void BeginFrame();
 
   void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // gpu_native_resolves: for the textures with the base page in the range, records whether the
+  // base level is up to date, to be called right before MarkRangeAsResolved invalidates them.
+  void CaptureUpToDateBeforeResolve(uint32_t start, uint32_t length);
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(uint32_t /*start_unscaled*/,
@@ -232,6 +235,13 @@ class TextureCache {
     }
     void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
 
+    // gpu_native_resolves: whether the base level was up to date as of the last
+    // CaptureUpToDateBeforeResolve covering the base page.
+    bool base_up_to_date_before_resolve() const { return base_up_to_date_before_resolve_; }
+    void CaptureBaseUpToDateBeforeResolve(const std::unique_lock<std::recursive_mutex>& global_lock) {
+      base_up_to_date_before_resolve_ = !base_outdated(global_lock);
+    }
+
     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
 
     // For LRU caching - updates the last usage frame and moves the texture to
@@ -273,11 +283,20 @@ class TextureCache {
     bool base_outdated_ = false;
     // Whether the recent mip data needs reloading from the memory.
     bool mips_outdated_ = false;
+    bool base_up_to_date_before_resolve_ = false;
     std::atomic<uint32_t> outdated_mask_{0};
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
   };
+
+  // Visits the textures with the base level at the 4 KB physical page. The visitor must not create
+  // or destroy textures.
+  void ForEachTextureAtBasePage(uint32_t base_page, const std::function<void(Texture&)>& visit);
+
+  // gpu_native_resolves: for a texture whose base level the host has just written with the data
+  // the guest memory now contains, marks it up to date and watches its memory again.
+  void MakeTextureUpToDateAndWatch(Texture& texture);
 
   // Rules of data access in load shaders:
   // - Source reading (from the shared memory or the scaled resolve buffer):
@@ -610,6 +629,8 @@ class TextureCache {
   uint64_t current_submission_time_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
+  // The textures in textures_ by TextureKey::base_page.
+  std::unordered_multimap<uint32_t, Texture*> textures_by_base_page_;
 
   // FindOrCreateTexture at a resolution scale: the guest base and mips extents of a key, for
   // IsRangeScaledResolved. Computing the whole layout for every lookup was ~3 % of the command

@@ -50,6 +50,11 @@ REXCVAR_DEFINE_BOOL(gpu_native_surfaces, false, "GPU",
                     "needs, and log the counts every few seconds")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(gpu_native_resolves, false, "GPU",
+                    "A resolve also copies its result from the host render target straight into "
+                    "the textures that view the destination, so they skip the reload from memory")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_STRING(gpu_native_surfaces_keep, "", "GPU",
                       "With gpu_native_surfaces: the transfer kinds this game still needs, as the "
                       "report names them (\"C2x1->D0x1\" for one pair, \"C2x1\" for all from or to it), "
