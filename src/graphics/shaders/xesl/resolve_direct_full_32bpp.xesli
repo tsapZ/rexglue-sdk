@@ -1,0 +1,188 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+// Direct resolve (rex SDK): resolve_full_32bpp with the EDRAM buffer loads replaced by loads from
+// the host render target that owns the whole source span (8_8_8_8 and 2_10_10_10, UNORM SRV). Each
+// sample is packed the way the render target dump stores it in the EDRAM buffer, then unpacked,
+// averaged, biased, swapped and packed to the destination format exactly as resolve_full_32bpp
+// does, so the result is the same word for word. XE_RESOLVE_DIRECT_2XMSAA: the render target is
+// multisampled; sample select 0, 1 or 01 (both averaged). Other selects keep the dump.
+
+#include "endian.xesli"
+#include "pixel_formats.xesli"
+#define XE_RESOLVE_DIRECT
+#define XE_RESOLVE_SOURCE_TYPE uint4_xe
+#include "resolve.xesli"
+
+// The render target dump's packing (round to nearest, as MAd 0.5 + FToU there), as
+// resolve_direct_fast_32bpp_1x2xmsaa's.
+uint XeResolveDirectFullPack32bpp(float4_xe color, uint packing) {
+  uint packed;
+  dont_flatten_xe
+  if (packing == 1u) {
+    uint4_xe c = uint4_xe(color * float4_xe(1023.0f, 1023.0f, 1023.0f, 3.0f) +
+                          0.5f);
+    packed = c.x | (c.y << 10u) | (c.z << 20u) | (c.w << 30u);
+  } else {
+    uint4_xe c = uint4_xe(color * 255.0f + 0.5f);
+    packed = c.x | (c.y << 8u) | (c.z << 16u) | (c.w << 24u);
+  }
+  return packed;
+}
+
+array_buffer_wo_declare_xe(uint4_xe, xe_resolve_dest, set=1, binding=0, u0,
+                           space0)
+#define LOCAL_SIZE_X_XE 8
+#define LOCAL_SIZE_Y_XE 8
+#define LOCAL_SIZE_Z_XE 1
+entry_bindings_begin_compute_xe
+  XE_RESOLVE_PUSH_CONST_BINDING
+  entry_binding_next_xe
+  array_buffer_wo_binding_xe(uint4_xe, xe_resolve_dest, buffer(1))
+  entry_binding_next_xe
+  #ifdef XE_RESOLVE_DIRECT_2XMSAA
+    texture_xe(texture_2d_ms_xe, xe_resolve_direct_source, set=0, binding=0,
+               t0, space0, texture(0))
+  #else
+    texture_xe(texture_2d_xe, xe_resolve_direct_source, set=0, binding=0, t0,
+               space0, texture(0))
+  #endif
+entry_bindings_end_inputs_begin_compute_xe
+  entry_in_global_thread_id_xe
+entry_inputs_end_code_begin_compute_xe
+{
+  // 1 thread = 4 host pixels, as resolve_full_32bpp.
+  XeResolveInfo resolve_info = XeResolveGetInfo(pass_push_consts_xe);
+  uint2_xe pixel_index = in_global_thread_id_xe.xy << uint2_xe(2u, 0u);
+  // Group height can't cross resolve granularity, Y overflow check not needed.
+  dont_flatten_xe
+  if (pixel_index.x >= resolve_info.width_div_8_scaled << 3u) {
+    return;
+  }
+  // The first pixel's first sample in the EDRAM, as
+  // XeResolveColorCopySourcePixelAddressIntsYHalfPixelOffsetFilling finds it (fewer than 4 samples:
+  // X isn't doubled, the second sample of 2x is the next row).
+  uint2_xe edram_pixel =
+      uint2_xe(pixel_index.x,
+               max(pixel_index.y, resolve_info.half_pixel_offset_fill_source.y)) +
+      resolve_info.edram_offset_scaled;
+  uint2_xe sample_xy =
+      edram_pixel <<
+      uint2_xe(0u, uint(resolve_info.edram_msaa_samples >= kXenosMsaaSamples_2X));
+  sample_xy += (uint_x2_xe(XeResolveFirstSampleIndex(resolve_info.sample_select)) >>
+                uint2_xe(1u, 0u)) & 1u;
+  uint2_xe tile_size = uint2_xe(80u, 16u) * resolve_info.resolution_scale;
+  uint2_xe tile_xy = sample_xy / tile_size;
+  uint tile = resolve_info.edram_base_tiles +
+              tile_xy.y * resolve_info.edram_pitch_tiles + tile_xy.x;
+  sample_xy -= tile_xy * tile_size;
+  uint rt_tiles = push_const_xe(xe_resolve_direct_rt_tiles);
+  uint rt_flags = push_const_xe(xe_resolve_direct_rt_flags);
+  uint rt_pitch_tiles = max(rt_tiles >> 16u, 1u);
+  uint rt_tile = (tile + uint(XE_EDRAM_TILE_COUNT) - (rt_tiles & 0xFFFFu)) %
+                 uint(XE_EDRAM_TILE_COUNT);
+  sample_xy += uint2_xe(rt_tile % rt_pitch_tiles, rt_tile / rt_pitch_tiles) *
+               tile_size;
+  uint packing = rt_flags & 0xFu;
+  bool average = resolve_info.sample_select >= kXenosCopySampleSelect_01;
+  uint4_xe packed_first;
+  uint4_xe packed_second = uint4_xe(0u, 0u, 0u, 0u);
+  #ifdef XE_RESOLVE_DIRECT_2XMSAA
+    // The guest's sample 0 is the even row, 1 the odd one; with averaging the second is the
+    // other sample of the same pixel.
+    uint host_first = (sample_xy.y & 1u) != 0u ? ((rt_flags >> 6u) & 3u)
+                                               : ((rt_flags >> 4u) & 3u);
+    uint host_second = (sample_xy.y & 1u) != 0u ? ((rt_flags >> 4u) & 3u)
+                                                : ((rt_flags >> 6u) & 3u);
+    int2_xe rt_pixel = int2_xe(int(sample_xy.x), int(sample_xy.y >> 1u));
+    packed_first.x = XeResolveDirectFullPack32bpp(
+        texel_fetch_2d_ms_xe(xe_resolve_direct_source, rt_pixel, host_first), packing);
+    packed_first.y = XeResolveDirectFullPack32bpp(
+        texel_fetch_2d_ms_xe(xe_resolve_direct_source, rt_pixel + int2_xe(1, 0), host_first),
+        packing);
+    packed_first.z = XeResolveDirectFullPack32bpp(
+        texel_fetch_2d_ms_xe(xe_resolve_direct_source, rt_pixel + int2_xe(2, 0), host_first),
+        packing);
+    packed_first.w = XeResolveDirectFullPack32bpp(
+        texel_fetch_2d_ms_xe(xe_resolve_direct_source, rt_pixel + int2_xe(3, 0), host_first),
+        packing);
+    dont_flatten_xe
+    if (average) {
+      packed_second.x = XeResolveDirectFullPack32bpp(
+          texel_fetch_2d_ms_xe(xe_resolve_direct_source, rt_pixel, host_second), packing);
+      packed_second.y = XeResolveDirectFullPack32bpp(
+          texel_fetch_2d_ms_xe(xe_resolve_direct_source, rt_pixel + int2_xe(1, 0), host_second),
+          packing);
+      packed_second.z = XeResolveDirectFullPack32bpp(
+          texel_fetch_2d_ms_xe(xe_resolve_direct_source, rt_pixel + int2_xe(2, 0), host_second),
+          packing);
+      packed_second.w = XeResolveDirectFullPack32bpp(
+          texel_fetch_2d_ms_xe(xe_resolve_direct_source, rt_pixel + int2_xe(3, 0), host_second),
+          packing);
+    }
+  #else
+    // 1x: one sample (the C++ side keeps averaging selects on the dump).
+    int2_xe rt_pixel = int2_xe(sample_xy);
+    packed_first.x = XeResolveDirectFullPack32bpp(
+        texel_fetch_2d_xe(xe_resolve_direct_source, rt_pixel, 0), packing);
+    packed_first.y = XeResolveDirectFullPack32bpp(
+        texel_fetch_2d_xe(xe_resolve_direct_source, rt_pixel + int2_xe(1, 0), 0), packing);
+    packed_first.z = XeResolveDirectFullPack32bpp(
+        texel_fetch_2d_xe(xe_resolve_direct_source, rt_pixel + int2_xe(2, 0), 0), packing);
+    packed_first.w = XeResolveDirectFullPack32bpp(
+        texel_fetch_2d_xe(xe_resolve_direct_source, rt_pixel + int2_xe(3, 0), 0), packing);
+  #endif
+  // From here as XeResolveLoad4RGBAColors and resolve_full_32bpp.
+  float4_xe pixel_0, pixel_1, pixel_2, pixel_3;
+  XeResolveUnpack32bpp4Samples(packed_first, resolve_info.edram_format, pixel_0, pixel_1,
+                               pixel_2, pixel_3);
+  float exp_bias = resolve_info.dest_exp_bias_factor;
+  dont_flatten_xe
+  if (average) {
+    // TODO(Triang3l): Gamma-correct resolve for 8_8_8_8_GAMMA.
+    exp_bias *= 0.5f;
+    float4_xe msaa_resolve_pixel_0, msaa_resolve_pixel_1, msaa_resolve_pixel_2,
+        msaa_resolve_pixel_3;
+    XeResolveUnpack32bpp4Samples(packed_second, resolve_info.edram_format, msaa_resolve_pixel_0,
+                                 msaa_resolve_pixel_1, msaa_resolve_pixel_2,
+                                 msaa_resolve_pixel_3);
+    pixel_0 += msaa_resolve_pixel_0;
+    pixel_1 += msaa_resolve_pixel_1;
+    pixel_2 += msaa_resolve_pixel_2;
+    pixel_3 += msaa_resolve_pixel_3;
+  }
+  pixel_0 *= exp_bias;
+  pixel_1 *= exp_bias;
+  pixel_2 *= exp_bias;
+  pixel_3 *= exp_bias;
+  dont_flatten_xe if (resolve_info.dest_swap) {
+    pixel_0 = pixel_0.bgra;
+    pixel_1 = pixel_1.bgra;
+    pixel_2 = pixel_2.bgra;
+    pixel_3 = pixel_3.bgra;
+  }
+  uint4_xe packed = XePack32bpp4Pixels(pixel_0, pixel_1, pixel_2, pixel_3,
+                                       resolve_info.dest_format);
+  dont_flatten_xe
+  if (pixel_index.x == 0u &&
+      resolve_info.half_pixel_offset_fill_source.x != 0u) {
+    if (resolve_info.half_pixel_offset_fill_source.x >= 2u) {
+      if (resolve_info.half_pixel_offset_fill_source.x >= 3u) {
+        packed.z = packed.w;
+      }
+      packed.y = packed.z;
+    }
+    packed.x = packed.y;
+  }
+  array_buffer_store_xe(
+      xe_resolve_dest,
+      XeResolveDestPixelAddress(resolve_info, pixel_index, 2u) >> 4u,
+      XeEndianSwap32(packed, resolve_info.dest_endian_128));
+}
+entry_code_end_compute_xe

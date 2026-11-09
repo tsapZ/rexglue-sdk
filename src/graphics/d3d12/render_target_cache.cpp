@@ -65,6 +65,10 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve_depth, true, "GPU",
 REXCVAR_DEFINE_BOOL(direct_host_resolve_uint, true, "GPU",
                     "With direct_host_resolve: resolves from 1x k_32_FLOAT, k_16_16 and k_16_16_FLOAT "
                     "render targets also copy straight from the render target (false: they dump first)");
+REXCVAR_DEFINE_BOOL(direct_host_resolve_full, true, "GPU",
+                    "With direct_host_resolve: colour resolves that convert the format, apply an "
+                    "exponent bias or average the two samples of 2x MSAA also copy straight from the "
+                    "render target (false: they dump first)");
 
 namespace rex::graphics::d3d12 {
 
@@ -100,6 +104,14 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_depth_4096_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_depth_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_depth_scaled_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_full_32bpp_1xmsaa_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_full_32bpp_1xmsaa_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_full_32bpp_1xmsaa_scaled_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_full_32bpp_1xmsaa_scaled_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_full_32bpp_2xmsaa_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_full_32bpp_2xmsaa_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_full_32bpp_2xmsaa_scaled_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_full_32bpp_2xmsaa_scaled_4096_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_4096_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_scaled_cs.h"
@@ -578,6 +590,44 @@ bool D3D12RenderTargetCache::Initialize() {
                            sizeof(shaders::resolve_direct_fast_32bpp_1xmsaa_uint_4096_cs)}
                     : Code{shaders::resolve_direct_fast_32bpp_1xmsaa_uint_cs,
                            sizeof(shaders::resolve_direct_fast_32bpp_1xmsaa_uint_cs)});
+    // The full-copy variants (format conversion, bias, 2x MSAA averaging), 1x and 2x MSAA.
+    Code full_codes[2];
+    if (draw_resolution_scaled) {
+      full_codes[0] = extended
+          ? Code{shaders::resolve_direct_full_32bpp_1xmsaa_scaled_4096_cs,
+                 sizeof(shaders::resolve_direct_full_32bpp_1xmsaa_scaled_4096_cs)}
+          : Code{shaders::resolve_direct_full_32bpp_1xmsaa_scaled_cs,
+                 sizeof(shaders::resolve_direct_full_32bpp_1xmsaa_scaled_cs)};
+      full_codes[1] = extended
+          ? Code{shaders::resolve_direct_full_32bpp_2xmsaa_scaled_4096_cs,
+                 sizeof(shaders::resolve_direct_full_32bpp_2xmsaa_scaled_4096_cs)}
+          : Code{shaders::resolve_direct_full_32bpp_2xmsaa_scaled_cs,
+                 sizeof(shaders::resolve_direct_full_32bpp_2xmsaa_scaled_cs)};
+    } else {
+      full_codes[0] = extended
+          ? Code{shaders::resolve_direct_full_32bpp_1xmsaa_4096_cs,
+                 sizeof(shaders::resolve_direct_full_32bpp_1xmsaa_4096_cs)}
+          : Code{shaders::resolve_direct_full_32bpp_1xmsaa_cs,
+                 sizeof(shaders::resolve_direct_full_32bpp_1xmsaa_cs)};
+      full_codes[1] = extended
+          ? Code{shaders::resolve_direct_full_32bpp_2xmsaa_4096_cs,
+                 sizeof(shaders::resolve_direct_full_32bpp_2xmsaa_4096_cs)}
+          : Code{shaders::resolve_direct_full_32bpp_2xmsaa_cs,
+                 sizeof(shaders::resolve_direct_full_32bpp_2xmsaa_cs)};
+    }
+    for (size_t i = 0; i < 2; ++i) {
+      direct_resolve_full_32bpp_pipelines_[i] = ui::d3d12::util::CreateComputePipeline(
+          device, full_codes[i].data, full_codes[i].size, direct_resolve_root_signature_color_);
+      if (direct_resolve_full_32bpp_pipelines_[i]) {
+        std::u16string pipeline_name = rex::string::to_utf16(
+            fmt::format("Resolve Direct Full 32bpp {}xMSAA", i + 1));
+        direct_resolve_full_32bpp_pipelines_[i]->SetName(
+            reinterpret_cast<LPCWSTR>(pipeline_name.c_str()));
+      } else {
+        REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the {}x MSAA full direct resolve pipeline",
+                     i + 1);
+      }
+    }
     direct_resolve_fast_32bpp_uint_pipeline_ = ui::d3d12::util::CreateComputePipeline(
         device, uint_code.data, uint_code.size, direct_resolve_root_signature_color_);
     if (direct_resolve_fast_32bpp_uint_pipeline_) {
@@ -1303,6 +1353,9 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   }
   ui::d3d12::util::ReleaseAndNull(direct_resolve_fast_32bpp_uint_pipeline_);
   ui::d3d12::util::ReleaseAndNull(direct_resolve_fast_32bpp_depth_pipeline_);
+  for (ID3D12PipelineState*& pipeline : direct_resolve_full_32bpp_pipelines_) {
+    ui::d3d12::util::ReleaseAndNull(pipeline);
+  }
   ui::d3d12::util::ReleaseAndNull(direct_resolve_root_signature_depth_);
   ui::d3d12::util::ReleaseAndNull(direct_resolve_root_signature_color_);
   ui::d3d12::util::ReleaseAndNull(dump_root_signature_depth_);
@@ -1634,7 +1687,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                 "{} span {}:{} rows {} row length {}, owner {}:{} msaa {} format {}, dest {:08X} | ",
                 direct_kind == DirectResolveSourceKind::kDepth
                     ? "depth"
-                    : (direct_kind == DirectResolveSourceKind::kColorUint ? "uint" : "color"),
+                    : (direct_kind == DirectResolveSourceKind::kColorUint
+                           ? "uint"
+                           : (direct_kind == DirectResolveSourceKind::kColorFull ? "full" : "color")),
                 base, pitch, rows, row_length, uint32_t(owner.base_tiles),
                 uint32_t(owner.pitch_tiles_at_32bpp), uint32_t(owner.msaa_samples),
                 uint32_t(owner.resource_format), resolve_info.copy_dest_base) +
@@ -1880,6 +1935,10 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                 break;
               case DirectResolveSourceKind::kDepth:
                 copy_pipeline = direct_resolve_fast_32bpp_depth_pipeline_;
+                break;
+              case DirectResolveSourceKind::kColorFull:
+                copy_pipeline = direct_resolve_full_32bpp_pipelines_[size_t(
+                    direct_rt->key().msaa_samples == xenos::MsaaSamples::k2X)];
                 break;
               default:
                 copy_pipeline = direct_resolve_fast_32bpp_pipelines_[size_t(
@@ -6216,12 +6275,20 @@ D3D12RenderTargetCache::D3D12RenderTarget* D3D12RenderTargetCache::GetDirectReso
     const draw_util::ResolveInfo& resolve_info, draw_util::ResolveCopyShaderIndex copy_shader,
     uint32_t& rt_tiles_out, uint32_t& rt_flags_out, DirectResolveSourceKind& kind_out) {
   ++direct_resolve_attempt_count_;
-  // The direct shaders are resolve_fast_32bpp_1x2xmsaa's (no sample averaging, 32bpp).
-  if (copy_shader != draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA ||
+  // The direct shaders are resolve_fast_32bpp_1x2xmsaa's (no sample averaging, 32bpp) and, for
+  // colour, resolve_full_32bpp's (conversion, bias, 2x averaging).
+  const bool full = copy_shader == draw_util::ResolveCopyShaderIndex::kFull32bpp;
+  if ((!full && copy_shader != draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA) ||
       !direct_resolve_root_signature_color_) {
     return nullptr;
   }
+  if (full && !REXCVAR_GET(direct_host_resolve_full)) {
+    return nullptr;
+  }
   const bool is_depth = resolve_info.IsCopyingDepth();
+  if (full && is_depth) {
+    return nullptr;
+  }
   uint32_t dump_base;
   uint32_t dump_row_length_used;
   uint32_t dump_rows;
@@ -6303,7 +6370,24 @@ D3D12RenderTargetCache::D3D12RenderTarget* D3D12RenderTargetCache::GetDirectReso
       default:
         return nullptr;
     }
-    if (kind == DirectResolveSourceKind::kColorUint) {
+    if (full) {
+      // UNORM colour only; at 1x one sample, at 2x sample 0, 1 or both averaged (what
+      // resolve_direct_full_32bpp maps; other selects keep the dump).
+      if (kind != DirectResolveSourceKind::kColor ||
+          !direct_resolve_full_32bpp_pipelines_[size_t(rt_key.msaa_samples ==
+                                                        xenos::MsaaSamples::k2X)]) {
+        return nullptr;
+      }
+      const xenos::CopySampleSelect select =
+          resolve_info.copy_dest_coordinate_info.copy_sample_select;
+      if (rt_key.msaa_samples == xenos::MsaaSamples::k1X
+              ? select != xenos::CopySampleSelect::k0
+              : (select != xenos::CopySampleSelect::k0 && select != xenos::CopySampleSelect::k1 &&
+                 select != xenos::CopySampleSelect::k01)) {
+        return nullptr;
+      }
+      kind = DirectResolveSourceKind::kColorFull;
+    } else if (kind == DirectResolveSourceKind::kColorUint) {
       if (!REXCVAR_GET(direct_host_resolve_uint) || rt_key.msaa_samples != xenos::MsaaSamples::k1X ||
           !direct_resolve_fast_32bpp_uint_pipeline_) {
         return nullptr;

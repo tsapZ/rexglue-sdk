@@ -1,0 +1,2 @@
+#define XE_RESOLVE_DIRECT_2XMSAA
+#include "resolve_direct_full_32bpp.xesli"

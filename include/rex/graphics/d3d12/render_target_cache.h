@@ -682,6 +682,9 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     kColorUint,
     // Depth and stencil through their SRVs (D24S8, D24FS8), 1x.
     kDepth,
+    // Colour through its UNORM SRV (8_8_8_8, 2_10_10_10) for resolve_full_32bpp's copies (format
+    // conversion, exponent bias, the two samples of 2x MSAA averaged), 1x or 2x MSAA.
+    kColorFull,
   };
   // Direct resolve: the render target to copy from instead of dumping to the EDRAM buffer, when
   // one render target owns the resolve's whole source span and the copy is one the direct shaders
@@ -837,6 +840,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // direct_resolve_root_signature_depth_: the stencil SRV in a fourth parameter).
   ID3D12PipelineState* direct_resolve_fast_32bpp_uint_pipeline_ = nullptr;
   ID3D12PipelineState* direct_resolve_fast_32bpp_depth_pipeline_ = nullptr;
+  // resolve_direct_full_32bpp_{1x,2x}msaa (the colour root signature).
+  ID3D12PipelineState* direct_resolve_full_32bpp_pipelines_[2] = {};
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
