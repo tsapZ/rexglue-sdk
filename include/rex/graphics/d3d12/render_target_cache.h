@@ -385,6 +385,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       // swapping of 40-sample columns as opposed to the host render target -
       // this is done only for the color source).
       uint32_t host_depth_source_is_copy : 1;
+      // The scale classes of the two sides (draw_resolution_scale_threshold): the shader bakes
+      // each side's tile size and the conversion between the scale spaces.
+      uint32_t dest_scale_native : 1;
+      uint32_t source_scale_native : 1;
 
       // Last bits because this affects the root signature - after sorting, only
       // change it as fewer times as possible. Depth buffers have an additional
@@ -480,6 +484,12 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       // Last bit because this affects the root signature - after sorting, only
       // change it at most once. Depth buffers have an additional stencil SRV.
       uint32_t is_depth : 1;
+      // A 1x render target (draw_resolution_scale_threshold): dumping it to the scaled EDRAM
+      // layout duplicates its guest pixels.
+      uint32_t source_scale_native : 1;
+      // source_scale_native only: address the EDRAM buffer with the plain 1x tile layout (a
+      // resolve whose sources are all 1x).
+      uint32_t native_layout : 1;
     };
 
     DumpPipelineKey() : key(0) { static_assert_size(*this, sizeof(key)); }

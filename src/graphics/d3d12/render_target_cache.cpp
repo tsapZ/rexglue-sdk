@@ -1294,10 +1294,10 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
         // The left-out rectangle magenta before the draw: it shows wherever the draw didn't cover it.
         const Transfer::Rectangle& cutout = *last_update_transfer_cutout();
         D3D12_RECT rect;
-        rect.left = LONG(cutout.x_pixels * draw_resolution_scale_x());
-        rect.top = LONG(cutout.y_pixels * draw_resolution_scale_y());
-        rect.right = LONG((cutout.x_pixels + cutout.width_pixels) * draw_resolution_scale_x());
-        rect.bottom = LONG((cutout.y_pixels + cutout.height_pixels) * draw_resolution_scale_y());
+        rect.left = LONG(cutout.x_pixels * GetDrawScaleX());
+        rect.top = LONG(cutout.y_pixels * GetDrawScaleY());
+        rect.right = LONG((cutout.x_pixels + cutout.width_pixels) * GetDrawScaleX());
+        rect.bottom = LONG((cutout.y_pixels + cutout.height_pixels) * GetDrawScaleY());
         const float magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
         for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
           if ((last_update_transfer_cutout_bits() & (uint32_t(1) << i)) &&
@@ -1324,8 +1324,8 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
           rect.top = 0;
           rect.right = LONG(((uint32_t(rt_key.pitch_tiles_at_32bpp) * xenos::kEdramTileWidthSamples) >>
                              msaa_x_log2) *
-                            draw_resolution_scale_x());
-          rect.bottom = LONG(overwritten_rows[i] * tile_height * draw_resolution_scale_y());
+                            GetKeyScaleX(rt_key));
+          rect.bottom = LONG(overwritten_rows[i] * tile_height * GetKeyScaleY(rt_key));
           if (!i) {
             // Depth: the nearest depth (what isn't overwritten hides what is drawn behind it) and
             // every stencil bit set (a later stencil test then behaves differently).
@@ -2009,9 +2009,9 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
   D3D12_RESOURCE_DESC resource_desc;
   resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   resource_desc.Alignment = 0;
-  resource_desc.Width = key.GetWidth() * draw_resolution_scale_x();
+  resource_desc.Width = key.GetWidth() * GetKeyScaleX(key);
   resource_desc.Height =
-      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) * draw_resolution_scale_y();
+      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) * GetKeyScaleY(key);
   resource_desc.DepthOrArraySize = 1;
   resource_desc.MipLevels = 1;
   if (key.is_depth) {
@@ -2873,24 +2873,32 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   }
   // r0:r2 are involved at least in common addressing code. Texture loads
   // usually can overwrite some of the addressing temps as they are only needed
-  // for the coordinates for that load. Currently 3 temps are enough.
-  a.OpDclTemps(3);
+  // for the coordinates for that load. Currently 3 temps are enough, plus one
+  // more to keep the destination coordinates for the host depth source across
+  // the scale class conversion.
+  const bool cross_scale_class = key.source_scale_native != key.dest_scale_native;
+  a.OpDclTemps(3 + uint32_t(cross_scale_class));
 
-  uint32_t draw_resolution_scale_x = this->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = this->draw_resolution_scale_y();
-
-  uint32_t tile_width_samples = xenos::kEdramTileWidthSamples * draw_resolution_scale_x;
-  uint32_t tile_height_samples = xenos::kEdramTileHeightSamples * draw_resolution_scale_y;
+  // The two sides may be in different scale classes (draw_resolution_scale_threshold). The host
+  // depth source always has the destination's scale, as 1x targets don't track host depth.
+  const uint32_t dest_scale_x = key.dest_scale_native ? 1 : this->draw_resolution_scale_x();
+  const uint32_t dest_scale_y = key.dest_scale_native ? 1 : this->draw_resolution_scale_y();
+  const uint32_t source_scale_x = key.source_scale_native ? 1 : this->draw_resolution_scale_x();
+  const uint32_t source_scale_y = key.source_scale_native ? 1 : this->draw_resolution_scale_y();
+  const uint32_t dest_tile_width_samples = xenos::kEdramTileWidthSamples * dest_scale_x;
+  const uint32_t dest_tile_height_samples = xenos::kEdramTileHeightSamples * dest_scale_y;
+  const uint32_t source_tile_width_samples = xenos::kEdramTileWidthSamples * source_scale_x;
+  const uint32_t source_tile_height_samples = xenos::kEdramTileHeightSamples * source_scale_y;
 
   // Split the destination pixel index into 32bpp tile in r0.zw and
   // 32bpp-tile-relative pixel index in r0.xy.
   // r0.xy = pixel XY as uint
   a.OpFToU(dxbc::Dest::R(0, 0b0011), dxbc::Src::V1D(kInputRegisterPosition));
   uint32_t dest_tile_width_pixels =
-      tile_width_samples >>
+      dest_tile_width_samples >>
       (uint32_t(dest_is_64bpp) + uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k4X));
   uint32_t dest_tile_height_pixels =
-      tile_height_samples >> uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k2X);
+      dest_tile_height_samples >> uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k2X);
   // r0.xy = destination pixel XY index within the 32bpp tile
   // r0.zw = 32bpp tile XY index
   a.OpUDiv(dxbc::Dest::R(0, 0b1100), dxbc::Dest::R(0, 0b0011), dxbc::Src::R(0, 0b01000100),
@@ -2905,6 +2913,23 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // r1.x = free
   a.OpUMAd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(1, dxbc::Src::kXXXX),
            dxbc::Src::R(0, dxbc::Src::kWWWW), dxbc::Src::R(0, dxbc::Src::kZZZZ));
+
+  if (cross_scale_class) {
+    // Convert the tile-local pixel coordinates in r0.xy to the source scale space (the
+    // remappings below go between two layouts of one scale). Keep the destination-space r0.xy
+    // in r3.xy for the host depth source. Sample indices don't change.
+    a.OpMov(dxbc::Dest::R(3, 0b0011), dxbc::Src::R(0));
+    if (key.dest_scale_native) {
+      // A 1x destination reading a scaled source: the centre host pixel of each guest pixel, as
+      // memexport and the resolve downscale do.
+      a.OpUMAd(dxbc::Dest::R(0, 0b0011), dxbc::Src::LU(source_scale_x, source_scale_y, 0, 0),
+               dxbc::Src::R(0), dxbc::Src::LU(source_scale_x >> 1, source_scale_y >> 1, 0, 0));
+    } else {
+      // A scaled destination reading a 1x source: duplicate the guest pixels.
+      a.OpUDiv(dxbc::Dest::R(0, 0b0011), dxbc::Dest::Null(), dxbc::Src::R(0),
+               dxbc::Src::LU(dest_scale_x, dest_scale_y, 1, 1));
+    }
+  }
 
   // Now the tile index doesn't have any dependencies on the destination. The
   // dword index within the source tile, however, is calculated from both the
@@ -3193,7 +3218,7 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     // Copying between color and depth / stencil - swap 40-32bpp-sample columns
     // in the pixel index within the source 32bpp tile using r1.w as temporary.
     uint32_t source_32bpp_tile_half_pixels =
-        tile_width_samples >> (1 + source_pixel_width_dwords_log2);
+        source_tile_width_samples >> (1 + source_pixel_width_dwords_log2);
     a.OpULT(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(source_tile_pixel_x_reg, dxbc::Src::kXXXX),
             dxbc::Src::LU(source_32bpp_tile_half_pixels));
     a.OpMovC(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
@@ -3236,12 +3261,13 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // r1.x = pixel X within the source texture
   // r2.x = free
   a.OpUMAd(
-      dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(tile_width_samples >> source_pixel_width_dwords_log2),
+      dxbc::Dest::R(1, 0b0001),
+      dxbc::Src::LU(source_tile_width_samples >> source_pixel_width_dwords_log2),
       dxbc::Src::R(2, dxbc::Src::kXXXX), dxbc::Src::R(source_tile_pixel_x_reg, dxbc::Src::kXXXX));
   // r1.y = pixel Y within the source texture
   // r1.w = free
   a.OpUMAd(dxbc::Dest::R(1, 0b0010),
-           dxbc::Src::LU(tile_height_samples >>
+           dxbc::Src::LU(source_tile_height_samples >>
                          uint32_t(key.source_msaa_samples >= xenos::MsaaSamples::k2X)),
            dxbc::Src::R(1, dxbc::Src::kWWWW),
            dxbc::Src::R(source_tile_pixel_y_reg, dxbc::Src::kYYYY));
@@ -3752,6 +3778,12 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
             // r0.z = 32bpp tile index relative to the destination base
             // r1.w = depth in guest format
 
+            if (cross_scale_class) {
+              // r0.xy is in the source scale space: the host depth source needs the
+              // destination-space coordinates kept in r3.xy.
+              a.OpMov(dxbc::Dest::R(0, 0b0011), dxbc::Src::R(3));
+            }
+
             if (key.host_depth_source_is_copy) {
               // Get the address in the EDRAM scratch buffer and load from
               // there.
@@ -3786,10 +3818,10 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
               // The tile index doesn't need to be wrapped, as the host depth is
               // written to the beginning of the buffer, without the base
               // offset.
-              a.OpUMAd(dxbc::Dest::R(0, 0b0001), dxbc::Src::LU(tile_width_samples),
+              a.OpUMAd(dxbc::Dest::R(0, 0b0001), dxbc::Src::LU(dest_tile_width_samples),
                        dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(0, dxbc::Src::kXXXX));
               a.OpUMAd(dxbc::Dest::R(0, 0b0001),
-                       dxbc::Src::LU(tile_width_samples * tile_height_samples),
+                       dxbc::Src::LU(dest_tile_width_samples * dest_tile_height_samples),
                        dxbc::Src::R(0, dxbc::Src::kZZZZ), dxbc::Src::R(0, dxbc::Src::kXXXX));
               // Load from the buffer.
               a.OpLd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), 0b0001,
@@ -3936,14 +3968,14 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
               // r1.x = free
               a.OpUMAd(
                   dxbc::Dest::R(0, 0b0001),
-                  dxbc::Src::LU(tile_width_samples >> uint32_t(key.host_depth_source_msaa_samples >=
+                  dxbc::Src::LU(dest_tile_width_samples >> uint32_t(key.host_depth_source_msaa_samples >=
                                                                xenos::MsaaSamples::k4X)),
                   dxbc::Src::R(1, dxbc::Src::kXXXX), dxbc::Src::R(0, dxbc::Src::kXXXX));
               // r0.y = pixel Y within the host depth source texture
               // r0.z = free
               a.OpUMAd(dxbc::Dest::R(0, 0b0010),
                        dxbc::Src::LU(
-                           tile_height_samples >>
+                           dest_tile_height_samples >>
                            uint32_t(key.host_depth_source_msaa_samples >= xenos::MsaaSamples::k2X)),
                        dxbc::Src::R(0, dxbc::Src::kZZZZ), dxbc::Src::R(0, dxbc::Src::kYYYY));
               // Load from the host depth texture.
@@ -4260,16 +4292,26 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
   D3D12_RECT clear_rect;
   if (resolve_clear_needed) {
+    // All render targets of a clear share the pitch and so the scale class.
+    uint32_t resolve_clear_scale_x = draw_resolution_scale_x();
+    uint32_t resolve_clear_scale_y = draw_resolution_scale_y();
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      if (render_targets[i]) {
+        resolve_clear_scale_x = GetKeyScaleX(render_targets[i]->key());
+        resolve_clear_scale_y = GetKeyScaleY(render_targets[i]->key());
+        break;
+      }
+    }
     // Assuming the rectangle is already clamped by the setup function from the
     // common render target cache.
-    clear_rect.left = LONG(resolve_clear_rectangle->x_pixels * draw_resolution_scale_x());
-    clear_rect.top = LONG(resolve_clear_rectangle->y_pixels * draw_resolution_scale_y());
+    clear_rect.left = LONG(resolve_clear_rectangle->x_pixels * resolve_clear_scale_x);
+    clear_rect.top = LONG(resolve_clear_rectangle->y_pixels * resolve_clear_scale_y);
     clear_rect.right =
         LONG((resolve_clear_rectangle->x_pixels + resolve_clear_rectangle->width_pixels) *
-             draw_resolution_scale_x());
+             resolve_clear_scale_x);
     clear_rect.bottom =
         LONG((resolve_clear_rectangle->y_pixels + resolve_clear_rectangle->height_pixels) *
-             draw_resolution_scale_y());
+             resolve_clear_scale_y);
   }
 
   // Do host depth storing for the depth destination (assuming there can be only
@@ -4290,6 +4332,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       if (transfer.host_depth_source != dest_rt) {
         continue;
       }
+      assert_false(dest_rt_key.scale_native);
       if (!host_depth_store_set_up) {
         // Bindings.
         // 0 - source.
@@ -4525,8 +4568,6 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
   bool transfer_viewport_set = false;
   float pixels_to_ndc_unscaled = 2.0f / float(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION);
-  float pixels_to_ndc_x = pixels_to_ndc_unscaled * draw_resolution_scale_x();
-  float pixels_to_ndc_y = pixels_to_ndc_unscaled * draw_resolution_scale_y();
 
   TransferRootSignatureIndex last_transfer_root_signature_index =
       TransferRootSignatureIndex::kCount;
@@ -4578,6 +4619,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
       uint32_t dest_pitch_tiles = dest_rt_key.GetPitchTiles();
       bool dest_is_64bpp = dest_rt_key.Is64bpp();
+      // The rectangles are in guest pixels: scale them to the destination's class.
+      float pixels_to_ndc_x = pixels_to_ndc_unscaled * GetKeyScaleX(dest_rt_key);
+      float pixels_to_ndc_y = pixels_to_ndc_unscaled * GetKeyScaleY(dest_rt_key);
 
       // Gather shader keys and sort to reduce pipeline state and binding
       // switches. Also gather stencil rectangles to clear if needed.
@@ -4589,6 +4633,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       TransferShaderKey new_transfer_shader_key;
       new_transfer_shader_key.dest_msaa_samples = dest_rt_key.msaa_samples;
       new_transfer_shader_key.dest_resource_format = dest_rt_key.resource_format;
+      new_transfer_shader_key.dest_scale_native = dest_rt_key.scale_native;
       uint32_t stencil_clear_rectangle_count = 0;
       for (uint32_t j = 0; j <= uint32_t(need_stencil_bit_draws); ++j) {
         // j == 0 - color or depth.
@@ -4621,6 +4666,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           RenderTargetKey source_rt_key = source_d3d12_rt.key();
           new_transfer_shader_key.source_msaa_samples = source_rt_key.msaa_samples;
           new_transfer_shader_key.source_resource_format = source_rt_key.resource_format;
+          new_transfer_shader_key.source_scale_native = source_rt_key.scale_native;
+          assert_true(!host_depth_source_d3d12_rt ||
+                      host_depth_source_d3d12_rt->key().scale_native == dest_rt_key.scale_native);
           bool host_depth_source_is_copy = host_depth_source_d3d12_rt == &dest_d3d12_rt;
           new_transfer_shader_key.host_depth_source_is_copy = host_depth_source_is_copy;
           // The host depth copy buffer has only raw samples.
@@ -4677,15 +4725,15 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             const Transfer::Rectangle& stencil_clear_rectangle =
                 transfer_stencil_clear_rectangles[j];
             stencil_clear_rect_write_ptr->left =
-                LONG(stencil_clear_rectangle.x_pixels * draw_resolution_scale_x());
+                LONG(stencil_clear_rectangle.x_pixels * GetKeyScaleX(dest_rt_key));
             stencil_clear_rect_write_ptr->top =
-                LONG(stencil_clear_rectangle.y_pixels * draw_resolution_scale_y());
+                LONG(stencil_clear_rectangle.y_pixels * GetKeyScaleY(dest_rt_key));
             stencil_clear_rect_write_ptr->right =
                 LONG((stencil_clear_rectangle.x_pixels + stencil_clear_rectangle.width_pixels) *
-                     draw_resolution_scale_x());
+                     GetKeyScaleX(dest_rt_key));
             stencil_clear_rect_write_ptr->bottom =
                 LONG((stencil_clear_rectangle.y_pixels + stencil_clear_rectangle.height_pixels) *
-                     draw_resolution_scale_y());
+                     GetKeyScaleY(dest_rt_key));
             ++stencil_clear_rect_write_ptr;
           }
         }
