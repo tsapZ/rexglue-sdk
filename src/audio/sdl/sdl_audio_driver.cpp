@@ -28,6 +28,11 @@
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+REXCVAR_DEFINE_STRING(audio_channels, "auto", "Audio",
+                      "Output channels: auto (5.1 on a surround device, else stereo) or stereo "
+                      "(always mixes 5.1 down to two channels, e.g. for headphones on an output "
+                      "the system has set up as 5.1 or 7.1, which would lose the center channel)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::audio {
 namespace {
@@ -90,7 +95,12 @@ bool SDLAudioDriver::Initialize() {
 
   // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
   // Handing it a 6ch stream instead would use SDL's own downmix.
-  if (obtained_spec.channels <= 2) {
+  // audio_channels = stereo folds for a surround device too: headphones on an
+  // output set up as 5.1/7.1 play only front left and right, and a game that
+  // puts voices on the center channel alone (Spyro's Adventure's movies) went
+  // silent there.
+  const bool force_stereo = REXCVAR_GET(audio_channels) == "stereo";
+  if (obtained_spec.channels <= 2 || force_stereo) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;
     desired_spec.channels = 2;
