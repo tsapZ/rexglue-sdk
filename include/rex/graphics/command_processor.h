@@ -260,16 +260,20 @@ class CommandProcessor {
 
   // Backends note every resolve (its guest range and the bits per pixel of the copy), so
   // ReadBackResolvedMemory knows which ranges hold GPU-written data.
-  void NoteResolvedRange(uint32_t address, uint32_t length, uint32_t bits_per_pixel);
+  // scaled: the resolve went to the scaled resolve memory (false: a 1x resolve under
+  // draw_resolution_scale_threshold, in shared memory).
+  void NoteResolvedRange(uint32_t address, uint32_t length, uint32_t bits_per_pixel,
+                         bool scaled = true);
   // Command processor thread: copies one noted resolve back into guest memory, as it is in the
   // GPU's memory now, and waits for that; only its part inside [clip_start, clip_end), and with
   // resolution scaling only the pages still holding the resolve (not written by the CPU since).
   // Backends that can read back implement it.
   virtual bool ReadBackResolvedRange(uint32_t address, uint32_t length, uint32_t bits_per_pixel,
-                                     uint32_t clip_start, uint32_t clip_end) {
+                                     bool scaled, uint32_t clip_start, uint32_t clip_end) {
     (void)address;
     (void)length;
     (void)bits_per_pixel;
+    (void)scaled;
     (void)clip_start;
     (void)clip_end;
     return false;
@@ -341,6 +345,7 @@ class CommandProcessor {
     uint32_t length;
     uint32_t bits_per_pixel;
     uint64_t frame;  // guest_frame_count_ at the resolve
+    bool scaled;     // in the scaled resolve memory (not a 1x resolve in shared memory)
   };
   // The resolves of the last frames, oldest first; one that a newer resolve covers whole is dropped
   // (command processor thread only).

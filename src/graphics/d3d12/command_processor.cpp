@@ -2584,9 +2584,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     current_external_pipeline_ = nullptr;
   }
 
-  // Get dynamic rasterizer state.
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  // Get dynamic rasterizer state, at this draw's scale: 1x1 under
+  // draw_resolution_scale_threshold.
+  uint32_t draw_resolution_scale_x = render_target_cache_->GetDrawScaleX();
+  uint32_t draw_resolution_scale_y = render_target_cache_->GetDrawScaleY();
 
   bool convert_z_to_float24 =
       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader();
@@ -2603,8 +2604,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   viewport_key.normalized_depth_control = normalized_depth_control.value;
   std::memcpy(viewport_key.vport_regs, &regs[XE_GPU_REG_PA_CL_VPORT_XSCALE],
               sizeof(viewport_key.vport_regs));
+  // The scale can differ per draw (draw_resolution_scale_threshold): part of the key.
   viewport_key.flags = (uint32_t(convert_z_to_float24) << 0) |
-                       (uint32_t(host_render_targets_used) << 1) | (uint32_t(ps_writes_depth) << 2);
+                       (uint32_t(host_render_targets_used) << 1) | (uint32_t(ps_writes_depth) << 2) |
+                       (draw_resolution_scale_x << 3) | (draw_resolution_scale_y << 6);
 
   draw_util::ViewportInfo viewport_info;
   if (viewport_cache_valid_ && viewport_key == previous_viewport_key_) {
@@ -3047,11 +3050,12 @@ bool D3D12CommandProcessor::IssueCopy() {
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
+    bool written_scaled = true;
     if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
-                                       written_length)) {
+                                       written_length, &written_scaled)) {
       return false;
     }
-    NoteResolvedRange(written_address, written_length, ResolveCopyBitsPerPixel());
+    NoteResolvedRange(written_address, written_length, ResolveCopyBitsPerPixel(), written_scaled);
     return true;
   }
   return IssueCopy_ReadbackResolvePath();
@@ -3059,15 +3063,16 @@ bool D3D12CommandProcessor::IssueCopy() {
 
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t written_address, written_length;
+  bool written_scaled = true;
   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
-                                     written_length)) {
+                                     written_length, &written_scaled)) {
     return false;
   }
 
   if (!written_length) {
     return true;
   }
-  NoteResolvedRange(written_address, written_length, ResolveCopyBitsPerPixel());
+  NoteResolvedRange(written_address, written_length, ResolveCopyBitsPerPixel(), written_scaled);
   // Only the resolves the settings ask for (readback_resolve_max_size / _addresses): the
   // full-screen ones are the costly copies, and a game usually reads one known result.
   if (!IsResolveReadbackWanted(written_address, written_length)) {
@@ -3118,6 +3123,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   if (!RecordResolveReadbackCopy(written_address, written_length, ResolveCopyBitsPerPixel(),
+                                 written_scaled && texture_cache_->IsDrawResolutionScaled(),
                                  rb.buffers[write_index])) {
     return true;
   }
@@ -3162,9 +3168,9 @@ uint32_t D3D12CommandProcessor::ResolveCopyBitsPerPixel() const {
 }
 
 bool D3D12CommandProcessor::RecordResolveReadbackCopy(uint32_t address, uint32_t length,
-                                                      uint32_t bits_per_pixel,
+                                                      uint32_t bits_per_pixel, bool scaled,
                                                       ID3D12Resource* destination) {
-  if (texture_cache_->IsDrawResolutionScaled()) {
+  if (scaled) {
     if (!resolve_downscale_pipeline_ || !resolve_downscale_root_signature_) {
       return false;
     }
@@ -3291,13 +3297,14 @@ bool D3D12CommandProcessor::RecordResolveReadbackCopy(uint32_t address, uint32_t
 }
 
 bool D3D12CommandProcessor::ReadBackResolvedRange(uint32_t address, uint32_t length,
-                                                  uint32_t bits_per_pixel, uint32_t clip_start,
-                                                  uint32_t clip_end) {
+                                                  uint32_t bits_per_pixel, bool scaled,
+                                                  uint32_t clip_start, uint32_t clip_end) {
   uint8_t* guest = memory_->TranslatePhysical(address);
   if (!guest) {
     return false;
   }
-  const bool is_scaled = texture_cache_->IsDrawResolutionScaled();
+  // A 1x resolve (draw_resolution_scale_threshold) is in shared memory, as without scaling.
+  const bool is_scaled = texture_cache_->IsDrawResolutionScaled() && scaled;
   // With scaling the data is only in the scaled copy, until the CPU writes over the range.
   if (is_scaled && !texture_cache_->IsRangeScaledResolved(address, length)) {
     return false;
@@ -3338,7 +3345,7 @@ bool D3D12CommandProcessor::ReadBackResolvedRange(uint32_t address, uint32_t len
     requested_readback_mapping_ = mapping;
     requested_readback_buffer_size_ = size;
   }
-  if (!RecordResolveReadbackCopy(address, length, bits_per_pixel,
+  if (!RecordResolveReadbackCopy(address, length, bits_per_pixel, is_scaled,
                                  requested_readback_buffer_.Get())) {
     return false;
   }
@@ -3958,8 +3965,9 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
 
   bool edram_rov_used =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  // This draw's scale (1x1 under draw_resolution_scale_threshold, host render targets only).
+  uint32_t draw_resolution_scale_x = render_target_cache_->GetDrawScaleX();
+  uint32_t draw_resolution_scale_y = render_target_cache_->GetDrawScaleY();
 
   // Get the color info register values for each render target. Also, for ROV,
   // exclude components that don't exist in the format from the write mask.

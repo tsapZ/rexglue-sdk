@@ -378,10 +378,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Records the copy of a resolved guest range into `destination` (a readback buffer of at least
   // `length` bytes), downscaled to 1x first when the resolution is scaled (the scaled range must
   // be current then). False if it can't.
+  // scaled: the range is in the scaled resolve memory (downscaled for the copy), else in shared
+  // memory (copied as it is).
   bool RecordResolveReadbackCopy(uint32_t address, uint32_t length, uint32_t bits_per_pixel,
-                                 ID3D12Resource* destination);
+                                 bool scaled, ID3D12Resource* destination);
   bool ReadBackResolvedRange(uint32_t address, uint32_t length, uint32_t bits_per_pixel,
-                             uint32_t clip_start, uint32_t clip_end) override;
+                             bool scaled, uint32_t clip_start, uint32_t clip_end) override;
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 

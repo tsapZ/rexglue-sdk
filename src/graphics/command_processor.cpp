@@ -474,7 +474,7 @@ bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) cons
 constexpr uint64_t kResolvedRangeFrames = 120;
 
 void CommandProcessor::NoteResolvedRange(uint32_t address, uint32_t length,
-                                         uint32_t bits_per_pixel) {
+                                         uint32_t bits_per_pixel, bool scaled) {
   if (!length) {
     return;
   }
@@ -487,7 +487,7 @@ void CommandProcessor::NoteResolvedRange(uint32_t address, uint32_t length,
   if (resolved_ranges_.size() >= 256) {
     resolved_ranges_.erase(resolved_ranges_.begin());
   }
-  resolved_ranges_.push_back({address, length, bits_per_pixel, frame});
+  resolved_ranges_.push_back({address, length, bits_per_pixel, frame, scaled});
 }
 
 bool CommandProcessor::ReadBackNotedResolves(uint32_t address, uint32_t length) {
@@ -500,7 +500,8 @@ bool CommandProcessor::ReadBackNotedResolves(uint32_t address, uint32_t length) 
         frame - r.frame > kResolvedRangeFrames) {
       continue;
     }
-    if (ReadBackResolvedRange(r.start, r.length, r.bits_per_pixel, address, address + length)) {
+    if (ReadBackResolvedRange(r.start, r.length, r.bits_per_pixel, r.scaled, address,
+                              address + length)) {
       any = true;
     }
   }
