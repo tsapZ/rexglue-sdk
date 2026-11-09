@@ -47,7 +47,7 @@ REXCVAR_DEFINE_BOOL(gpu_transfer_report, false, "GPU",
 
 REXCVAR_DEFINE_BOOL(gpu_native_surfaces, false, "GPU",
                     "Drop the EDRAM ownership transfers between render targets, except the kinds the game "
-                    "needs, and log the counts every few seconds")
+                    "needs (gpu_transfer_report logs the counts)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(gpu_native_resolves, true, "GPU",
@@ -958,7 +958,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
         }
       }
     }
-    if (REXCVAR_GET(gpu_transfer_report) || REXCVAR_GET(gpu_native_surfaces)) {
+    if (REXCVAR_GET(gpu_transfer_report)) {
       ReportNativeSurfaceTransfers();
     }
     if (!interlock_barrier_only) {
@@ -1572,17 +1572,27 @@ void RenderTargetCache::NoteNativeSurfaceTransfers(std::vector<Transfer>& transf
   };
   const native_surfaces::SurfaceKind dest_kind = kind_of(dest_key);
   const bool drop = REXCVAR_GET(gpu_native_surfaces);
-  const std::string& keep = REXCVAR_GET(gpu_native_surfaces_keep);
+  const bool report = REXCVAR_GET(gpu_transfer_report);
   auto dropped_begin = std::remove_if(transfers.begin(), transfers.end(), [&](const Transfer& transfer) {
     const native_surfaces::SurfaceKind source_kind = kind_of(transfer.source->key());
-    const uint32_t tiles = transfer.end_tiles - transfer.start_tiles;
-    if (!drop || native_surfaces::KeepTransfer(source_kind, dest_kind) ||
-        native_surfaces::KeepByList(source_kind, dest_kind, keep)) {
-      native_surface_kept_.Record(source_kind, dest_kind, tiles);
-      return false;
+    bool kept = !drop;
+    if (!kept) {
+      // Once per kind: the keep list is text, and a frame has many transfers.
+      const uint32_t pair = native_surfaces::PairKey(source_kind, dest_kind);
+      auto it = native_surface_keep_by_pair_.find(pair);
+      if (it == native_surface_keep_by_pair_.end()) {
+        const bool keep_it = native_surfaces::KeepTransfer(source_kind, dest_kind) ||
+                             native_surfaces::KeepByList(source_kind, dest_kind,
+                                                         REXCVAR_GET(gpu_native_surfaces_keep));
+        it = native_surface_keep_by_pair_.emplace(pair, keep_it).first;
+      }
+      kept = it->second;
     }
-    native_surface_dropped_.Record(source_kind, dest_kind, tiles);
-    return true;
+    if (report) {
+      (kept ? native_surface_kept_ : native_surface_dropped_)
+          .Record(source_kind, dest_kind, transfer.end_tiles - transfer.start_tiles);
+    }
+    return !kept;
   });
   transfers.erase(dropped_begin, transfers.end());
 }

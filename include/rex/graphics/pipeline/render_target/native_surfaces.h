@@ -39,6 +39,14 @@ inline std::string KindName(const SurfaceKind& kind) {
          std::to_string(1u << kind.msaa_samples_log2);
 }
 
+// The source and destination kinds of a transfer as one number, for caches per kind.
+inline uint32_t PairKey(const SurfaceKind& source, const SurfaceKind& dest) {
+  auto one = [](const SurfaceKind& kind) {
+    return (uint32_t(kind.is_depth) << 12) | ((kind.format & 0xFF) << 4) | (kind.msaa_samples_log2 & 0xF);
+  };
+  return (one(source) << 16) | one(dest);
+}
+
 // A game's own keep list on top of KeepTransfer (gpu_native_surfaces_keep), in the report's names,
 // separated by commas: "C2x1->D0x1" keeps that one pair, "C2x1" every transfer from or to it.
 inline bool KeepByList(const SurfaceKind& source, const SurfaceKind& dest, const std::string& list) {

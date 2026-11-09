@@ -727,6 +727,9 @@ class RenderTargetCache {
   native_surfaces::TransferCounters native_surface_kept_;
   native_surfaces::TransferCounters native_surface_dropped_;
   std::chrono::steady_clock::time_point native_surface_last_report_ = std::chrono::steady_clock::now();
+  // gpu_native_surfaces: whether a transfer kind (native_surfaces::PairKey) is kept, decided once
+  // per kind (the keep list is set at start).
+  std::map<uint32_t, bool> native_surface_keep_by_pair_;
 
   // Bumped by everything that changes ownership_ranges_ or may delete render targets (for
   // update_skip_).
