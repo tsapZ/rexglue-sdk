@@ -399,8 +399,8 @@ void RenderTargetCache::InitializeCommon() {
                                                   RenderTargetKey(), RenderTargetKey()));
 
   if (REXCVAR_GET(draw_resolution_scale_threshold) > 0) {
-    if (GetPath() != Path::kHostRenderTargets) {
-      REXGPU_WARN("draw_resolution_scale_threshold needs host render targets - ignoring");
+    if (GetPath() != Path::kHostRenderTargets || !SupportsScaleThreshold()) {
+      REXGPU_WARN("draw_resolution_scale_threshold needs D3D12 host render targets - ignoring");
     } else if (!IsDrawResolutionScaled()) {
       REXGPU_WARN("draw_resolution_scale_threshold does nothing at resolution scale 1");
     } else {
@@ -473,7 +473,8 @@ void RenderTargetCache::BeginFrame() {
 bool RenderTargetCache::IsScaleNativeForPitch(uint32_t pitch_tiles_at_32bpp,
                                               xenos::MsaaSamples msaa_samples) const {
   const int32_t threshold = REXCVAR_GET(draw_resolution_scale_threshold);
-  if (threshold <= 0 || !IsDrawResolutionScaled() || GetPath() != Path::kHostRenderTargets) {
+  if (threshold <= 0 || !IsDrawResolutionScaled() || GetPath() != Path::kHostRenderTargets ||
+      !SupportsScaleThreshold()) {
     return false;
   }
   // The pitch is the only guest surface dimension that's reliably known (host render target

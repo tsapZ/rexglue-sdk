@@ -61,6 +61,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void BeginSubmission();
 
   Path GetPath() const override { return path_; }
+  bool SupportsScaleThreshold() const override { return true; }
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;

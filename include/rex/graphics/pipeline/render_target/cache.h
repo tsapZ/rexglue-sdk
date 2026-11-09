@@ -127,6 +127,9 @@ class RenderTargetCache {
   virtual ~RenderTargetCache();
 
   virtual Path GetPath() const = 0;
+  // Whether the backend makes and draws 1x render targets for draw_resolution_scale_threshold
+  // (D3D12 host render targets; the Vulkan backend isn't ported).
+  virtual bool SupportsScaleThreshold() const { return false; }
   // The sample count (log2) of the render target that last used the EDRAM tile, -1 if none did.
   int OwnerMsaaSamplesLog2(uint32_t tile) const;
 
