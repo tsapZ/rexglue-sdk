@@ -11,7 +11,9 @@
 
 #pragma once
 
+#include <filesystem>
 #include <string>
+#include <utility>
 
 #include <rex/filesystem/device.h>
 
@@ -26,6 +28,12 @@ class HostPathDevice : public Device {
   ~HostPathDevice() override;
 
   bool Initialize() override;
+  // An overlay (mods, vfs_overlay_roots): each file under `root` takes the place of the file at the
+  // same path in this device (names compared without case, as the guest's paths are), or is added
+  // where the device has none; folders are merged. A file where the device has a folder, or the
+  // other way round, is left out. Call after Initialize(); a later overlay wins over an earlier one.
+  // Only the entries change, the host folders are not touched. Returns the files replaced and added.
+  std::pair<size_t, size_t> AddOverlay(const std::filesystem::path& root);
   void Dump(string::StringBuffer* string_buffer) override;
   Entry* ResolvePath(const std::string_view path) override;
 
@@ -48,6 +56,8 @@ class HostPathDevice : public Device {
 
  private:
   void PopulateEntry(HostPathEntry* parent_entry);
+  void OverlayEntry(HostPathEntry* parent_entry, const std::filesystem::path& host_dir,
+                    size_t& replaced, size_t& added);
 
   std::string name_;
   std::filesystem::path host_path_;

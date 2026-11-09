@@ -9,6 +9,10 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <algorithm>
+#include <filesystem>
+#include <string>
+
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/filesystem/devices/host_path_device.h>
@@ -33,6 +37,10 @@ REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
 REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
 REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
+REXCVAR_DEFINE_STRING(vfs_overlay_roots, "", "Runtime",
+                      "Folders whose files take the place of the game's files at the same path, or "
+                      "are added to them (mods), in order (a later one wins), separated by ;")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex {
 
@@ -310,6 +318,23 @@ bool Runtime::SetupVfs() {
   if (!device->Initialize()) {
     REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
     return false;
+  }
+  // Mods (vfs_overlay_roots, set by the game before the runtime is set up): their files take the
+  // place of the disc's at the same path, or are added; the disc's folder is not touched.
+  {
+    const std::string roots = REXCVAR_GET(vfs_overlay_roots);
+    size_t start = 0;
+    while (start <= roots.size()) {
+      const size_t end = std::min(roots.find(';', start), roots.size());
+      const std::string root = roots.substr(start, end - start);
+      start = end + 1;
+      if (root.empty()) {
+        continue;
+      }
+      const std::u8string root_u8(reinterpret_cast<const char8_t*>(root.data()), root.size());
+      const auto [replaced, added] = device->AddOverlay(std::filesystem::path(root_u8));
+      REXSYS_INFO("Overlay {}: {} files replaced, {} added", root, replaced, added);
+    }
   }
   if (!file_system_->RegisterDevice(std::move(device))) {
     REXSYS_ERROR("Runtime::SetupVfs: Failed to register host path device");
