@@ -221,6 +221,8 @@ class PipelineCache {
     uint32_t depth_write : 1;                         // 18
     uint32_t stencil_enable : 1;                      // 19
     uint32_t stencil_read_mask : 8;                   // 27
+    // A draw at 1x under draw_resolution_scale_threshold: slope-scaled depth bias unscaled.
+    uint32_t resolution_scale_native : 1;             // 28
 
     uint32_t stencil_write_mask : 8;                   // 8
     xenos::StencilOp stencil_front_fail_op : 3;        // 11
@@ -234,7 +236,7 @@ class PipelineCache {
 
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
-    static constexpr uint32_t kVersion = 0x20210425;
+    static constexpr uint32_t kVersion = 0x20261109;
   });
 
   REXPACKEDSTRUCT(PipelineStoredDescription, {

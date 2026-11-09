@@ -112,7 +112,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260226;
+    static constexpr uint32_t kVersion = 0x20261109;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -177,6 +177,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t dynamic_addressable_register_count : 8;
       // Non-ROV - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 2;
+      // PsParamGen and the memexport dedup act as without resolution scaling: the draw is at
+      // 1x because of draw_resolution_scale_threshold (host render targets only). Texture
+      // fetch offsets are not affected: they follow the texture's scale.
+      uint32_t resolution_scale_native : 1;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
@@ -937,6 +941,19 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // Guest pixel host width / height.
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+
+  // The scale of the draw being translated: every position-dependent path uses these; only
+  // texture fetch offsets use draw_resolution_scale_x_/y_ directly.
+  uint32_t GetCurrentDrawResolutionScaleX() const {
+    return is_pixel_shader() && GetDxbcShaderModification().pixel.resolution_scale_native
+               ? 1
+               : draw_resolution_scale_x_;
+  }
+  uint32_t GetCurrentDrawResolutionScaleY() const {
+    return is_pixel_shader() && GetDxbcShaderModification().pixel.resolution_scale_native
+               ? 1
+               : draw_resolution_scale_y_;
+  }
   // EDRAM size for ROV addressing wrapping (rex/graphics/edram_layout.h).
   uint32_t edram_tile_count_;
 
