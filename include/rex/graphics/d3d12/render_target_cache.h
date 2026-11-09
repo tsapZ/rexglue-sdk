@@ -81,9 +81,11 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // Performs the resolve to a shared memory area according to the current
   // register values, and also clears the render targets if needed. Must be in a
   // frame for calling.
+  // written_scaled_out: whether the data went to the scaled resolve memory rather than shared
+  // memory (a resolve at 1x under draw_resolution_scale_threshold doesn't).
   bool Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
                D3D12TextureCache& texture_cache, uint32_t& written_address_out,
-               uint32_t& written_length_out);
+               uint32_t& written_length_out, bool* written_scaled_out = nullptr);
 
   // For host render targets.
 
@@ -196,6 +198,12 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       kResolveCopyShaders4096[size_t(draw_util::ResolveCopyShaderIndex::kCount)];
   ID3D12PipelineState* resolve_copy_pipelines_[size_t(draw_util::ResolveCopyShaderIndex::kCount)] =
       {};
+  // Unscaled variants for resolves whose sources are all 1x (draw_resolution_scale_threshold),
+  // made only with resolution scaling (else the main set is unscaled already). Their own root
+  // signature: the scaled shaders' constants and destination assume the scaled resolve memory.
+  ID3D12RootSignature* resolve_copy_native_root_signature_ = nullptr;
+  ID3D12PipelineState*
+      resolve_copy_native_pipelines_[size_t(draw_util::ResolveCopyShaderIndex::kCount)] = {};
 
   // For host render targets.
 
@@ -675,8 +683,9 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
+  // native_layout: the plain 1x tile layout (a resolve whose sources are all 1x).
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
-                         uint32_t dump_pitch);
+                         uint32_t dump_pitch, bool native_layout);
 
   // gpu_native_resolves: why a resolve or a texture was not written natively.
   enum class NativeResolveFallback : uint32_t {

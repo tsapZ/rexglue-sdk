@@ -436,6 +436,19 @@ bool D3D12RenderTargetCache::Initialize() {
   }
   direct_resolve_root_signature_depth_ = resolve_copy_root_signature_;
   direct_resolve_root_signature_depth_->AddRef();
+  if (draw_resolution_scaled) {
+    // For resolves whose sources are all 1x: full constants with the destination base, as
+    // without scaling.
+    resolve_copy_root_parameters[0].Constants.Num32BitValues =
+        sizeof(draw_util::ResolveCopyShaderConstants) / sizeof(uint32_t);
+    resolve_copy_native_root_signature_ =
+        ui::d3d12::util::CreateRootSignature(provider, resolve_copy_root_signature_desc);
+    if (resolve_copy_native_root_signature_ == nullptr) {
+      REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the native resolve copy root signature");
+      Shutdown();
+      return false;
+    }
+  }
 
   // Create the resolve copying pipelines.
   for (size_t i = 0; i < size_t(draw_util::ResolveCopyShaderIndex::kCount); ++i) {
@@ -463,6 +476,20 @@ bool D3D12RenderTargetCache::Initialize() {
         rex::string::to_utf16(resolve_copy_shader_info.debug_name);
     resolve_copy_pipeline->SetName(reinterpret_cast<LPCWSTR>(resolve_copy_pipeline_name.c_str()));
     resolve_copy_pipelines_[i] = resolve_copy_pipeline;
+    if (draw_resolution_scaled) {
+      ID3D12PipelineState* resolve_copy_native_pipeline = ui::d3d12::util::CreateComputePipeline(
+          device, resolve_copy_shader_code.unscaled, resolve_copy_shader_code.unscaled_size,
+          resolve_copy_native_root_signature_);
+      if (resolve_copy_native_pipeline == nullptr) {
+        REXGPU_ERROR("D3D12RenderTargetCache: Failed to create {} native resolve copy pipeline",
+                     resolve_copy_shader_info.debug_name);
+        Shutdown();
+        return false;
+      }
+      resolve_copy_native_pipeline->SetName(
+          reinterpret_cast<LPCWSTR>(resolve_copy_pipeline_name.c_str()));
+      resolve_copy_native_pipelines_[i] = resolve_copy_native_pipeline;
+    }
   }
 
   // Direct resolve pipelines (1x and 2x MSAA source render targets). A missing one only means
@@ -1244,6 +1271,10 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   descriptor_pool_depth_.reset();
   descriptor_pool_color_.reset();
 
+  for (size_t i = 0; i < rex::countof(resolve_copy_native_pipelines_); ++i) {
+    ui::d3d12::util::ReleaseAndNull(resolve_copy_native_pipelines_[i]);
+  }
+  ui::d3d12::util::ReleaseAndNull(resolve_copy_native_root_signature_);
   for (size_t i = 0; i < rex::countof(resolve_copy_pipelines_); ++i) {
     ui::d3d12::util::ReleaseAndNull(resolve_copy_pipelines_[i]);
   }
@@ -1430,7 +1461,11 @@ void D3D12RenderTargetCache::WriteEdramUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTO
 
 bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
                                      D3D12TextureCache& texture_cache,
-                                     uint32_t& written_address_out, uint32_t& written_length_out) {
+                                     uint32_t& written_address_out, uint32_t& written_length_out,
+                                     bool* written_scaled_out) {
+  if (written_scaled_out) {
+    *written_scaled_out = false;
+  }
   written_address_out = 0;
   written_length_out = 0;
   if (!direct_resolve_verify_pending_.empty()) {
@@ -1458,10 +1493,30 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   // Copying.
   bool copied = false;
   if (resolve_info.copy_dest_extent_length) {
+    // draw_resolution_scale_threshold: if everything owning the source is 1x, copy at 1x into
+    // shared memory (with the resolve info redone at 1x for the unscaled copy shaders).
+    bool copy_native = false;
+    if (GetPath() == Path::kHostRenderTargets && draw_resolution_scaled) {
+      uint32_t span_base, span_row_length, span_rows, span_pitch;
+      resolve_info.GetCopyEdramTileSpan(span_base, span_row_length, span_rows, span_pitch);
+      copy_native = IsResolveSourceNativeOnly(span_base, span_row_length, span_rows, span_pitch);
+      if (copy_native &&
+          !draw_util::GetResolveInfo(register_file(), memory, 1, 1, fixed_16_truncated_to_minus_1_to_1,
+                                     fixed_16_truncated_to_minus_1_to_1, edram_layout(),
+                                     resolve_info)) {
+        return false;
+      }
+    }
+    const bool copy_dest_scaled = draw_resolution_scaled && !copy_native;
+    ID3D12RootSignature* const resolve_copy_root_signature =
+        copy_native ? resolve_copy_native_root_signature_ : resolve_copy_root_signature_;
+    ID3D12PipelineState* const* const resolve_copy_pipelines =
+        copy_native ? resolve_copy_native_pipelines_ : resolve_copy_pipelines_;
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
     draw_util::ResolveCopyShaderIndex copy_shader =
-        resolve_info.GetCopyShader(draw_resolution_scale_x(), draw_resolution_scale_y(),
+        resolve_info.GetCopyShader(copy_native ? 1 : draw_resolution_scale_x(),
+                                   copy_native ? 1 : draw_resolution_scale_y(),
                                    copy_shader_constants, copy_group_count_x, copy_group_count_y);
     assert_true(copy_group_count_x && copy_group_count_y);
     if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
@@ -1475,7 +1530,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
       bool verify = false;
       std::string verify_what;
       if (GetPath() == Path::kHostRenderTargets) {
-        if (REXCVAR_GET(direct_host_resolve)) {
+        // Not for a 1x copy: the direct shaders are made for the cache's scale.
+        if (REXCVAR_GET(direct_host_resolve) && !copy_native) {
           direct_rt =
               GetDirectResolveSource(resolve_info, copy_shader, direct_rt_tiles, direct_rt_flags);
           if (direct_rt) {
@@ -1533,7 +1589,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           uint32_t dump_rows;
           uint32_t dump_pitch;
           resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-          if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
+          if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+                                 copy_native)) {
             REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");
             return false;
           }
@@ -1542,7 +1599,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
 
       // Make sure there is memory to write to.
       bool copy_dest_committed;
-      if (draw_resolution_scaled) {
+      if (copy_dest_scaled) {
         // Committing starting with the beginning of the potentially written
         // extent, but making the buffer containing the base current as the
         // beginning of the bound buffer is the base.
@@ -1569,18 +1626,18 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         // Bindless: one-use descriptors only for the scaled destination and a direct source.
         if (command_processor_.RequestOneUseSingleViewDescriptors(
                 bindless_resources_used_
-                    ? uint32_t(draw_resolution_scaled) + uint32_t(direct_rt != nullptr)
+                    ? uint32_t(copy_dest_scaled) + uint32_t(direct_rt != nullptr)
                     : 2,
                 descriptors)) {
           if (bindless_resources_used_) {
-            if (draw_resolution_scaled) {
+            if (copy_dest_scaled) {
               descriptor_dest = descriptors[0];
             } else {
               descriptor_dest = command_processor_.GetSharedMemoryUintPow2BindlessUAVHandlePair(
                   copy_shader_info.dest_bpe_log2);
             }
             if (direct_rt) {
-              descriptor_source = descriptors[uint32_t(draw_resolution_scaled)];
+              descriptor_source = descriptors[uint32_t(copy_dest_scaled)];
             } else if (copy_shader_info.source_is_raw) {
               descriptor_source = command_processor_.GetSystemBindlessViewHandlePair(
                   D3D12CommandProcessor::SystemBindlessView::kEdramRawSRV);
@@ -1590,7 +1647,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             }
           } else {
             descriptor_dest = descriptors[0];
-            if (!draw_resolution_scaled) {
+            if (!copy_dest_scaled) {
               shared_memory.WriteUintPow2UAVDescriptor(descriptor_dest.first,
                                                        copy_shader_info.dest_bpe_log2);
             }
@@ -1604,7 +1661,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                               copy_shader_info.source_bpe_log2);
             }
           }
-          if (draw_resolution_scaled) {
+          if (copy_dest_scaled) {
             texture_cache.CreateCurrentScaledResolveRangeUintPow2UAV(
                 descriptor_dest.first, copy_shader_info.dest_bpe_log2);
             texture_cache.TransitionCurrentScaledResolveRange(
@@ -1619,7 +1676,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           uint64_t verify_offset = 0;
           uint32_t verify_length = 0;
           auto verify_copy_destination = [&](ID3D12Resource* readback) {
-            if (draw_resolution_scaled) {
+            if (copy_dest_scaled) {
               texture_cache.MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
               texture_cache.TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_COPY_SOURCE);
             } else {
@@ -1629,7 +1686,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             command_processor_.SubmitBarriers();
             command_list.D3DCopyBufferRegion(readback, 0, verify_source, verify_offset,
                                              verify_length);
-            if (draw_resolution_scaled) {
+            if (copy_dest_scaled) {
               texture_cache.TransitionCurrentScaledResolveRange(
                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             } else {
@@ -1637,7 +1694,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             }
           };
           if (verify) {
-            if (draw_resolution_scaled) {
+            if (copy_dest_scaled) {
               verify_source = texture_cache.GetCurrentScaledResolveBufferResource();
               verify_offset =
                   texture_cache.GetCurrentScaledResolveRangeStartScaled() -
@@ -1676,10 +1733,10 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                     : command_processor_.GetEdramUintPow2BindlessSRVHandlePair(
                           copy_shader_info.source_bpe_log2);
             TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
+            command_list.D3DSetComputeRootSignature(resolve_copy_root_signature);
             command_list.D3DSetComputeRootDescriptorTable(2, edram_source.second);
             command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
-            if (draw_resolution_scaled) {
+            if (copy_dest_scaled) {
               command_list.D3DSetComputeRoot32BitConstants(
                   0, sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t),
                   &copy_shader_constants.dest_relative, 0);
@@ -1687,7 +1744,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
               command_list.D3DSetComputeRoot32BitConstants(
                   0, sizeof(copy_shader_constants) / sizeof(uint32_t), &copy_shader_constants, 0);
             }
-            command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
+            command_processor_.SetExternalPipeline(resolve_copy_pipelines[size_t(copy_shader)]);
             command_processor_.SubmitBarriers();
             command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
             verify_copy_destination(verify_readback[0]);
@@ -1706,14 +1763,14 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
 
           // Submit the resolve.
           command_list.D3DSetComputeRootSignature(
-              direct_rt ? direct_resolve_root_signature_color_ : resolve_copy_root_signature_);
+              direct_rt ? direct_resolve_root_signature_color_ : resolve_copy_root_signature);
           command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
           command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
           // The shader's constants: the copy's (without dest_base when scaled), then for a direct
           // resolve the render target's tiles and flags.
           uint32_t root_constants[sizeof(copy_shader_constants) / sizeof(uint32_t) + 2];
           uint32_t root_constant_count =
-              uint32_t((draw_resolution_scaled ? sizeof(copy_shader_constants.dest_relative)
+              uint32_t((copy_dest_scaled ? sizeof(copy_shader_constants.dest_relative)
                                                : sizeof(copy_shader_constants)) /
                        sizeof(uint32_t));
           std::memcpy(root_constants, &copy_shader_constants, root_constant_count * sizeof(uint32_t));
@@ -1725,7 +1782,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           command_processor_.SetExternalPipeline(
               direct_rt ? direct_resolve_fast_32bpp_pipelines_[size_t(
                               direct_rt->key().msaa_samples == xenos::MsaaSamples::k2X)]
-                        : resolve_copy_pipelines_[size_t(copy_shader)]);
+                        : resolve_copy_pipelines[size_t(copy_shader)]);
           command_processor_.SubmitBarriers();
           command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
           if (verify) {
@@ -1738,7 +1795,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           }
 
           // Order the resolve with other work using the destination as a UAV.
-          if (draw_resolution_scaled) {
+          if (copy_dest_scaled) {
             texture_cache.MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
           } else {
             shared_memory.MarkUAVWritesCommitNeeded();
@@ -1746,7 +1803,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
 
           // gpu_native_resolves: the textures viewing the destination that are up to date now
           // stay up to date if the resolved region is also copied into them on the host.
-          const bool native_resolve = REXCVAR_GET(gpu_native_resolves) &&
+          // Not for a 1x copy: its textures load the unscaled data from shared memory.
+          const bool native_resolve = REXCVAR_GET(gpu_native_resolves) && !copy_native &&
                                       GetPath() == Path::kHostRenderTargets &&
                                       IsNativeResolveEligible(resolve_info);
           if (native_resolve) {
@@ -1760,12 +1818,15 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                             resolve_info.copy_dest_extent_length,
-                                            draw_resolution_scaled);
+                                            copy_dest_scaled);
           if (native_resolve) {
             WriteResolveToTextures(resolve_info, texture_cache);
           }
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
+          if (written_scaled_out) {
+            *written_scaled_out = copy_dest_scaled;
+          }
           copied = true;
         }
       } else {
@@ -5573,8 +5634,9 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // fits in it, while 80x16 doesn't.
   a.OpDclThreadGroup(40, 16, 1);
 
-  uint32_t draw_resolution_scale_x = this->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = this->draw_resolution_scale_y();
+  // Dumps for resolves whose sources are all 1x use the plain 1x tile layout.
+  uint32_t draw_resolution_scale_x = key.native_layout ? 1 : this->draw_resolution_scale_x();
+  uint32_t draw_resolution_scale_y = key.native_layout ? 1 : this->draw_resolution_scale_y();
 
   // For now, as the exact addressing in 64bpp render targets relatively to
   // 32bpp is unknown, treating 64bpp tiles as storing 40x16 samples rather than
@@ -5784,6 +5846,12 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
       // r0.w = sample index within the source pixel
       a.OpUShR(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
     }
+    if (key.source_scale_native && !key.native_layout && IsDrawResolutionScaled()) {
+      // A 1x source dumped to the scaled EDRAM layout: duplicate its guest pixels into every
+      // scaled sample slot covering them (after the sample index is taken: MSAA isn't scaled).
+      a.OpUDiv(dxbc::Dest::R(0, 0b0011), dxbc::Dest::Null(), dxbc::Src::R(0),
+               dxbc::Src::LU(this->draw_resolution_scale_x(), this->draw_resolution_scale_y(), 1, 1));
+    }
     // Load the source to r1.
     // r0.x = X pixel position within the source texture if stencil is needed
     // r0.y = Y pixel position within the source texture if stencil is needed
@@ -5804,6 +5872,12 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
                dxbc::Src::R(0, dxbc::Src::kWWWW));
     }
   } else {
+    if (key.source_scale_native && !key.native_layout && IsDrawResolutionScaled()) {
+      // A 1x source dumped to the scaled EDRAM layout: duplicate its guest pixels into every
+      // scaled sample slot covering them (after the sample index is taken: MSAA isn't scaled).
+      a.OpUDiv(dxbc::Dest::R(0, 0b0011), dxbc::Dest::Null(), dxbc::Src::R(0),
+               dxbc::Src::LU(this->draw_resolution_scale_x(), this->draw_resolution_scale_y(), 1, 1));
+    }
     // Write the LOD index (0) to the register with texture coordinates for
     // loading from the single-sampled source texture.
     // r0.x = X pixel position within the source texture
@@ -6101,7 +6175,8 @@ D3D12RenderTargetCache::D3D12RenderTarget* D3D12RenderTargetCache::GetDirectReso
 }
 
 bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
-                                               uint32_t dump_rows, uint32_t dump_pitch) {
+                                               uint32_t dump_rows, uint32_t dump_pitch,
+                                               bool native_layout) {
   assert_true(GetPath() == Path::kHostRenderTargets);
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
@@ -6149,6 +6224,10 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
     pipeline_key.msaa_samples = rt_key.msaa_samples;
     pipeline_key.resource_format = rt_key.resource_format;
     pipeline_key.is_depth = rt_key.is_depth;
+    // The 1x layout is only for resolves whose sources are all 1x.
+    assert_true(!native_layout || rt_key.scale_native);
+    pipeline_key.source_scale_native = rt_key.scale_native;
+    pipeline_key.native_layout = uint32_t(native_layout);
     dump_invocations_.emplace_back(rectangle, pipeline_key);
   }
   // 32bpp and 64bpp.
@@ -6307,9 +6386,11 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
       command_processor_.SubmitBarriers();
       // Processing 40 x 16 x scale samples per dispatch (a 32bpp tile in two
       // dispatches at 1x1 scale, 64bpp in one dispatch).
-      command_list.D3DDispatch((dispatch.width_tiles * draw_resolution_scale_x())
-                                   << uint32_t(!format_is_64bpp),
-                               dispatch.height_tiles * draw_resolution_scale_y(), 1);
+      // The 1x layout has a 1x footprint.
+      command_list.D3DDispatch(
+          (dispatch.width_tiles * (native_layout ? 1 : draw_resolution_scale_x()))
+              << uint32_t(!format_is_64bpp),
+          dispatch.height_tiles * (native_layout ? 1 : draw_resolution_scale_y()), 1);
     }
     MarkEdramBufferModified();
   }
