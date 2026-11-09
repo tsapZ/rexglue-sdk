@@ -171,6 +171,16 @@ class RenderTargetCache {
     return draw_resolution_scale_x() > 1 || draw_resolution_scale_y() > 1;
   }
 
+  // draw_resolution_scale_threshold (from Xenia Canary 74db632ab3): whether surfaces with this
+  // pitch render at 1x. Compares the tile-aligned width, so it's a pure function of key fields.
+  bool IsScaleNativeForPitch(uint32_t pitch_tiles_at_32bpp, xenos::MsaaSamples msaa_samples) const;
+  // The same for the current RB_SURFACE_INFO.
+  bool IsDrawScaleNative() const;
+  // Scale of the current draw: the global scale, or 1x1 under the threshold. Everything per draw
+  // must use these so a draw never mixes scales.
+  uint32_t GetDrawScaleX() const { return IsDrawScaleNative() ? 1 : draw_resolution_scale_x(); }
+  uint32_t GetDrawScaleY() const { return IsDrawScaleNative() ? 1 : draw_resolution_scale_y(); }
+
   // Virtual (both the common code and the implementation may do something
   // here), don't call from destructors (does work not needed for shutdown
   // also).
@@ -251,6 +261,11 @@ class RenderTargetCache {
       uint32_t is_depth : 1;                                      // 23
       // Ignoring the blending precision and sRGB.
       uint32_t resource_format : xenos::kRenderTargetFormatBits;  // 27
+      // 1 if this render target is kept at the guest's resolution because of
+      // draw_resolution_scale_threshold. Native and scaled targets at the same base are distinct
+      // objects, and ownership can be transferred between them. The only classes are the global
+      // scale and 1x1.
+      uint32_t scale_native : 1;  // 28
     };
 
     RenderTargetKey() : key(0) { static_assert_size(*this, sizeof(key)); }
@@ -297,10 +312,18 @@ class RenderTargetCache {
     uint32_t GetWidth() const { return GetWidth(pitch_tiles_at_32bpp, msaa_samples); }
 
     std::string GetDebugName() const {
-      return fmt::format("RT @ {}t, <{}t>, {}xMSAA, {}", base_tiles, GetPitchTiles(),
-                         uint32_t(1) << uint32_t(msaa_samples), GetFormatName());
+      return fmt::format("RT @ {}t, <{}t>, {}xMSAA, {}{}", base_tiles, GetPitchTiles(),
+                         uint32_t(1) << uint32_t(msaa_samples), GetFormatName(), scale_native ? ", native" : "");
     }
   };
+
+  // The scale this render target is created and drawn at.
+  uint32_t GetKeyScaleX(RenderTargetKey key) const {
+    return key.scale_native ? 1 : draw_resolution_scale_x();
+  }
+  uint32_t GetKeyScaleY(RenderTargetKey key) const {
+    return key.scale_native ? 1 : draw_resolution_scale_y();
+  }
 
   class RenderTarget {
    public:
@@ -562,6 +585,12 @@ class RenderTargetCache {
   // need to be done (false in both empty and error cases).
   // TODO(Triang3l): Try to defer clears until the first draw in the next pass
   // (if it uses one or both render targets being cleared) for tile-based GPUs.
+  // True if everything owning the resolve source region is at the native scale: the resolve can
+  // then be done at 1x1 into shared memory instead of duplicating pixels into the scaled layout.
+  // Decided from the actual ownership, since one range can span both classes.
+  bool IsResolveSourceNativeOnly(uint32_t base, uint32_t row_length, uint32_t rows,
+                                 uint32_t pitch) const;
+
   bool PrepareHostRenderTargetsResolveClear(const draw_util::ResolveInfo& resolve_info,
                                             Transfer::Rectangle& clear_rectangle_out,
                                             RenderTarget*& depth_render_target_out,
