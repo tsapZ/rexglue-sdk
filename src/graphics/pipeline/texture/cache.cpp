@@ -356,7 +356,8 @@ void TextureCache::BeginFrame() {
   ResetTextureBindings();
 }
 
-void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
+void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                                       bool resolution_scaled) {
   if (length_unscaled == 0) {
     return;
   }
@@ -378,9 +379,18 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
       if (i == block_last && (page_last & 31) != 31) {
         add_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
       }
-      pages_changed |= (scaled_resolve_pages_[i] & add_bits) != add_bits;
-      scaled_resolve_pages_[i] |= add_bits;
-      scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
+      if (resolution_scaled) {
+        pages_changed |= (scaled_resolve_pages_[i] & add_bits) != add_bits;
+        scaled_resolve_pages_[i] |= add_bits;
+        scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
+      } else {
+        // Resolved at 1x into shared memory: clear the pages as the CPU write watch does.
+        pages_changed |= (scaled_resolve_pages_[i] & add_bits) != 0;
+        scaled_resolve_pages_[i] &= ~add_bits;
+        if (!scaled_resolve_pages_[i]) {
+          scaled_resolve_pages_l2_[i >> 6] &= ~(UINT64_C(1) << (i & 63));
+        }
+      }
     }
     if (pages_changed) {
       scaled_resolve_pages_generation_.fetch_add(1, std::memory_order_release);

@@ -80,7 +80,11 @@ class TextureCache {
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
 
-  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // Marks the range as holding resolved data and invalidates the textures overlapping it.
+  // resolution_scaled: the data went to the scaled resolve memory; false: to shared memory (a
+  // resolve at 1x under draw_resolution_scale_threshold), which clears the range's scaled state.
+  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                           bool resolution_scaled);
   // gpu_native_resolves: for the textures with the base page in the range, records whether the
   // base level is up to date, to be called right before MarkRangeAsResolved invalidates them.
   void CaptureUpToDateBeforeResolve(uint32_t start, uint32_t length);

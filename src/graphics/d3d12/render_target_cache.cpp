@@ -1759,7 +1759,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
 
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
-                                            resolve_info.copy_dest_extent_length);
+                                            resolve_info.copy_dest_extent_length,
+                                            draw_resolution_scaled);
           if (native_resolve) {
             WriteResolveToTextures(resolve_info, texture_cache);
           }
