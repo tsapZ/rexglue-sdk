@@ -59,6 +59,12 @@ REXCVAR_DEFINE_BOOL(transfer_skip_overwritten_verify, false, "GPU",
 
 REXCVAR_DEFINE_BOOL(direct_host_resolve_keep_dump, false, "GPU",
                     "Debug: with direct_host_resolve, still dump the render targets to the EDRAM buffer");
+REXCVAR_DEFINE_BOOL(direct_host_resolve_depth, true, "GPU",
+                    "With direct_host_resolve: depth resolves from 1x depth render targets also "
+                    "copy straight from the render target (false: they dump to the EDRAM buffer first)");
+REXCVAR_DEFINE_BOOL(direct_host_resolve_uint, true, "GPU",
+                    "With direct_host_resolve: resolves from 1x k_32_FLOAT, k_16_16 and k_16_16_FLOAT "
+                    "render targets also copy straight from the render target (false: they dump first)");
 
 namespace rex::graphics::d3d12 {
 
@@ -86,6 +92,14 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_2xmsaa_4096_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_2xmsaa_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_2xmsaa_scaled_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_uint_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_uint_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_uint_scaled_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_uint_scaled_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_depth_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_depth_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_depth_scaled_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_depth_scaled_4096_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_4096_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_scaled_cs.h"
@@ -433,9 +447,26 @@ bool D3D12RenderTargetCache::Initialize() {
       // Not fatal: every resolve then dumps, as without direct resolve.
       REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the direct resolve root signature");
     }
+    // Depth: the depth SRV (t0) in parameter 2 as for colour, the stencil SRV (t1) in its own
+    // table (one-use bindless descriptors aren't contiguous).
+    std::array<D3D12_ROOT_PARAMETER, 4> direct_depth_root_parameters;
+    std::copy(direct_resolve_root_parameters.begin(), direct_resolve_root_parameters.end(),
+              direct_depth_root_parameters.begin());
+    D3D12_DESCRIPTOR_RANGE direct_stencil_range = resolve_copy_source_range;
+    direct_stencil_range.BaseShaderRegister = 1;
+    direct_depth_root_parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    direct_depth_root_parameters[3].DescriptorTable.NumDescriptorRanges = 1;
+    direct_depth_root_parameters[3].DescriptorTable.pDescriptorRanges = &direct_stencil_range;
+    direct_depth_root_parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    direct_resolve_root_signature_desc.NumParameters = UINT(direct_depth_root_parameters.size());
+    direct_resolve_root_signature_desc.pParameters = direct_depth_root_parameters.data();
+    direct_resolve_root_signature_depth_ =
+        ui::d3d12::util::CreateRootSignature(provider, direct_resolve_root_signature_desc);
+    if (direct_resolve_root_signature_depth_ == nullptr) {
+      // Not fatal: depth resolves then dump.
+      REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the direct depth resolve root signature");
+    }
   }
-  direct_resolve_root_signature_depth_ = resolve_copy_root_signature_;
-  direct_resolve_root_signature_depth_->AddRef();
   if (draw_resolution_scaled) {
     // For resolves whose sources are all 1x: full constants with the destination base, as
     // without scaling.
@@ -536,6 +567,41 @@ bool D3D12RenderTargetCache::Initialize() {
           fmt::format("Resolve Direct Fast 32bpp {}xMSAA", i + 1));
       pipeline->SetName(reinterpret_cast<LPCWSTR>(pipeline_name.c_str()));
       direct_resolve_fast_32bpp_pipelines_[i] = pipeline;
+    }
+    // 1x integer colour (the colour root signature) and depth (its own).
+    Code uint_code = draw_resolution_scaled
+        ? (extended ? Code{shaders::resolve_direct_fast_32bpp_1xmsaa_uint_scaled_4096_cs,
+                           sizeof(shaders::resolve_direct_fast_32bpp_1xmsaa_uint_scaled_4096_cs)}
+                    : Code{shaders::resolve_direct_fast_32bpp_1xmsaa_uint_scaled_cs,
+                           sizeof(shaders::resolve_direct_fast_32bpp_1xmsaa_uint_scaled_cs)})
+        : (extended ? Code{shaders::resolve_direct_fast_32bpp_1xmsaa_uint_4096_cs,
+                           sizeof(shaders::resolve_direct_fast_32bpp_1xmsaa_uint_4096_cs)}
+                    : Code{shaders::resolve_direct_fast_32bpp_1xmsaa_uint_cs,
+                           sizeof(shaders::resolve_direct_fast_32bpp_1xmsaa_uint_cs)});
+    direct_resolve_fast_32bpp_uint_pipeline_ = ui::d3d12::util::CreateComputePipeline(
+        device, uint_code.data, uint_code.size, direct_resolve_root_signature_color_);
+    if (direct_resolve_fast_32bpp_uint_pipeline_) {
+      direct_resolve_fast_32bpp_uint_pipeline_->SetName(L"Resolve Direct Fast 32bpp Uint");
+    } else {
+      REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the integer direct resolve pipeline");
+    }
+    if (direct_resolve_root_signature_depth_) {
+      Code depth_code = draw_resolution_scaled
+          ? (extended ? Code{shaders::resolve_direct_fast_32bpp_1xmsaa_depth_scaled_4096_cs,
+                             sizeof(shaders::resolve_direct_fast_32bpp_1xmsaa_depth_scaled_4096_cs)}
+                      : Code{shaders::resolve_direct_fast_32bpp_1xmsaa_depth_scaled_cs,
+                             sizeof(shaders::resolve_direct_fast_32bpp_1xmsaa_depth_scaled_cs)})
+          : (extended ? Code{shaders::resolve_direct_fast_32bpp_1xmsaa_depth_4096_cs,
+                             sizeof(shaders::resolve_direct_fast_32bpp_1xmsaa_depth_4096_cs)}
+                      : Code{shaders::resolve_direct_fast_32bpp_1xmsaa_depth_cs,
+                             sizeof(shaders::resolve_direct_fast_32bpp_1xmsaa_depth_cs)});
+      direct_resolve_fast_32bpp_depth_pipeline_ = ui::d3d12::util::CreateComputePipeline(
+          device, depth_code.data, depth_code.size, direct_resolve_root_signature_depth_);
+      if (direct_resolve_fast_32bpp_depth_pipeline_) {
+        direct_resolve_fast_32bpp_depth_pipeline_->SetName(L"Resolve Direct Fast 32bpp Depth");
+      } else {
+        REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the depth direct resolve pipeline");
+      }
     }
   }
 
@@ -1235,6 +1301,8 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   for (ID3D12PipelineState*& pipeline : direct_resolve_fast_32bpp_pipelines_) {
     ui::d3d12::util::ReleaseAndNull(pipeline);
   }
+  ui::d3d12::util::ReleaseAndNull(direct_resolve_fast_32bpp_uint_pipeline_);
+  ui::d3d12::util::ReleaseAndNull(direct_resolve_fast_32bpp_depth_pipeline_);
   ui::d3d12::util::ReleaseAndNull(direct_resolve_root_signature_depth_);
   ui::d3d12::util::ReleaseAndNull(direct_resolve_root_signature_color_);
   ui::d3d12::util::ReleaseAndNull(dump_root_signature_depth_);
@@ -1527,13 +1595,14 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
       D3D12RenderTarget* direct_rt = nullptr;
       uint32_t direct_rt_tiles = 0;
       uint32_t direct_rt_flags = 0;
+      DirectResolveSourceKind direct_kind = DirectResolveSourceKind::kColor;
       bool verify = false;
       std::string verify_what;
       if (GetPath() == Path::kHostRenderTargets) {
         // Not for a 1x copy: the direct shaders are made for the cache's scale.
         if (REXCVAR_GET(direct_host_resolve) && !copy_native) {
-          direct_rt =
-              GetDirectResolveSource(resolve_info, copy_shader, direct_rt_tiles, direct_rt_flags);
+          direct_rt = GetDirectResolveSource(resolve_info, copy_shader, direct_rt_tiles,
+                                             direct_rt_flags, direct_kind);
           if (direct_rt) {
             ++direct_resolve_success_count_;
           } else {
@@ -1562,12 +1631,16 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                                            ? resolve_info.depth_edram_info
                                                            : resolve_info.color_edram_info;
             verify_what = fmt::format(
-                "span {}:{} rows {} row length {}, owner {}:{} msaa {} format {}, dest {:08X} | "
-                "resolve msaa {} format {} original base {} offset {},{} (x8) size {}x{} (x8) "
-                "half pixel {} sample {} extended {}",
+                "{} span {}:{} rows {} row length {}, owner {}:{} msaa {} format {}, dest {:08X} | ",
+                direct_kind == DirectResolveSourceKind::kDepth
+                    ? "depth"
+                    : (direct_kind == DirectResolveSourceKind::kColorUint ? "uint" : "color"),
                 base, pitch, rows, row_length, uint32_t(owner.base_tiles),
                 uint32_t(owner.pitch_tiles_at_32bpp), uint32_t(owner.msaa_samples),
-                uint32_t(owner.GetColorFormat()), resolve_info.copy_dest_base,
+                uint32_t(owner.resource_format), resolve_info.copy_dest_base) +
+                          fmt::format(
+                "resolve msaa {} format {} original base {} offset {},{} (x8) size {}x{} (x8) "
+                "half pixel {} sample {} extended {}",
                 uint32_t(edram.msaa_samples), uint32_t(edram.format),
                 resolve_info.color_original_base,
                 uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8),
@@ -1622,13 +1695,21 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         // (D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP).
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_dest;
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_source;
-        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
+        // A direct depth resolve's stencil SRV (root parameter 3).
+        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_stencil;
+        const bool direct_depth = direct_rt && direct_kind == DirectResolveSourceKind::kDepth;
+        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[3];
         // Bindless: one-use descriptors only for the scaled destination and a direct source.
         if (command_processor_.RequestOneUseSingleViewDescriptors(
-                bindless_resources_used_
-                    ? uint32_t(copy_dest_scaled) + uint32_t(direct_rt != nullptr)
-                    : 2,
+                bindless_resources_used_ ? uint32_t(copy_dest_scaled) +
+                                               uint32_t(direct_rt != nullptr) +
+                                               uint32_t(direct_depth)
+                                         : 2 + uint32_t(direct_depth),
                 descriptors)) {
+          if (direct_depth) {
+            descriptor_stencil =
+                descriptors[bindless_resources_used_ ? uint32_t(copy_dest_scaled) + 1 : 2];
+          }
           if (bindless_resources_used_) {
             if (copy_dest_scaled) {
               descriptor_dest = descriptors[0];
@@ -1750,9 +1831,16 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             verify_copy_destination(verify_readback[0]);
           }
           if (direct_rt) {
+            // The render target's own SRV: UNORM for 8_8_8_8 / 2_10_10_10, the integer ownership
+            // transfer format for the others, depth for a depth render target.
             command_processor_.GetD3D12Provider().GetDevice()->CopyDescriptorsSimple(
                 1, descriptor_source.first, direct_rt->descriptor_srv().GetHandle(),
                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            if (direct_depth) {
+              command_processor_.GetD3D12Provider().GetDevice()->CopyDescriptorsSimple(
+                  1, descriptor_stencil.first, direct_rt->descriptor_srv_stencil().GetHandle(),
+                  D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            }
             command_processor_.PushTransitionBarrier(
                 direct_rt->resource(),
                 direct_rt->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
@@ -1763,9 +1851,14 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
 
           // Submit the resolve.
           command_list.D3DSetComputeRootSignature(
-              direct_rt ? direct_resolve_root_signature_color_ : resolve_copy_root_signature);
+              direct_depth ? direct_resolve_root_signature_depth_
+                           : (direct_rt ? direct_resolve_root_signature_color_
+                                        : resolve_copy_root_signature));
           command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
           command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
+          if (direct_depth) {
+            command_list.D3DSetComputeRootDescriptorTable(3, descriptor_stencil.second);
+          }
           // The shader's constants: the copy's (without dest_base when scaled), then for a direct
           // resolve the render target's tiles and flags.
           uint32_t root_constants[sizeof(copy_shader_constants) / sizeof(uint32_t) + 2];
@@ -1779,10 +1872,22 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             root_constants[root_constant_count++] = direct_rt_flags;
           }
           command_list.D3DSetComputeRoot32BitConstants(0, root_constant_count, root_constants, 0);
-          command_processor_.SetExternalPipeline(
-              direct_rt ? direct_resolve_fast_32bpp_pipelines_[size_t(
-                              direct_rt->key().msaa_samples == xenos::MsaaSamples::k2X)]
-                        : resolve_copy_pipelines[size_t(copy_shader)]);
+          ID3D12PipelineState* copy_pipeline = resolve_copy_pipelines[size_t(copy_shader)];
+          if (direct_rt) {
+            switch (direct_kind) {
+              case DirectResolveSourceKind::kColorUint:
+                copy_pipeline = direct_resolve_fast_32bpp_uint_pipeline_;
+                break;
+              case DirectResolveSourceKind::kDepth:
+                copy_pipeline = direct_resolve_fast_32bpp_depth_pipeline_;
+                break;
+              default:
+                copy_pipeline = direct_resolve_fast_32bpp_pipelines_[size_t(
+                    direct_rt->key().msaa_samples == xenos::MsaaSamples::k2X)];
+                break;
+            }
+          }
+          command_processor_.SetExternalPipeline(copy_pipeline);
           command_processor_.SubmitBarriers();
           command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
           if (verify) {
@@ -6109,13 +6214,14 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDirectResolvePipeline(
 
 D3D12RenderTargetCache::D3D12RenderTarget* D3D12RenderTargetCache::GetDirectResolveSource(
     const draw_util::ResolveInfo& resolve_info, draw_util::ResolveCopyShaderIndex copy_shader,
-    uint32_t& rt_tiles_out, uint32_t& rt_flags_out) {
+    uint32_t& rt_tiles_out, uint32_t& rt_flags_out, DirectResolveSourceKind& kind_out) {
   ++direct_resolve_attempt_count_;
   // The direct shaders are resolve_fast_32bpp_1x2xmsaa's (no sample averaging, 32bpp).
   if (copy_shader != draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA ||
       !direct_resolve_root_signature_color_) {
     return nullptr;
   }
+  const bool is_depth = resolve_info.IsCopyingDepth();
   uint32_t dump_base;
   uint32_t dump_row_length_used;
   uint32_t dump_rows;
@@ -6146,27 +6252,68 @@ D3D12RenderTargetCache::D3D12RenderTarget* D3D12RenderTargetCache::GetDirectReso
     return nullptr;
   }
   // The same for the samples: no resolve read another MSAA mode than its owner's in the check.
-  if (rt_key.msaa_samples != resolve_info.color_edram_info.msaa_samples) {
+  const draw_util::ResolveEdramInfo& edram_info =
+      is_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
+  if (rt_key.is_depth != is_depth || rt_key.msaa_samples != edram_info.msaa_samples ||
+      rt_key.msaa_samples > xenos::MsaaSamples::k2X) {
     return nullptr;
   }
-  if (rt_key.is_depth || rt_key.msaa_samples > xenos::MsaaSamples::k2X ||
-      !direct_resolve_fast_32bpp_pipelines_[size_t(rt_key.msaa_samples ==
-                                                   xenos::MsaaSamples::k2X)]) {
-    return nullptr;
-  }
-  // The dump's packing for the render target's format, read through its UNORM SRV.
+  // The dump's packing for the render target's format (see the direct shaders).
   uint32_t packing;
-  switch (rt_key.GetColorFormat()) {
-    case xenos::ColorRenderTargetFormat::k_8_8_8_8:
-      packing = 0;
-      break;
-    case xenos::ColorRenderTargetFormat::k_2_10_10_10:
-    case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
-      packing = 1;
-      break;
-    default:
+  DirectResolveSourceKind kind;
+  if (is_depth) {
+    // 1x only, through the depth and stencil SRVs.
+    if (!REXCVAR_GET(direct_host_resolve_depth) || rt_key.msaa_samples != xenos::MsaaSamples::k1X ||
+        !direct_resolve_fast_32bpp_depth_pipeline_) {
       return nullptr;
+    }
+    kind = DirectResolveSourceKind::kDepth;
+    switch (rt_key.GetDepthFormat()) {
+      case xenos::DepthRenderTargetFormat::kD24S8:
+        packing = 4;
+        break;
+      case xenos::DepthRenderTargetFormat::kD24FS8:
+        // As the dump's PreClampedDepthTo20e4 call.
+        packing = (!depth_float24_convert_in_pixel_shader() && depth_float24_round()) ? 6 : 5;
+        break;
+      default:
+        return nullptr;
+    }
+  } else {
+    switch (rt_key.GetColorFormat()) {
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+        kind = DirectResolveSourceKind::kColor;
+        packing = 0;
+        break;
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
+        kind = DirectResolveSourceKind::kColor;
+        packing = 1;
+        break;
+      // Through the integer ownership transfer SRV the dump reads too.
+      case xenos::ColorRenderTargetFormat::k_32_FLOAT:
+        kind = DirectResolveSourceKind::kColorUint;
+        packing = 2;
+        break;
+      case xenos::ColorRenderTargetFormat::k_16_16:
+      case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
+        kind = DirectResolveSourceKind::kColorUint;
+        packing = 3;
+        break;
+      default:
+        return nullptr;
+    }
+    if (kind == DirectResolveSourceKind::kColorUint) {
+      if (!REXCVAR_GET(direct_host_resolve_uint) || rt_key.msaa_samples != xenos::MsaaSamples::k1X ||
+          !direct_resolve_fast_32bpp_uint_pipeline_) {
+        return nullptr;
+      }
+    } else if (!direct_resolve_fast_32bpp_pipelines_[size_t(rt_key.msaa_samples ==
+                                                            xenos::MsaaSamples::k2X)]) {
+      return nullptr;
+    }
   }
+  kind_out = kind;
   rt_tiles_out = rt_key.base_tiles | (rt_key.pitch_tiles_at_32bpp << 16);
   rt_flags_out = packing |
                  (draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_supported_) << 4) |

@@ -9,13 +9,73 @@
 
 // Direct resolve (rex SDK): resolve_fast_32bpp_1x2xmsaa with the two EDRAM buffer loads replaced
 // by loads from the host render target that owns the whole source span, packed the way the
-// render target dump would have stored them in the EDRAM buffer (8_8_8_8 and 2_10_10_10 only,
-// UNORM storage). XE_RESOLVE_DIRECT_2XMSAA: the render target is multisampled.
+// render target dump would have stored them in the EDRAM buffer. XE_RESOLVE_DIRECT_2XMSAA: the
+// render target is multisampled.
+// Colour through its UNORM SRV: packing 0 = 8_8_8_8, 1 = 2_10_10_10.
+// XE_RESOLVE_DIRECT_UINT (1x only): colour through its integer ownership transfer SRV, as the dump
+// reads it: packing 2 = one 32-bit component (k_32_FLOAT), 3 = two 16-bit components (k_16_16,
+// k_16_16_FLOAT).
+// XE_RESOLVE_DIRECT_DEPTH (1x only): the depth SRV (t0) and the stencil SRV (t1, in .y), packed
+// as the dump packs them: 4 = D24S8, 5 = D24FS8 truncated, 6 = D24FS8 rounded to the nearest even.
+// The two are D3D12-only (HLSL types), as the direct resolve itself.
 
 #include "endian.xesli"
 #define XE_RESOLVE_DIRECT
 #define XE_RESOLVE_SOURCE_TYPE uint4_xe
 #include "resolve.xesli"
+
+#if (defined(XE_RESOLVE_DIRECT_UINT) || defined(XE_RESOLVE_DIRECT_DEPTH)) && \
+    defined(XE_RESOLVE_DIRECT_2XMSAA)
+  #error "Integer and depth direct resolves are for 1x render targets only"
+#endif
+
+#if defined(XE_RESOLVE_DIRECT_UINT)
+
+// The dump's packing of the ownership transfer SRV's integer components.
+uint XeResolveDirectPackUint(uint4_xe texel, uint packing) {
+  uint packed;
+  dont_flatten_xe
+  if (packing == 3u) {
+    packed = (texel.x & 0xFFFFu) | (texel.y << 16u);
+  } else {
+    packed = texel.x;
+  }
+  return packed;
+}
+
+#elif defined(XE_RESOLVE_DIRECT_DEPTH)
+
+// As DxbcShaderTranslator::PreClampedDepthTo20e4 with remap_from_0_to_0_5, which the dump uses:
+// the host keeps the guest's [0, 2) float24 depth as [0, 1) float32.
+uint XeResolveDirectDepthTo20e4(uint f32u32, bool round_to_nearest_even) {
+  uint f24u32;
+  dont_flatten_xe
+  if (f32u32 < 0x38000000u) {
+    f24u32 = ((f32u32 & 0x7FFFFFu) | 0x800000u) >> min(112u - (f32u32 >> 23u), 24u);
+  } else {
+    f24u32 = f32u32 + 0xC8800000u;
+  }
+  dont_flatten_xe
+  if (round_to_nearest_even) {
+    f24u32 += 3u + ((f24u32 >> 3u) & 1u);
+  }
+  return (f24u32 >> 3u) & 0xFFFFFFu;
+}
+
+// The dump's depth and stencil packing: 24-bit depth in bits 8:31, stencil in 0:7.
+uint XeResolveDirectPackDepth(float depth, uint stencil, uint packing) {
+  uint depth24;
+  dont_flatten_xe
+  if (packing == 4u) {
+    // D24S8: round to the nearest even, as the dump does.
+    depth24 = uint(round(depth * 16777215.0f));
+  } else {
+    depth24 = XeResolveDirectDepthTo20e4(asuint(depth), packing == 6u);
+  }
+  return (depth24 << 8u) | (stencil & 0xFFu);
+}
+
+#else
 
 // The render target dump's packing (round to nearest, as MAd 0.5 + FToU there).
 uint XeResolveDirectPack32bpp(float4_xe color, uint packing) {
@@ -32,6 +92,8 @@ uint XeResolveDirectPack32bpp(float4_xe color, uint packing) {
   return packed;
 }
 
+#endif
+
 array_buffer_wo_declare_xe(uint4_xe, xe_resolve_dest, set=1, binding=0, u0,
                            space0)
 #define LOCAL_SIZE_X_XE 8
@@ -42,7 +104,16 @@ entry_bindings_begin_compute_xe
   entry_binding_next_xe
   array_buffer_wo_binding_xe(uint4_xe, xe_resolve_dest, buffer(1))
   entry_binding_next_xe
-  #ifdef XE_RESOLVE_DIRECT_2XMSAA
+  #if defined(XE_RESOLVE_DIRECT_UINT)
+    texture_xe(Texture2D<uint4_xe>, xe_resolve_direct_source, set=0, binding=0,
+               t0, space0, texture(0))
+  #elif defined(XE_RESOLVE_DIRECT_DEPTH)
+    texture_xe(texture_2d_xe, xe_resolve_direct_source, set=0, binding=0, t0,
+               space0, texture(0))
+    entry_binding_next_xe
+    texture_xe(Texture2D<uint4_xe>, xe_resolve_direct_stencil, set=0,
+               binding=1, t1, space0, texture(1))
+  #elif defined(XE_RESOLVE_DIRECT_2XMSAA)
     texture_xe(texture_2d_ms_xe, xe_resolve_direct_source, set=0, binding=0,
                t0, space0, texture(0))
   #else
@@ -78,7 +149,8 @@ entry_inputs_end_code_begin_compute_xe
               tile_xy.y * resolve_info.edram_pitch_tiles + tile_xy.x;
   sample_xy -= tile_xy * tile_size;
   // The same sample in the render target: its tiles are laid out linearly from its base with its
-  // own pitch (the dump's mapping), EDRAM addressing wrapping around.
+  // own pitch (the dump's mapping), EDRAM addressing wrapping around. A depth render target is
+  // dumped and resolved with the same half-tile swap, so its samples map the same way.
   uint rt_tiles = push_const_xe(xe_resolve_direct_rt_tiles);
   uint rt_flags = push_const_xe(xe_resolve_direct_rt_flags);
   uint rt_pitch_tiles = max(rt_tiles >> 16u, 1u);
@@ -88,7 +160,22 @@ entry_inputs_end_code_begin_compute_xe
                tile_size;
   uint packing = rt_flags & 0xFu;
   uint pixels[8];
-  #ifdef XE_RESOLVE_DIRECT_2XMSAA
+  #if defined(XE_RESOLVE_DIRECT_UINT)
+    int2_xe rt_pixel = int2_xe(sample_xy);
+    for (int i = 0; i < 8; ++i) {
+      pixels[i] = XeResolveDirectPackUint(
+          texel_fetch_2d_xe(xe_resolve_direct_source, rt_pixel + int2_xe(i, 0), 0),
+          packing);
+    }
+  #elif defined(XE_RESOLVE_DIRECT_DEPTH)
+    int2_xe rt_pixel = int2_xe(sample_xy);
+    for (int i = 0; i < 8; ++i) {
+      pixels[i] = XeResolveDirectPackDepth(
+          texel_fetch_2d_xe(xe_resolve_direct_source, rt_pixel + int2_xe(i, 0), 0).x,
+          texel_fetch_2d_xe(xe_resolve_direct_stencil, rt_pixel + int2_xe(i, 0), 0).y,
+          packing);
+    }
+  #elif defined(XE_RESOLVE_DIRECT_2XMSAA)
     uint host_sample = (sample_xy.y & 1u) != 0u ? ((rt_flags >> 6u) & 3u)
                                                 : ((rt_flags >> 4u) & 3u);
     int2_xe rt_pixel = int2_xe(int(sample_xy.x), int(sample_xy.y >> 1u));

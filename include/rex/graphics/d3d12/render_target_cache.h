@@ -674,13 +674,24 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   ID3D12PipelineState* GetOrCreateDumpPipeline(DumpPipelineKey key);
   ID3D12PipelineState* GetOrCreateDirectResolvePipeline(DirectResolvePipelineKey key);
+  // Which direct resolve shader reads the render target.
+  enum class DirectResolveSourceKind : uint32_t {
+    // Colour through its UNORM SRV (8_8_8_8, 2_10_10_10), 1x or 2x MSAA.
+    kColor,
+    // Colour through its integer ownership transfer SRV (k_32_FLOAT, k_16_16, k_16_16_FLOAT), 1x.
+    kColorUint,
+    // Depth and stencil through their SRVs (D24S8, D24FS8), 1x.
+    kDepth,
+  };
   // Direct resolve: the render target to copy from instead of dumping to the EDRAM buffer, when
   // one render target owns the resolve's whole source span and the copy is one the direct shaders
-  // do (fast 32bpp, 8_8_8_8 or 2_10_10_10 at 1x or 2x MSAA); else nullptr. rt_tiles_out and
-  // rt_flags_out are the shader's xe_resolve_direct_rt_tiles / _flags.
+  // do (fast 32bpp: 8_8_8_8 or 2_10_10_10 at 1x or 2x MSAA, or at 1x k_32_FLOAT, k_16_16,
+  // k_16_16_FLOAT and depth); else nullptr. rt_tiles_out and rt_flags_out are the shader's
+  // xe_resolve_direct_rt_tiles / _flags, kind_out the shader family.
   D3D12RenderTarget* GetDirectResolveSource(const draw_util::ResolveInfo& resolve_info,
                                             draw_util::ResolveCopyShaderIndex copy_shader,
-                                            uint32_t& rt_tiles_out, uint32_t& rt_flags_out);
+                                            uint32_t& rt_tiles_out, uint32_t& rt_flags_out,
+                                            DirectResolveSourceKind& kind_out);
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
@@ -822,6 +833,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       direct_resolve_pipelines_;
   // resolve_direct_fast_32bpp_{1x,2x}msaa, at the draw resolution scale and EDRAM size in use.
   ID3D12PipelineState* direct_resolve_fast_32bpp_pipelines_[2] = {};
+  // resolve_direct_fast_32bpp_1xmsaa_uint and _depth (the depth one with
+  // direct_resolve_root_signature_depth_: the stencil SRV in a fourth parameter).
+  ID3D12PipelineState* direct_resolve_fast_32bpp_uint_pipeline_ = nullptr;
+  ID3D12PipelineState* direct_resolve_fast_32bpp_depth_pipeline_ = nullptr;
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
