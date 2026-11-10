@@ -1658,6 +1658,25 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
     ++counts.written;
     note_mirror(d3d12_texture);
   });
+  // gpu_lazy_resolve_copies: textures written, none holding the whole rectangle - which sizes they
+  // have against the rectangle, each kind once (16 at most).
+  if (counts.written && !counts.mirror && REXCVAR_GET(gpu_texture_load_report)) {
+    static std::set<uint64_t> logged;
+    const uint64_t kind = uint64_t(write.base_page) ^ (uint64_t(write.dest_x) << 20) ^
+                          (uint64_t(write.dest_y) << 32) ^ (uint64_t(write.width) << 44) ^
+                          (uint64_t(write.height) << 54);
+    if (logged.size() < 16 && logged.insert(kind).second) {
+      std::string sizes;
+      ForEachTextureAtBasePage(write.base_page, [&](Texture& texture) {
+        const TextureKey& key = texture.key();
+        sizes += fmt::format(" {}x{} f{} p{}", key.GetWidth(), key.GetHeight(), uint32_t(key.format),
+                             uint32_t(key.pitch));
+      });
+      REXGPU_INFO("LAZYRESOLVE no mirror: base {:05X} rect {},{} {}x{} format {} pitch {}; textures:{}",
+                  write.base_page, write.dest_x, write.dest_y, write.width, write.height,
+                  uint32_t(write.format), write.pitch, sizes);
+    }
+  }
 }
 
 bool D3D12TextureCache::RebuildLazyResolveCopy(const LazyResolveCopy& copy, D3D12Texture& mirror) {

@@ -846,6 +846,25 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // gpu_lazy_resolve_copies: resolve_lazy_rebuild_32bpp_scaled (the colour root signature), handed
   // to the texture cache, which rebuilds the skipped copies.
   ID3D12PipelineState* lazy_rebuild_pipeline_ = nullptr;
+  // What became of the copies since the last report (every few seconds): at 1x (threshold), not a
+  // direct resolve, integer or depth, not k_8_8_8_8, not written natively, another setting,
+  // written without a texture holding the rectangle, waiting (skipped), made and verified.
+  enum class LazyOutcome : uint32_t {
+    kNative1x,
+    kNotDirect,
+    kKind,
+    kFormat,
+    kNotNative,
+    kOther,
+    kNoMirror,
+    kSkipped,
+    kVerified,
+    kCount,
+  };
+  std::array<uint64_t, size_t(LazyOutcome::kCount)> lazy_outcomes_ = {};
+  std::chrono::steady_clock::time_point lazy_outcomes_last_report_ =
+      std::chrono::steady_clock::now();
+  void CountLazyOutcome(LazyOutcome outcome);
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;

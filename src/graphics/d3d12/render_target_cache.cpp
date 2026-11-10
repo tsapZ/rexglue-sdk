@@ -1808,21 +1808,43 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
       // the textures are written first, and if one holds the whole rectangle the copy waits.
       bool native_written = false;
       bool lazy_mirror = false;
-      if (lazy_tracking && native_resolve && REXCVAR_GET(gpu_lazy_resolve_copies) && direct_rt &&
-          (direct_kind == DirectResolveSourceKind::kColor ||
-           direct_kind == DirectResolveSourceKind::kColorFull) &&
-          !verify && !REXCVAR_GET(direct_host_resolve_keep_dump) &&
-          !REXCVAR_GET(d3d12_readback_resolve) &&
-          uint32_t(resolve_info.copy_dest_info.copy_dest_format) ==
-              uint32_t(xenos::TextureFormat::k_8_8_8_8)) {
+      const bool lazy_enabled = REXCVAR_GET(gpu_lazy_resolve_copies);
+      const bool lazy_direct_color =
+          direct_rt && (direct_kind == DirectResolveSourceKind::kColor ||
+                        direct_kind == DirectResolveSourceKind::kColorFull);
+      const bool lazy_8888 = uint32_t(resolve_info.copy_dest_info.copy_dest_format) ==
+                             uint32_t(xenos::TextureFormat::k_8_8_8_8);
+      const bool lazy_settings_ok = !verify && !REXCVAR_GET(direct_host_resolve_keep_dump) &&
+                                    !REXCVAR_GET(d3d12_readback_resolve);
+      if (lazy_enabled && !resolve_info.IsCopyingDepth()) {
+        if (!lazy_tracking) {
+          CountLazyOutcome(copy_native ? LazyOutcome::kNative1x : LazyOutcome::kOther);
+        } else if (!direct_rt) {
+          CountLazyOutcome(LazyOutcome::kNotDirect);
+        } else if (!lazy_direct_color) {
+          CountLazyOutcome(LazyOutcome::kKind);
+        } else if (!lazy_8888) {
+          CountLazyOutcome(LazyOutcome::kFormat);
+        } else if (!native_resolve) {
+          CountLazyOutcome(LazyOutcome::kNotNative);
+        } else if (!lazy_settings_ok) {
+          CountLazyOutcome(LazyOutcome::kOther);
+        }
+      }
+      if (lazy_tracking && native_resolve && lazy_enabled && lazy_direct_color && lazy_settings_ok &&
+          lazy_8888) {
         texture_cache.CaptureUpToDateBeforeResolve(
             resolve_info.copy_dest_base, lazy.current_length);
         texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                           resolve_info.copy_dest_extent_length, copy_dest_scaled);
         lazy_mirror = WriteResolveToTextures(resolve_info, texture_cache);
         native_written = true;
-        if (lazy_mirror && !REXCVAR_GET(gpu_lazy_resolve_copies_verify) &&
-            texture_cache.AddLazyResolveCopy(lazy)) {
+        if (!lazy_mirror) {
+          CountLazyOutcome(LazyOutcome::kNoMirror);
+        } else if (REXCVAR_GET(gpu_lazy_resolve_copies_verify)) {
+          CountLazyOutcome(LazyOutcome::kVerified);
+        } else if (texture_cache.AddLazyResolveCopy(lazy)) {
+          CountLazyOutcome(LazyOutcome::kSkipped);
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           if (written_scaled_out) {
@@ -7121,6 +7143,25 @@ bool D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
   CountNativeResolveFallback(NativeResolveFallback::kDescriptors, counts.descriptors);
   ReportNativeResolves();
   return counts.mirror;
+}
+
+void D3D12RenderTargetCache::CountLazyOutcome(LazyOutcome outcome) {
+  ++lazy_outcomes_[size_t(outcome)];
+  const auto now = std::chrono::steady_clock::now();
+  if (now - lazy_outcomes_last_report_ < std::chrono::seconds(5)) {
+    return;
+  }
+  lazy_outcomes_last_report_ = now;
+  static const char* const kNames[size_t(LazyOutcome::kCount)] = {
+      "1x", "not_direct", "kind", "format", "not_native", "other", "no_mirror", "skipped", "verified"};
+  std::string text;
+  for (size_t i = 0; i < size_t(LazyOutcome::kCount); ++i) {
+    if (lazy_outcomes_[i]) {
+      text += fmt::format(" {}={}", kNames[i], lazy_outcomes_[i]);
+    }
+  }
+  REXGPU_INFO("LAZYRESOLVE colour copies:{}", text);
+  lazy_outcomes_ = {};
 }
 
 void D3D12RenderTargetCache::ReportNativeResolves() {
