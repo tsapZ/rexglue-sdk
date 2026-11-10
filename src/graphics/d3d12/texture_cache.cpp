@@ -1453,11 +1453,14 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
   const uint32_t scale_x = draw_resolution_scale_x();
   const uint32_t scale_y = draw_resolution_scale_y();
   // gpu_lazy_resolve_copies: a written texture containing the whole rectangle mirrors the
-  // destination memory there.
+  // destination memory there. The rectangle is rounded up to 8 pixels (1040x620 resolves as
+  // 1040x624): up to 7 more columns and rows than the texture are its padding, which the rebuild
+  // leaves out.
   auto note_mirror = [&](D3D12Texture& texture) {
     const TextureKey& key = texture.key();
-    if (!counts.mirror && write.dest_x + write.width <= key.GetWidth() &&
-        write.dest_y + write.height <= key.GetHeight()) {
+    if (!counts.mirror && write.dest_x < key.GetWidth() && write.dest_y < key.GetHeight() &&
+        write.dest_x + write.width < key.GetWidth() + 8 &&
+        write.dest_y + write.height < key.GetHeight() + 8) {
       counts.mirror = true;
       last_native_resolve_mirror_ = &texture;
     }
@@ -1722,8 +1725,15 @@ bool D3D12TextureCache::RebuildLazyResolveCopy(const LazyResolveCopy& copy, D3D1
   // As the direct resolve colour root signature lays them out: constants, destination, source.
   command_list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
   command_list.D3DSetComputeRootDescriptorTable(2, descriptors[1].second);
-  command_list.D3DSetComputeRoot32BitConstants(0, copy.root_constant_count,
-                                               copy.root_constants.data(), 0);
+  // The first of the two direct resolve constants: the mirror's scaled size (the rebuild writes
+  // nothing past it).
+  std::array<uint32_t, 8> root_constants = copy.root_constants;
+  const TextureKey& mirror_key = mirror.key();
+  root_constants[copy.root_constant_count - 2] =
+      std::min(mirror_key.GetWidth() * draw_resolution_scale_x(), uint32_t(0xFFFF)) |
+      (std::min(mirror_key.GetHeight() * draw_resolution_scale_y(), uint32_t(0xFFFF)) << 16);
+  command_list.D3DSetComputeRoot32BitConstants(0, copy.root_constant_count, root_constants.data(),
+                                               0);
   command_list.D3DDispatch(copy.group_count_x, copy.group_count_y, 1);
   MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
   // Leave the mirror in the state its users expect it to be in.

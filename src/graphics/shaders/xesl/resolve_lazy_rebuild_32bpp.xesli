@@ -16,6 +16,10 @@
 // does). Same dispatch, constants and destination addressing as resolve_direct_fast_32bpp (1 thread
 // = 8 scaled pixels of the resolve rectangle); xe_resolve_direct_rt_flags bits 0:3 are the packing of
 // the texture's integer view: 0 = R8G8B8A8_UINT (k_8_8_8_8), 1 = R16G16_UINT (k_16_16_FLOAT).
+// xe_resolve_direct_rt_tiles is the texture's scaled width (bits 0:15) and height (16:31): the
+// resolve rectangle is rounded up to 8 guest pixels, the texture is the game's real size, so rows
+// and 4-pixel groups past it aren't written (padding no texture of that size reads; the copy wrote
+// whatever the render target held there).
 // D3D12-only (HLSL types), as the direct resolves.
 
 #include "endian.xesli"
@@ -60,8 +64,16 @@ entry_inputs_end_code_begin_compute_xe
   }
   uint2_xe pixel_index = in_global_thread_id_xe.xy << uint2_xe(3u, 0u);
   uint packing = push_const_xe(xe_resolve_direct_rt_flags) & 0xFu;
+  uint texture_size_packed = push_const_xe(xe_resolve_direct_rt_tiles);
+  uint2_xe texture_size =
+      uint2_xe(texture_size_packed & 0xFFFFu, texture_size_packed >> 16u);
   // The surface pixel this thread's first pixel is written to, which is the texture's texel.
-  int2_xe texel = int2_xe(resolve_info.dest_xy_offset_scaled + pixel_index);
+  uint2_xe texel_first = resolve_info.dest_xy_offset_scaled + pixel_index;
+  dont_flatten_xe
+  if (texel_first.y >= texture_size.y || texel_first.x >= texture_size.x) {
+    return;
+  }
+  int2_xe texel = int2_xe(texel_first);
   uint pixels[8];
   for (int i = 0; i < 8; ++i) {
     pixels[i] = XeResolveLazyPack32bpp(
@@ -74,10 +86,13 @@ entry_inputs_end_code_begin_compute_xe
   array_buffer_store_xe(
       xe_resolve_dest, dest_address,
       XeEndianSwap32(pixels_0123, resolve_info.dest_endian_128));
-  dest_address += XeResolveDestRightConsecutiveBlocksOffset(
-                      pixel_index.x, 2u, resolve_info.resolution_scale) >> 4u;
-  array_buffer_store_xe(
-      xe_resolve_dest, dest_address,
-      XeEndianSwap32(pixels_4567, resolve_info.dest_endian_128));
+  dont_flatten_xe
+  if (texel_first.x + 4u < texture_size.x) {
+    dest_address += XeResolveDestRightConsecutiveBlocksOffset(
+                        pixel_index.x, 2u, resolve_info.resolution_scale) >> 4u;
+    array_buffer_store_xe(
+        xe_resolve_dest, dest_address,
+        XeEndianSwap32(pixels_4567, resolve_info.dest_endian_128));
+  }
 }
 entry_code_end_compute_xe
