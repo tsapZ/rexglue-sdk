@@ -3312,6 +3312,11 @@ bool D3D12CommandProcessor::ReadBackResolvedRange(uint32_t address, uint32_t len
   if (!BeginSubmission(true)) {
     return false;
   }
+  // gpu_lazy_resolve_copies: the skipped copies in the range first (this changes the current scaled
+  // resolve range, which is made current for the readback right after).
+  if (is_scaled) {
+    texture_cache_->MaterializeLazyResolveCopies(address, length);
+  }
   if (is_scaled ? !texture_cache_->MakeScaledResolveRangeCurrent(address, length)
                 : !shared_memory_->RequestRange(address, length)) {
     return false;

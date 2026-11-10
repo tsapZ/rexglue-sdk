@@ -736,6 +736,14 @@ bool D3D12TextureCache::Initialize() {
 }
 
 void D3D12TextureCache::ClearCache() {
+  // The mirrors are destroyed with the rest: their pending copies can't be rebuilt any more (the
+  // textures reload from memory, as after any cache clear).
+  if (!lazy_resolve_copies_.empty()) {
+    REXGPU_WARN("LAZYRESOLVE: {} pending copies dropped with the texture cache",
+                lazy_resolve_copies_.size());
+    lazy_resolve_copies_.clear();
+  }
+  last_native_resolve_mirror_ = nullptr;
   TextureCache::ClearCache();
 
   // Clear texture descriptor cache.
@@ -746,6 +754,12 @@ void D3D12TextureCache::ClearCache() {
 
 void D3D12TextureCache::BeginSubmission(uint64_t new_submission_index) {
   TextureCache::BeginSubmission(new_submission_index);
+
+  // gpu_lazy_resolve_copies: the mirrors of pending copies stay in the cache (the memory limit only
+  // destroys textures unused since a completed submission).
+  for (PendingLazyResolveCopy& pending : lazy_resolve_copies_) {
+    pending.mirror->MarkAsUsed();
+  }
 
   // ExecuteCommandLists is a full UAV and aliasing barrier.
   if (IsDrawResolutionScaled()) {
@@ -1431,12 +1445,23 @@ void D3D12TextureCache::TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE
 void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& write,
                                                      D3D12_RESOURCE_STATES& source_state,
                                                      NativeResolveWriteCounts& counts) {
+  last_native_resolve_mirror_ = nullptr;
   if (!write.source || !write.width || !write.height) {
     return;
   }
   const bool scaled = IsDrawResolutionScaled();
   const uint32_t scale_x = draw_resolution_scale_x();
   const uint32_t scale_y = draw_resolution_scale_y();
+  // gpu_lazy_resolve_copies: a written texture containing the whole rectangle mirrors the
+  // destination memory there.
+  auto note_mirror = [&](D3D12Texture& texture) {
+    const TextureKey& key = texture.key();
+    if (!counts.mirror && write.dest_x + write.width <= key.GetWidth() &&
+        write.dest_y + write.height <= key.GetHeight()) {
+      counts.mirror = true;
+      last_native_resolve_mirror_ = &texture;
+    }
+  };
   ForEachTextureAtBasePage(write.base_page, [&](Texture& texture) {
     const TextureKey& key = texture.key();
     if (!key.tiled || key.dimension != xenos::DataDimension::k2DOrStacked ||
@@ -1587,6 +1612,7 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
 
       MakeTextureUpToDateAndWatch(texture);
       ++counts.written;
+      note_mirror(d3d12_texture);
       return;
     }
 
@@ -1630,7 +1656,142 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
 
     MakeTextureUpToDateAndWatch(texture);
     ++counts.written;
+    note_mirror(d3d12_texture);
   });
+}
+
+bool D3D12TextureCache::RebuildLazyResolveCopy(const LazyResolveCopy& copy, D3D12Texture& mirror) {
+  // A replacement (texture_replace_dir) would be read instead of the guest's data.
+  if (!IsLazyResolveRebuildAvailable() || mirror.replaced_mip_levels() || !mirror.resource() ||
+      !copy.group_count_x || !copy.group_count_y) {
+    return false;
+  }
+  if (!EnsureScaledResolveMemoryCommitted(copy.extent_start, copy.extent_length) ||
+      !MakeScaledResolveRangeCurrent(copy.dest_base, copy.current_length)) {
+    return false;
+  }
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
+  if (!command_processor_.RequestOneUseSingleViewDescriptors(uint32_t(rex::countof(descriptors)),
+                                                             descriptors)) {
+    return false;
+  }
+  // The destination as the copy writes it (uint4 elements, resolve_copy_shader_info's
+  // dest_bpe_log2 of the fast 32bpp copy).
+  CreateCurrentScaledResolveRangeUintPow2UAV(descriptors[0].first, 4);
+  TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
+  srv_desc.Format = copy.srv_format;
+  srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv_desc.Texture2D.MostDetailedMip = 0;
+  srv_desc.Texture2D.MipLevels = 1;
+  srv_desc.Texture2D.PlaneSlice = 0;
+  srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+  ID3D12Resource* mirror_resource = mirror.resource();
+  command_processor_.GetD3D12Provider().GetDevice()->CreateShaderResourceView(
+      mirror_resource, &srv_desc, descriptors[1].first);
+  // Referenced by the command list now.
+  mirror.MarkAsUsed();
+  const D3D12_RESOURCE_STATES mirror_state =
+      mirror.SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  command_processor_.PushTransitionBarrier(mirror_resource, mirror_state,
+                                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  command_processor_.SubmitBarriers();
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  command_processor_.SetExternalPipeline(lazy_rebuild_pipeline_);
+  command_list.D3DSetComputeRootSignature(lazy_rebuild_root_signature_);
+  // As the direct resolve colour root signature lays them out: constants, destination, source.
+  command_list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
+  command_list.D3DSetComputeRootDescriptorTable(2, descriptors[1].second);
+  command_list.D3DSetComputeRoot32BitConstants(0, copy.root_constant_count,
+                                               copy.root_constants.data(), 0);
+  command_list.D3DDispatch(copy.group_count_x, copy.group_count_y, 1);
+  MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
+  // Leave the mirror in the state its users expect it to be in.
+  command_processor_.PushTransitionBarrier(mirror_resource,
+                                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                           mirror_state);
+  mirror.SetResourceState(mirror_state);
+  return true;
+}
+
+void D3D12TextureCache::PrepareLazyResolveCopiesForResolve(const LazyResolveCopy& resolve) {
+  const uint64_t end = uint64_t(resolve.extent_start) + resolve.extent_length;
+  for (size_t i = 0; i < lazy_resolve_copies_.size();) {
+    PendingLazyResolveCopy& pending = lazy_resolve_copies_[i];
+    const uint64_t pending_end = uint64_t(pending.copy.extent_start) + pending.copy.extent_length;
+    if (pending.copy.extent_start >= end || resolve.extent_start >= pending_end) {
+      ++i;
+      continue;
+    }
+    if (resolve.Covers(pending.copy)) {
+      // Overwritten completely by the resolve, by its copy or by its own pending one.
+      ++lazy_dropped_;
+    } else if (RebuildLazyResolveCopy(pending.copy, *pending.mirror)) {
+      ++lazy_rebuilt_;
+    } else {
+      ++lazy_failed_;
+    }
+    lazy_resolve_copies_.erase(lazy_resolve_copies_.begin() + i);
+  }
+  ReportLazyResolveCopies();
+}
+
+bool D3D12TextureCache::AddLazyResolveCopy(const LazyResolveCopy& copy) {
+  if (!last_native_resolve_mirror_ || !IsLazyResolveRebuildAvailable()) {
+    return false;
+  }
+  lazy_resolve_copies_.push_back({copy, last_native_resolve_mirror_});
+  ++lazy_skipped_;
+  ReportLazyResolveCopies();
+  return true;
+}
+
+void D3D12TextureCache::MaterializeLazyResolveCopies(uint32_t start, uint32_t length) {
+  if (lazy_resolve_copies_.empty() || !length) {
+    return;
+  }
+  const uint64_t end = uint64_t(start) + length;
+  for (size_t i = 0; i < lazy_resolve_copies_.size();) {
+    PendingLazyResolveCopy& pending = lazy_resolve_copies_[i];
+    const uint64_t pending_end = uint64_t(pending.copy.extent_start) + pending.copy.extent_length;
+    if (pending.copy.extent_start >= end || start >= pending_end) {
+      ++i;
+      continue;
+    }
+    if (RebuildLazyResolveCopy(pending.copy, *pending.mirror)) {
+      ++lazy_rebuilt_;
+    } else {
+      ++lazy_failed_;
+    }
+    lazy_resolve_copies_.erase(lazy_resolve_copies_.begin() + i);
+  }
+  ReportLazyResolveCopies();
+}
+
+bool D3D12TextureCache::RebuildFromLastMirror(const LazyResolveCopy& copy) {
+  return last_native_resolve_mirror_ && RebuildLazyResolveCopy(copy, *last_native_resolve_mirror_);
+}
+
+void D3D12TextureCache::ReportLazyResolveCopies() {
+  const uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count());
+  if (!lazy_last_report_ms_) {
+    lazy_last_report_ms_ = now_ms;
+    return;
+  }
+  if (now_ms - lazy_last_report_ms_ < 5000) {
+    return;
+  }
+  REXGPU_INFO("LAZYRESOLVE skipped {} rebuilt {} dropped {} failed {} pending {} in {} ms",
+              lazy_skipped_, lazy_rebuilt_, lazy_dropped_, lazy_failed_,
+              lazy_resolve_copies_.size(), now_ms - lazy_last_report_ms_);
+  lazy_skipped_ = 0;
+  lazy_rebuilt_ = 0;
+  lazy_dropped_ = 0;
+  lazy_failed_ = 0;
+  lazy_last_report_ms_ = now_ms;
 }
 
 void D3D12TextureCache::CreateCurrentScaledResolveRangeUintPow2SRV(
@@ -1905,6 +2066,17 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
     }
   }
   TextureKey texture_key = d3d12_texture.key();
+
+  // gpu_lazy_resolve_copies: the scaled resolve memory this load reads holds the skipped copies
+  // first (from their mirrors, which may be this texture: it's only overwritten below).
+  if (texture_key.scaled_resolve && !lazy_resolve_copies_.empty()) {
+    if (load_base) {
+      MaterializeLazyResolveCopies(texture_key.base_page << 12, d3d12_texture.GetGuestBaseSize());
+    }
+    if (load_mips) {
+      MaterializeLazyResolveCopies(texture_key.mip_page << 12, d3d12_texture.GetGuestMipsSize());
+    }
+  }
 
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();

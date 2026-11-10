@@ -1,0 +1,83 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+// Lazy resolve copies (rex SDK): a direct colour resolve whose destination textures were all written
+// natively (gpu_native_resolves) can skip its copy into the scaled resolve memory; this rebuilds that
+// memory from such a texture when something is about to read it. The texture is the destination
+// surface itself (same base, pitch, format and endianness, resolution-scaled), so texel (x, y) is the
+// surface's scaled pixel (x, y), and it holds the words the copy would have written before their
+// endian swap (the native write applies the red / blue swap and the half-pixel gap fill as the copy
+// does). Same dispatch, constants and destination addressing as resolve_direct_fast_32bpp (1 thread
+// = 8 scaled pixels of the resolve rectangle); xe_resolve_direct_rt_flags bits 0:3 are the packing of
+// the texture's integer view: 0 = R8G8B8A8_UINT (k_8_8_8_8), 1 = R16G16_UINT (k_16_16_FLOAT).
+// D3D12-only (HLSL types), as the direct resolves.
+
+#include "endian.xesli"
+#define XE_RESOLVE_DIRECT
+#define XE_RESOLVE_SOURCE_TYPE uint4_xe
+#include "resolve.xesli"
+
+uint XeResolveLazyPack32bpp(uint4_xe texel, uint packing) {
+  uint packed;
+  dont_flatten_xe
+  if (packing == 1u) {
+    packed = (texel.x & 0xFFFFu) | (texel.y << 16u);
+  } else {
+    packed = (texel.x & 0xFFu) | ((texel.y & 0xFFu) << 8u) | ((texel.z & 0xFFu) << 16u) |
+             (texel.w << 24u);
+  }
+  return packed;
+}
+
+array_buffer_wo_declare_xe(uint4_xe, xe_resolve_dest, set=1, binding=0, u0,
+                           space0)
+#define LOCAL_SIZE_X_XE 8
+#define LOCAL_SIZE_Y_XE 8
+#define LOCAL_SIZE_Z_XE 1
+entry_bindings_begin_compute_xe
+  XE_RESOLVE_PUSH_CONST_BINDING
+  entry_binding_next_xe
+  array_buffer_wo_binding_xe(uint4_xe, xe_resolve_dest, buffer(1))
+  entry_binding_next_xe
+  texture_xe(Texture2D<uint4_xe>, xe_resolve_lazy_source, set=0, binding=0, t0,
+             space0, texture(0))
+entry_bindings_end_inputs_begin_compute_xe
+  entry_in_global_thread_id_xe
+entry_inputs_end_code_begin_compute_xe
+{
+  // 1 thread = 8 host pixels.
+  XeResolveInfo resolve_info = XeResolveGetInfo(pass_push_consts_xe);
+  // Group height can't cross resolve granularity, Y overflow check not needed.
+  dont_flatten_xe
+  if (in_global_thread_id_xe.x >= resolve_info.width_div_8_scaled) {
+    return;
+  }
+  uint2_xe pixel_index = in_global_thread_id_xe.xy << uint2_xe(3u, 0u);
+  uint packing = push_const_xe(xe_resolve_direct_rt_flags) & 0xFu;
+  // The surface pixel this thread's first pixel is written to, which is the texture's texel.
+  int2_xe texel = int2_xe(resolve_info.dest_xy_offset_scaled + pixel_index);
+  uint pixels[8];
+  for (int i = 0; i < 8; ++i) {
+    pixels[i] = XeResolveLazyPack32bpp(
+        texel_fetch_2d_xe(xe_resolve_lazy_source, texel + int2_xe(i, 0), 0), packing);
+  }
+  uint4_xe pixels_0123 = uint4_xe(pixels[0], pixels[1], pixels[2], pixels[3]);
+  uint4_xe pixels_4567 = uint4_xe(pixels[4], pixels[5], pixels[6], pixels[7]);
+  uint dest_address =
+      XeResolveDestPixelAddress(resolve_info, pixel_index, 2u) >> 4u;
+  array_buffer_store_xe(
+      xe_resolve_dest, dest_address,
+      XeEndianSwap32(pixels_0123, resolve_info.dest_endian_128));
+  dest_address += XeResolveDestRightConsecutiveBlocksOffset(
+                      pixel_index.x, 2u, resolve_info.resolution_scale) >> 4u;
+  array_buffer_store_xe(
+      xe_resolve_dest, dest_address,
+      XeEndianSwap32(pixels_4567, resolve_info.dest_endian_128));
+}
+entry_code_end_compute_xe

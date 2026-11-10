@@ -750,8 +750,9 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   bool IsNativeResolveEligible(const draw_util::ResolveInfo& resolve_info);
   // After DumpRenderTargets and MarkRangeAsResolved for the resolve, copies the resolved region
   // from the source host render target into the texture cache textures viewing the destination
-  // that were up to date before the resolve, and marks them up to date.
-  void WriteResolveToTextures(const draw_util::ResolveInfo& resolve_info,
+  // that were up to date before the resolve, and marks them up to date. True if one of them holds
+  // the whole rectangle (a mirror for gpu_lazy_resolve_copies).
+  bool WriteResolveToTextures(const draw_util::ResolveInfo& resolve_info,
                               D3D12TextureCache& texture_cache);
   void CountNativeResolveFallback(NativeResolveFallback reason, uint64_t count = 1) {
     native_resolve_fallbacks_[size_t(reason)] += count;
@@ -842,6 +843,9 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   ID3D12PipelineState* direct_resolve_fast_32bpp_depth_pipeline_ = nullptr;
   // resolve_direct_full_32bpp_{1x,2x}msaa (the colour root signature).
   ID3D12PipelineState* direct_resolve_full_32bpp_pipelines_[2] = {};
+  // gpu_lazy_resolve_copies: resolve_lazy_rebuild_32bpp_scaled (the colour root signature), handed
+  // to the texture cache, which rebuilds the skipped copies.
+  ID3D12PipelineState* lazy_rebuild_pipeline_ = nullptr;
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;

@@ -69,6 +69,15 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve_full, true, "GPU",
                     "With direct_host_resolve: colour resolves that convert the format, apply an "
                     "exponent bias or average the two samples of 2x MSAA also copy straight from the "
                     "render target (false: they dump first)");
+REXCVAR_DEFINE_BOOL(gpu_lazy_resolve_copies, false, "GPU",
+                    "With resolution scaling, direct_host_resolve and gpu_native_resolves: a k_8_8_8_8 "
+                    "colour resolve whose rectangle a natively written texture holds completely skips "
+                    "its copy into the scaled resolve memory, which is rebuilt from that texture when "
+                    "something reads it (D3D12)");
+REXCVAR_DEFINE_BOOL(gpu_lazy_resolve_copies_verify, false, "GPU",
+                    "Debug: with gpu_lazy_resolve_copies, make the copy anyway, rebuild it from the "
+                    "texture over it and compare the two word for word (logged as a direct resolve "
+                    "verify, 'lazy')");
 
 namespace rex::graphics::d3d12 {
 
@@ -88,6 +97,8 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_4096_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_scaled_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_lazy_rebuild_32bpp_scaled_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_lazy_rebuild_32bpp_scaled_4096_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_4096_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_scaled_cs.h"
@@ -579,6 +590,22 @@ bool D3D12RenderTargetCache::Initialize() {
           fmt::format("Resolve Direct Fast 32bpp {}xMSAA", i + 1));
       pipeline->SetName(reinterpret_cast<LPCWSTR>(pipeline_name.c_str()));
       direct_resolve_fast_32bpp_pipelines_[i] = pipeline;
+    }
+    // gpu_lazy_resolve_copies: the rebuild of a skipped copy from its texture (scaled only, the
+    // colour root signature).
+    if (draw_resolution_scaled) {
+      const Code lazy_code =
+          extended ? Code{shaders::resolve_lazy_rebuild_32bpp_scaled_4096_cs,
+                          sizeof(shaders::resolve_lazy_rebuild_32bpp_scaled_4096_cs)}
+                   : Code{shaders::resolve_lazy_rebuild_32bpp_scaled_cs,
+                          sizeof(shaders::resolve_lazy_rebuild_32bpp_scaled_cs)};
+      lazy_rebuild_pipeline_ = ui::d3d12::util::CreateComputePipeline(
+          device, lazy_code.data, lazy_code.size, direct_resolve_root_signature_color_);
+      if (lazy_rebuild_pipeline_) {
+        lazy_rebuild_pipeline_->SetName(L"Resolve Lazy Rebuild 32bpp");
+      } else {
+        REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the lazy resolve rebuild pipeline");
+      }
     }
     // 1x integer colour (the colour root signature) and depth (its own).
     Code uint_code = draw_resolution_scaled
@@ -1353,6 +1380,7 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   }
   ui::d3d12::util::ReleaseAndNull(direct_resolve_fast_32bpp_uint_pipeline_);
   ui::d3d12::util::ReleaseAndNull(direct_resolve_fast_32bpp_depth_pipeline_);
+  ui::d3d12::util::ReleaseAndNull(lazy_rebuild_pipeline_);
   for (ID3D12PipelineState*& pipeline : direct_resolve_full_32bpp_pipelines_) {
     ui::d3d12::util::ReleaseAndNull(pipeline);
   }
@@ -1725,9 +1753,90 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         }
       }
 
+      // gpu_native_resolves: the textures viewing the destination that are up to date now
+      // stay up to date if the resolved region is also copied into them on the host.
+      // Not for a 1x copy: its textures load the unscaled data from shared memory.
+      const bool native_resolve = REXCVAR_GET(gpu_native_resolves) && !copy_native &&
+                                  GetPath() == Path::kHostRenderTargets &&
+                                  IsNativeResolveEligible(resolve_info);
+      // gpu_lazy_resolve_copies (D3D12TextureCache::LazyResolveCopy): this resolve's surface,
+      // rectangle and the rebuild dispatch of its copy.
+      texture_cache.SetLazyResolveRebuild(direct_resolve_root_signature_color_,
+                                          lazy_rebuild_pipeline_);
+      D3D12TextureCache::LazyResolveCopy lazy;
+      const bool lazy_tracking = copy_dest_scaled && texture_cache.IsLazyResolveRebuildAvailable();
+      if (lazy_tracking) {
+        lazy.dest_base = resolve_info.copy_dest_base;
+        lazy.pitch = resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32;
+        lazy.format = xenos::TextureFormat(uint32_t(resolve_info.copy_dest_info.copy_dest_format));
+        lazy.endianness = xenos::Endian(uint32_t(resolve_info.copy_dest_info.copy_dest_endian));
+        lazy.rect_x = resolve_info.copy_dest_coordinate_info.offset_x_div_8 << 3;
+        lazy.rect_y = resolve_info.copy_dest_coordinate_info.offset_y_div_8 << 3;
+        // An array slice isn't part of the identity: such a resolve never covers a pending copy
+        // (and never becomes one, the native write doesn't take arrays).
+        if (!resolve_info.copy_dest_info.copy_dest_array) {
+          lazy.rect_width = resolve_info.coordinate_info.width_div_8 << 3;
+          lazy.rect_height = resolve_info.height_div_8 << 3;
+        }
+        lazy.extent_start = resolve_info.copy_dest_extent_start;
+        lazy.extent_length = resolve_info.copy_dest_extent_length;
+        lazy.current_length = resolve_info.copy_dest_extent_start - resolve_info.copy_dest_base +
+                              resolve_info.copy_dest_extent_length;
+        // The copy's constants (scaled: without dest_base), then the direct resolve's two, here 0
+        // and the packing (0: R8G8B8A8_UINT).
+        static_assert(sizeof(copy_shader_constants.dest_relative) + 2 * sizeof(uint32_t) <=
+                      sizeof(lazy.root_constants));
+        std::memcpy(lazy.root_constants.data(), &copy_shader_constants.dest_relative,
+                    sizeof(copy_shader_constants.dest_relative));
+        lazy.root_constant_count =
+            uint32_t(sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t));
+        lazy.root_constants[lazy.root_constant_count++] = 0;
+        lazy.root_constants[lazy.root_constant_count++] = 0;
+        // As resolve_copy_shader_info's fast 32bpp copy: 64x8 scaled pixels per group.
+        const uint32_t width_scaled =
+            (resolve_info.coordinate_info.width_div_8 << 3) * draw_resolution_scale_x();
+        const uint32_t height_scaled = (resolve_info.height_div_8 << 3) * draw_resolution_scale_y();
+        lazy.group_count_x = (width_scaled + 63) >> 6;
+        lazy.group_count_y = (height_scaled + 7) >> 3;
+        lazy.srv_format = DXGI_FORMAT_R8G8B8A8_UINT;
+        // The pending copies this resolve overlaps: rebuilt first, or dropped if it covers them.
+        if (texture_cache.HasLazyResolveCopies()) {
+          texture_cache.PrepareLazyResolveCopiesForResolve(lazy);
+        }
+      }
+      // A k_8_8_8_8 colour copy from the render target (not with a readback after every resolve):
+      // the textures are written first, and if one holds the whole rectangle the copy waits.
+      bool native_written = false;
+      bool lazy_mirror = false;
+      if (lazy_tracking && native_resolve && REXCVAR_GET(gpu_lazy_resolve_copies) && direct_rt &&
+          (direct_kind == DirectResolveSourceKind::kColor ||
+           direct_kind == DirectResolveSourceKind::kColorFull) &&
+          !verify && !REXCVAR_GET(direct_host_resolve_keep_dump) &&
+          !REXCVAR_GET(d3d12_readback_resolve) &&
+          uint32_t(resolve_info.copy_dest_info.copy_dest_format) ==
+              uint32_t(xenos::TextureFormat::k_8_8_8_8)) {
+        texture_cache.CaptureUpToDateBeforeResolve(
+            resolve_info.copy_dest_base, lazy.current_length);
+        texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                          resolve_info.copy_dest_extent_length, copy_dest_scaled);
+        lazy_mirror = WriteResolveToTextures(resolve_info, texture_cache);
+        native_written = true;
+        if (lazy_mirror && !REXCVAR_GET(gpu_lazy_resolve_copies_verify) &&
+            texture_cache.AddLazyResolveCopy(lazy)) {
+          written_address_out = resolve_info.copy_dest_extent_start;
+          written_length_out = resolve_info.copy_dest_extent_length;
+          if (written_scaled_out) {
+            *written_scaled_out = true;
+          }
+          copied = true;
+        }
+      }
+
       // Make sure there is memory to write to.
-      bool copy_dest_committed;
-      if (copy_dest_scaled) {
+      bool copy_dest_committed = false;
+      if (copied) {
+        // gpu_lazy_resolve_copies: the copy waits, nothing to write now.
+      } else if (copy_dest_scaled) {
         // Committing starting with the beginning of the potentially written
         // extent, but making the buffer containing the base current as the
         // beginning of the bound buffer is the base.
@@ -1965,26 +2074,76 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             shared_memory.MarkUAVWritesCommitNeeded();
           }
 
-          // gpu_native_resolves: the textures viewing the destination that are up to date now
-          // stay up to date if the resolved region is also copied into them on the host.
-          // Not for a 1x copy: its textures load the unscaled data from shared memory.
-          const bool native_resolve = REXCVAR_GET(gpu_native_resolves) && !copy_native &&
-                                      GetPath() == Path::kHostRenderTargets &&
-                                      IsNativeResolveEligible(resolve_info);
-          if (native_resolve) {
-            // From the base, which may be before the extent start, for the textures at the base.
-            texture_cache.CaptureUpToDateBeforeResolve(
-                resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start -
-                                                 resolve_info.copy_dest_base +
-                                                 resolve_info.copy_dest_extent_length);
+          // gpu_native_resolves (native_resolve above), unless gpu_lazy_resolve_copies wrote the
+          // textures before the copy already.
+          if (!native_written) {
+            if (native_resolve) {
+              // From the base, which may be before the extent start, for the textures at the base.
+              texture_cache.CaptureUpToDateBeforeResolve(
+                  resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start -
+                                                   resolve_info.copy_dest_base +
+                                                   resolve_info.copy_dest_extent_length);
+            }
+
+            // Invalidate textures and mark the range as scaled if needed.
+            texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                              resolve_info.copy_dest_extent_length,
+                                              copy_dest_scaled);
+            if (native_resolve) {
+              WriteResolveToTextures(resolve_info, texture_cache);
+            }
           }
 
-          // Invalidate textures and mark the range as scaled if needed.
-          texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
-                                            resolve_info.copy_dest_extent_length,
-                                            copy_dest_scaled);
-          if (native_resolve) {
-            WriteResolveToTextures(resolve_info, texture_cache);
+          // gpu_lazy_resolve_copies_verify: the copy just made read back, rebuilt over it from
+          // the texture that would have let it wait, read back again, compared once the
+          // submission is done (as direct_host_resolve_verify); each surface rectangle twice.
+          if (lazy_mirror && REXCVAR_GET(gpu_lazy_resolve_copies_verify) &&
+              direct_resolve_verify_pending_.size() < 8) {
+            uint64_t key = uint64_t(lazy.dest_base) ^ (uint64_t(lazy.rect_x) << 32) ^
+                           (uint64_t(lazy.rect_y) << 44) ^ (uint64_t(lazy.rect_width) << 20) ^
+                           (uint64_t(lazy.rect_height) << 52) ^ 0x4C415A5900000000ull;
+            if (std::count(direct_resolve_verify_keys_.begin(), direct_resolve_verify_keys_.end(),
+                           key) < 2) {
+              direct_resolve_verify_keys_.push_back(key);
+              verify_source = texture_cache.GetCurrentScaledResolveBufferResource();
+              verify_offset =
+                  texture_cache.GetCurrentScaledResolveRangeStartScaled() -
+                  (uint64_t(texture_cache.GetCurrentScaledResolveBufferIndexPublic()) << 30);
+              verify_length =
+                  uint32_t(texture_cache.GetCurrentScaledResolveRangeLengthScaled()) & ~uint32_t(3);
+              ID3D12Resource* lazy_readback[2] = {};
+              D3D12_RESOURCE_DESC readback_desc;
+              ui::d3d12::util::FillBufferResourceDesc(readback_desc, verify_length,
+                                                      D3D12_RESOURCE_FLAG_NONE);
+              ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+              for (ID3D12Resource*& readback : lazy_readback) {
+                if (verify_length && verify_source &&
+                    FAILED(device->CreateCommittedResource(
+                        &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE,
+                        &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                        IID_PPV_ARGS(&readback)))) {
+                  readback = nullptr;
+                }
+              }
+              if (lazy_readback[0] && lazy_readback[1]) {
+                verify_copy_destination(lazy_readback[0]);
+                // The rebuild makes the same range current (the copy's).
+                if (texture_cache.RebuildFromLastMirror(lazy)) {
+                  verify_copy_destination(lazy_readback[1]);
+                  direct_resolve_verify_pending_.push_back(
+                      {{lazy_readback[0], lazy_readback[1]},
+                       verify_length,
+                       command_processor_.GetCurrentSubmission(),
+                       fmt::format("lazy dest {:08X} pitch {} rect {},{} {}x{} format {} endian {}",
+                                   lazy.dest_base, lazy.pitch, lazy.rect_x, lazy.rect_y,
+                                   lazy.rect_width, lazy.rect_height, uint32_t(lazy.format),
+                                   uint32_t(lazy.endianness))});
+                  lazy_readback[0] = lazy_readback[1] = nullptr;
+                }
+              }
+              ui::d3d12::util::ReleaseAndNull(lazy_readback[0]);
+              ui::d3d12::util::ReleaseAndNull(lazy_readback[1]);
+            }
           }
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
@@ -1993,7 +2152,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           }
           copied = true;
         }
-      } else {
+      } else if (!copied) {
         REXGPU_ERROR(
             "D3D12RenderTargetCache: Failed to obtain the resolve destination "
             "memory region");
@@ -6692,7 +6851,7 @@ bool D3D12RenderTargetCache::IsNativeResolveEligible(const draw_util::ResolveInf
   return false;
 }
 
-void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo& resolve_info,
+bool D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo& resolve_info,
                                                     D3D12TextureCache& texture_cache) {
   auto fallback = [this](NativeResolveFallback reason) {
     CountNativeResolveFallback(reason);
@@ -6730,7 +6889,7 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
       write.scale = 2.0f;
     } else {
       fallback(NativeResolveFallback::kDepth);
-      return;
+      return false;
     }
     write.mode = D3D12TextureCache::NativeResolveMode::kDepthToRed;
     write.dest_uav_format = DXGI_FORMAT_R32_FLOAT;
@@ -6780,15 +6939,15 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
     } else {
       // Including k_16_16, which the guest stores with a different range than the host.
       fallback(NativeResolveFallback::kSourceFormat);
-      return;
+      return false;
     }
     if (exp_bias && write.mode != D3D12TextureCache::NativeResolveMode::kScale) {
       fallback(NativeResolveFallback::kExpBias);
-      return;
+      return false;
     }
     if (swap_red_blue && write.mode != D3D12TextureCache::NativeResolveMode::kSwapRedBlue) {
       fallback(NativeResolveFallback::kSwap);
-      return;
+      return false;
     }
     // A negative bias is applied the same way.
     write.scale = std::ldexp(1.0f, exp_bias);
@@ -6807,7 +6966,7 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
         write.source_samples = 2 | (host0 << 4) | (host1 << 6);
       } else {
         fallback(NativeResolveFallback::kMsaa);
-        return;
+        return false;
       }
       if (write.mode == D3D12TextureCache::NativeResolveMode::kCopy) {
         write.mode = D3D12TextureCache::NativeResolveMode::kScale;
@@ -6823,7 +6982,7 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
             break;
           default:
             fallback(NativeResolveFallback::kMsaa);
-            return;
+            return false;
         }
         write.dest_uav_format = write.source_srv_format;
       }
@@ -6832,24 +6991,24 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
   // For depth, ResolveInfo has replaced the destination format with k_24_8 or k_24_8_FLOAT.
   if (uint32_t(resolve_info.copy_dest_info.copy_dest_format) != uint32_t(texture_format)) {
     fallback(NativeResolveFallback::kDestFormat);
-    return;
+    return false;
   }
   if (resolve_info.copy_dest_info.copy_dest_array) {
     fallback(NativeResolveFallback::kDestArray);
-    return;
+    return false;
   }
   // The destination offsets are relative to the texture base only if the base hasn't been moved
   // closer to a far resolve origin.
   if (resolve_info.copy_dest_base != register_file()[XE_GPU_REG_RB_COPY_DEST_BASE] ||
       (resolve_info.copy_dest_base & 0xFFF) != 0) {
     fallback(NativeResolveFallback::kDestBaseAdjusted);
-    return;
+    return false;
   }
   // Endian128 and Endian share the values of the swaps both have.
   const uint32_t dest_endian = uint32_t(resolve_info.copy_dest_info.copy_dest_endian);
   if (dest_endian > uint32_t(xenos::Endian::k16in32)) {
     fallback(NativeResolveFallback::kEndian);
-    return;
+    return false;
   }
   // The resolve shaders replicate the first surely covered host column / row (scale / 2) into the
   // half-pixel offset gap before it with resolution scaling, so does native_resolve_cs. Copied
@@ -6858,7 +7017,7 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
   if (fill_half_pixel_offset) {
     if (write.mode == D3D12TextureCache::NativeResolveMode::kCopy) {
       fallback(NativeResolveFallback::kHalfPixelFill);
-      return;
+      return false;
     }
     write.fill_x = resolve_info.coordinate_info.draw_resolution_scale_x >> 1;
     write.fill_y = resolve_info.coordinate_info.draw_resolution_scale_y >> 1;
@@ -6874,32 +7033,32 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
                                  dump_rectangles_);
   if (dump_rectangles_.empty()) {
     fallback(NativeResolveFallback::kNoSource);
-    return;
+    return false;
   }
   if (dump_rectangles_.size() != 1) {
     fallback(NativeResolveFallback::kMultipleSources);
-    return;
+    return false;
   }
   const ResolveCopyDumpRectangle& rectangle = dump_rectangles_.front();
   if (!rectangle.render_target) {
     fallback(NativeResolveFallback::kNoSource);
-    return;
+    return false;
   }
   // The last row ends at the pitch at most (as GetDirectResolveSource checks it).
   if (rectangle.row_first != 0 || rectangle.rows != dump_rows || rectangle.row_first_start != 0 ||
       rectangle.row_last_end != std::min(dump_row_length_used, dump_pitch)) {
     fallback(NativeResolveFallback::kPartialSource);
-    return;
+    return false;
   }
   auto& render_target = *static_cast<D3D12RenderTarget*>(rectangle.render_target);
   const RenderTargetKey rt_key = render_target.key();
   if (rt_key.is_depth != is_depth || rt_key.resource_format != source_resource_format) {
     fallback(NativeResolveFallback::kSourceFormat);
-    return;
+    return false;
   }
   if (rt_key.msaa_samples != edram_info.msaa_samples) {
     fallback(NativeResolveFallback::kMsaa);
-    return;
+    return false;
   }
 
   // The resolve origin in the render target: the resolve EDRAM base tile relative to the render
@@ -6909,7 +7068,7 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
   if (!rt_pitch_tiles || rt_pitch_tiles != edram_info.pitch_tiles ||
       resolve_base_tiles < rt_key.base_tiles) {
     fallback(NativeResolveFallback::kSourcePlacement);
-    return;
+    return false;
   }
   const uint32_t rt_offset_tiles = resolve_base_tiles - rt_key.base_tiles;
   const uint32_t tile_width_pixels = xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp());
@@ -6925,7 +7084,7 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
       write.source_y + height >
           GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp, rt_key.msaa_samples)) {
     fallback(NativeResolveFallback::kSourcePlacement);
-    return;
+    return false;
   }
   write.base_page = (resolve_info.copy_dest_base & 0x1FFFFFFF) >> 12;
   write.format = texture_format;
@@ -6961,6 +7120,7 @@ void D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
   CountNativeResolveFallback(NativeResolveFallback::kNoPipeline, counts.no_pipeline);
   CountNativeResolveFallback(NativeResolveFallback::kDescriptors, counts.descriptors);
   ReportNativeResolves();
+  return counts.mirror;
 }
 
 void D3D12RenderTargetCache::ReportNativeResolves() {

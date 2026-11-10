@@ -222,6 +222,9 @@ class D3D12TextureCache final : public TextureCache {
     uint32_t no_pipeline = 0;
     // Shader modes: failed to get the one-use descriptors.
     uint32_t descriptors = 0;
+    // gpu_lazy_resolve_copies: a written texture contains the whole rectangle, so it mirrors the
+    // destination memory there (kept as the mirror for AddLazyResolveCopy).
+    bool mirror = false;
   };
   // Writes the rectangle into every texture at write.base_page that is a single-level unsigned 2D
   // tiled texture with the format, pitch and endianness of the resolve, matching resolution
@@ -231,6 +234,60 @@ class D3D12TextureCache final : public TextureCache {
   void WriteNativeResolveToTextures(const NativeResolveWrite& write,
                                     D3D12_RESOURCE_STATES& source_state,
                                     NativeResolveWriteCounts& counts);
+
+  // gpu_lazy_resolve_copies: a direct colour resolve whose rectangle a natively written texture
+  // contains completely (the mirror: same base, pitch, format and endianness as the destination,
+  // so it holds what the copy would write) skips its copy into the scaled resolve memory. The
+  // memory is rebuilt from the mirror (resolve_lazy_rebuild_32bpp, the copy's dispatch with the
+  // mirror as the source) before anything reads it: a scaled texture load overlapping it, a resolve
+  // readback, another resolve partly overlapping it. A later resolve covering the same rectangle of
+  // the same surface makes it moot. The mirror stays in the cache while the copy is pending.
+  struct LazyResolveCopy {
+    // The surface and the rectangle (guest pixels, unscaled, relative to dest_base).
+    uint32_t dest_base = 0;
+    uint32_t pitch = 0;
+    xenos::TextureFormat format = xenos::TextureFormat::k_8_8_8_8;
+    xenos::Endian endianness = xenos::Endian::kNone;
+    uint32_t rect_x = 0, rect_y = 0, rect_width = 0, rect_height = 0;
+    // The range the copy would have written, and the length to make current from dest_base (as
+    // the copy does).
+    uint32_t extent_start = 0, extent_length = 0, current_length = 0;
+    // The rebuild's root constants: the copy's dest_relative constants, then 0 and the packing.
+    std::array<uint32_t, 8> root_constants = {};
+    uint32_t root_constant_count = 0;
+    uint32_t group_count_x = 0, group_count_y = 0;
+    // The integer view of the mirror the rebuild reads (R8G8B8A8_UINT for k_8_8_8_8).
+    DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
+    // Same surface and this rectangle containing the other's.
+    bool Covers(const LazyResolveCopy& other) const {
+      return dest_base == other.dest_base && pitch == other.pitch && format == other.format &&
+             endianness == other.endianness && rect_x <= other.rect_x && rect_y <= other.rect_y &&
+             rect_x + rect_width >= other.rect_x + other.rect_width &&
+             rect_y + rect_height >= other.rect_y + other.rect_height;
+    }
+  };
+  // The rebuild pipeline and its root signature (the direct resolve colour one), owned by the
+  // render target cache.
+  void SetLazyResolveRebuild(ID3D12RootSignature* root_signature, ID3D12PipelineState* pipeline) {
+    lazy_rebuild_root_signature_ = root_signature;
+    lazy_rebuild_pipeline_ = pipeline;
+  }
+  bool IsLazyResolveRebuildAvailable() const {
+    return lazy_rebuild_root_signature_ && lazy_rebuild_pipeline_ && IsDrawResolutionScaled();
+  }
+  bool HasLazyResolveCopies() const { return !lazy_resolve_copies_.empty(); }
+  // Before a resolve writes its destination (resolve: its surface, rectangle and extent): rebuilds
+  // the pending copies its extent overlaps, except those it covers completely, which are dropped.
+  void PrepareLazyResolveCopiesForResolve(const LazyResolveCopy& resolve);
+  // After WriteNativeResolveToTextures reported a mirror: the copy stays pending instead of being
+  // made. False if the mirror is gone (the copy must be made then).
+  bool AddLazyResolveCopy(const LazyResolveCopy& copy);
+  // Rebuilds the pending copies overlapping the range (before something reads it).
+  void MaterializeLazyResolveCopies(uint32_t start, uint32_t length);
+  // gpu_lazy_resolve_copies_verify: the rebuild of a copy that was made anyway, from the mirror
+  // WriteNativeResolveToTextures reported last, over the copy's result (the caller reads the
+  // destination back before and after).
+  bool RebuildFromLastMirror(const LazyResolveCopy& copy);
 
   // Returns the ID3D12Resource of the front buffer texture (in
   // NON_PIXEL_SHADER_RESOURCE state), or nullptr in case of failure, and writes
@@ -685,6 +742,28 @@ class D3D12TextureCache final : public TextureCache {
   // Range used in the last successful MakeScaledResolveRangeCurrent call.
   uint64_t scaled_resolve_current_range_start_scaled_;
   uint64_t scaled_resolve_current_range_length_scaled_;
+
+  // gpu_lazy_resolve_copies (see LazyResolveCopy): the pending copies with their mirrors, kept in
+  // the cache by marking them used every submission.
+  struct PendingLazyResolveCopy {
+    LazyResolveCopy copy;
+    D3D12Texture* mirror;
+  };
+  std::vector<PendingLazyResolveCopy> lazy_resolve_copies_;
+  // The mirror of the last WriteNativeResolveToTextures call, if it found one.
+  D3D12Texture* last_native_resolve_mirror_ = nullptr;
+  // Owned by the render target cache.
+  ID3D12RootSignature* lazy_rebuild_root_signature_ = nullptr;
+  ID3D12PipelineState* lazy_rebuild_pipeline_ = nullptr;
+  // Counts since the last report (every few seconds).
+  uint64_t lazy_skipped_ = 0;
+  uint64_t lazy_rebuilt_ = 0;
+  uint64_t lazy_dropped_ = 0;
+  uint64_t lazy_failed_ = 0;
+  uint64_t lazy_last_report_ms_ = 0;
+  // Dispatches the copy's rebuild from the mirror into the scaled resolve memory.
+  bool RebuildLazyResolveCopy(const LazyResolveCopy& copy, D3D12Texture& mirror);
+  void ReportLazyResolveCopies();
 };
 
 }  // namespace rex::graphics::d3d12
