@@ -852,6 +852,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // gpu_lazy_resolve_copies: resolve_lazy_rebuild_32bpp_scaled (the colour root signature), handed
   // to the texture cache, which rebuilds the skipped copies.
   ID3D12PipelineState* lazy_rebuild_pipeline_ = nullptr;
+  // gpu_lazy_resolve_copies_unscaled: resolve_lazy_rebuild_32bpp, into shared memory.
+  ID3D12PipelineState* lazy_rebuild_unscaled_pipeline_ = nullptr;
   // What became of the copies since the last report (every few seconds): at 1x (threshold), not a
   // direct resolve, integer or depth, not k_8_8_8_8, not written natively, another setting,
   // written without a texture holding the rectangle, waiting (skipped), made and verified.

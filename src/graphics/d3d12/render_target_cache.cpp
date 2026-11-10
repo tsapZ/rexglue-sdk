@@ -78,6 +78,10 @@ REXCVAR_DEFINE_BOOL(gpu_lazy_resolve_copies_verify, false, "GPU",
                     "Debug: with gpu_lazy_resolve_copies, make the copy anyway, rebuild it from the "
                     "texture over it and compare the two word for word (logged as a direct resolve "
                     "verify, 'lazy')");
+REXCVAR_DEFINE_BOOL(gpu_lazy_resolve_copies_unscaled, false, "GPU",
+                    "With gpu_lazy_resolve_copies: copies into shared memory (at scale 1, and the 1x "
+                    "copies of draw_resolution_scale_threshold) also wait, rebuilt from their "
+                    "texture when something asks shared memory for that range");
 REXCVAR_DEFINE_BOOL(gpu_native_resolves_unscaled, false, "GPU",
                     "With resolution scaling and gpu_native_resolves: a resolve from render targets "
                     "drawn at 1x (draw_resolution_scale_threshold), copied at 1x into shared memory, "
@@ -101,6 +105,8 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_4096_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_scaled_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_lazy_rebuild_32bpp_4096_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_lazy_rebuild_32bpp_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_lazy_rebuild_32bpp_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_lazy_rebuild_32bpp_scaled_4096_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_direct_fast_32bpp_1xmsaa_cs.h"
@@ -609,6 +615,24 @@ bool D3D12RenderTargetCache::Initialize() {
         lazy_rebuild_pipeline_->SetName(L"Resolve Lazy Rebuild 32bpp");
       } else {
         REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the lazy resolve rebuild pipeline");
+      }
+    }
+    // gpu_lazy_resolve_copies_unscaled: the same into shared memory (copies at scale 1, and the
+    // 1x copies of draw_resolution_scale_threshold).
+    {
+      const Code lazy_unscaled_code =
+          extended ? Code{shaders::resolve_lazy_rebuild_32bpp_4096_cs,
+                          sizeof(shaders::resolve_lazy_rebuild_32bpp_4096_cs)}
+                   : Code{shaders::resolve_lazy_rebuild_32bpp_cs,
+                          sizeof(shaders::resolve_lazy_rebuild_32bpp_cs)};
+      lazy_rebuild_unscaled_pipeline_ = ui::d3d12::util::CreateComputePipeline(
+          device, lazy_unscaled_code.data, lazy_unscaled_code.size,
+          direct_resolve_root_signature_color_);
+      if (lazy_rebuild_unscaled_pipeline_) {
+        lazy_rebuild_unscaled_pipeline_->SetName(L"Resolve Lazy Rebuild 32bpp Unscaled");
+      } else {
+        REXGPU_ERROR(
+            "D3D12RenderTargetCache: Failed to create the unscaled lazy resolve rebuild pipeline");
       }
     }
     // 1x integer colour (the colour root signature) and depth (its own).
@@ -1385,6 +1409,7 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   ui::d3d12::util::ReleaseAndNull(direct_resolve_fast_32bpp_uint_pipeline_);
   ui::d3d12::util::ReleaseAndNull(direct_resolve_fast_32bpp_depth_pipeline_);
   ui::d3d12::util::ReleaseAndNull(lazy_rebuild_pipeline_);
+  ui::d3d12::util::ReleaseAndNull(lazy_rebuild_unscaled_pipeline_);
   for (ID3D12PipelineState*& pipeline : direct_resolve_full_32bpp_pipelines_) {
     ui::d3d12::util::ReleaseAndNull(pipeline);
   }
@@ -1767,10 +1792,17 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
       // gpu_lazy_resolve_copies (D3D12TextureCache::LazyResolveCopy): this resolve's surface,
       // rectangle and the rebuild dispatch of its copy.
       texture_cache.SetLazyResolveRebuild(direct_resolve_root_signature_color_,
-                                          lazy_rebuild_pipeline_);
+                                          lazy_rebuild_pipeline_, lazy_rebuild_unscaled_pipeline_);
       D3D12TextureCache::LazyResolveCopy lazy;
-      const bool lazy_tracking = copy_dest_scaled && texture_cache.IsLazyResolveRebuildAvailable();
+      // gpu_lazy_resolve_copies_unscaled: copies into shared memory too (scale 1, and the 1x
+      // copies of draw_resolution_scale_threshold).
+      const bool lazy_unscaled = !copy_dest_scaled &&
+                                 REXCVAR_GET(gpu_lazy_resolve_copies_unscaled) &&
+                                 GetPath() == Path::kHostRenderTargets;
+      const bool lazy_tracking = (copy_dest_scaled || lazy_unscaled) &&
+                                 texture_cache.IsLazyResolveRebuildAvailable(!copy_dest_scaled);
       if (lazy_tracking) {
+        lazy.unscaled = !copy_dest_scaled;
         lazy.dest_base = resolve_info.copy_dest_base;
         lazy.pitch = resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32;
         lazy.format = xenos::TextureFormat(uint32_t(resolve_info.copy_dest_info.copy_dest_format));
@@ -1803,20 +1835,23 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             lazy.srv_format = DXGI_FORMAT_R8G8B8A8_UINT;
             break;
         }
-        // The copy's constants (scaled: without dest_base), then the direct resolve's two, here 0
-        // and the packing.
-        static_assert(sizeof(copy_shader_constants.dest_relative) + 2 * sizeof(uint32_t) <=
+        // The copy's constants (scaled: without dest_base, unscaled: all, as the copy gets them),
+        // then the direct resolve's two, here 0 and the packing.
+        static_assert(sizeof(copy_shader_constants) + 2 * sizeof(uint32_t) <=
                       sizeof(lazy.root_constants));
-        std::memcpy(lazy.root_constants.data(), &copy_shader_constants.dest_relative,
-                    sizeof(copy_shader_constants.dest_relative));
-        lazy.root_constant_count =
-            uint32_t(sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t));
+        const size_t lazy_constants_size = lazy.unscaled
+                                               ? sizeof(copy_shader_constants)
+                                               : sizeof(copy_shader_constants.dest_relative);
+        std::memcpy(lazy.root_constants.data(), &copy_shader_constants, lazy_constants_size);
+        lazy.root_constant_count = uint32_t(lazy_constants_size / sizeof(uint32_t));
         lazy.root_constants[lazy.root_constant_count++] = 0;
         lazy.root_constants[lazy.root_constant_count++] = lazy_packing;
-        // As resolve_copy_shader_info's fast 32bpp copy: 64x8 scaled pixels per group.
-        const uint32_t width_scaled =
-            (resolve_info.coordinate_info.width_div_8 << 3) * draw_resolution_scale_x();
-        const uint32_t height_scaled = (resolve_info.height_div_8 << 3) * draw_resolution_scale_y();
+        // As resolve_copy_shader_info's fast 32bpp copy: 64x8 host pixels per group (guest pixels
+        // for an unscaled copy).
+        const uint32_t lazy_scale_x = lazy.unscaled ? 1 : draw_resolution_scale_x();
+        const uint32_t lazy_scale_y = lazy.unscaled ? 1 : draw_resolution_scale_y();
+        const uint32_t width_scaled = (resolve_info.coordinate_info.width_div_8 << 3) * lazy_scale_x;
+        const uint32_t height_scaled = (resolve_info.height_div_8 << 3) * lazy_scale_y;
         lazy.group_count_x = (width_scaled + 63) >> 6;
         lazy.group_count_y = (height_scaled + 7) >> 3;
         // The pending copies this resolve overlaps: rebuilt first, or dropped if it covers them.
@@ -1856,13 +1891,19 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           CountLazyOutcome(LazyOutcome::kOther);
         }
       }
-      if (lazy_tracking && native_resolve && lazy_enabled && lazy_direct_color && lazy_settings_ok &&
-          lazy_format_ok) {
+      // An unscaled copy writes shared memory: the CPU's data in its pages is uploaded first, as the
+      // copy path does before copying (else RangeWrittenByGpu below would mark the pages valid over
+      // stale bytes around the rectangle); it also makes the range resident for the rebuild.
+      const bool lazy_candidate = lazy_tracking && native_resolve && lazy_enabled &&
+                                  lazy_direct_color && lazy_settings_ok && lazy_format_ok;
+      if (lazy_candidate &&
+          (!lazy.unscaled || shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
+                                                       resolve_info.copy_dest_extent_length))) {
         texture_cache.CaptureUpToDateBeforeResolve(
             resolve_info.copy_dest_base, lazy.current_length);
         texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                           resolve_info.copy_dest_extent_length, copy_dest_scaled);
-        lazy_mirror = WriteResolveToTextures(resolve_info, texture_cache, false);
+        lazy_mirror = WriteResolveToTextures(resolve_info, texture_cache, copy_native);
         native_written = true;
         if (!lazy_mirror) {
           CountLazyOutcome(LazyOutcome::kNoMirror);
@@ -1873,7 +1914,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           if (written_scaled_out) {
-            *written_scaled_out = true;
+            *written_scaled_out = copy_dest_scaled;
           }
           copied = true;
         }
@@ -2148,16 +2189,25 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
               direct_resolve_verify_pending_.size() < 8) {
             uint64_t key = uint64_t(lazy.dest_base) ^ (uint64_t(lazy.rect_x) << 32) ^
                            (uint64_t(lazy.rect_y) << 44) ^ (uint64_t(lazy.rect_width) << 20) ^
-                           (uint64_t(lazy.rect_height) << 52) ^ 0x4C415A5900000000ull;
+                           (uint64_t(lazy.rect_height) << 52) ^ (uint64_t(lazy.unscaled) << 31) ^
+                           0x4C415A5900000000ull;
             if (std::count(direct_resolve_verify_keys_.begin(), direct_resolve_verify_keys_.end(),
                            key) < 2) {
               direct_resolve_verify_keys_.push_back(key);
-              verify_source = texture_cache.GetCurrentScaledResolveBufferResource();
-              verify_offset =
-                  texture_cache.GetCurrentScaledResolveRangeStartScaled() -
-                  (uint64_t(texture_cache.GetCurrentScaledResolveBufferIndexPublic()) << 30);
-              verify_length =
-                  uint32_t(texture_cache.GetCurrentScaledResolveRangeLengthScaled()) & ~uint32_t(3);
+              if (lazy.unscaled) {
+                // The copy's destination in shared memory (as direct_host_resolve_verify reads it).
+                verify_source = shared_memory.GetBuffer();
+                verify_offset = resolve_info.copy_dest_extent_start;
+                verify_length = resolve_info.copy_dest_extent_length & ~uint32_t(3);
+              } else {
+                verify_source = texture_cache.GetCurrentScaledResolveBufferResource();
+                verify_offset =
+                    texture_cache.GetCurrentScaledResolveRangeStartScaled() -
+                    (uint64_t(texture_cache.GetCurrentScaledResolveBufferIndexPublic()) << 30);
+                verify_length =
+                    uint32_t(texture_cache.GetCurrentScaledResolveRangeLengthScaled()) &
+                    ~uint32_t(3);
+              }
               ID3D12Resource* lazy_readback[2] = {};
               D3D12_RESOURCE_DESC readback_desc;
               ui::d3d12::util::FillBufferResourceDesc(readback_desc, verify_length,
@@ -2181,10 +2231,10 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                       {{lazy_readback[0], lazy_readback[1]},
                        verify_length,
                        command_processor_.GetCurrentSubmission(),
-                       fmt::format("lazy dest {:08X} pitch {} rect {},{} {}x{} format {} endian {}",
-                                   lazy.dest_base, lazy.pitch, lazy.rect_x, lazy.rect_y,
-                                   lazy.rect_width, lazy.rect_height, uint32_t(lazy.format),
-                                   uint32_t(lazy.endianness))});
+                       fmt::format("lazy{} dest {:08X} pitch {} rect {},{} {}x{} format {} endian {}",
+                                   lazy.unscaled ? " 1x" : "", lazy.dest_base, lazy.pitch,
+                                   lazy.rect_x, lazy.rect_y, lazy.rect_width, lazy.rect_height,
+                                   uint32_t(lazy.format), uint32_t(lazy.endianness))});
                   lazy_readback[0] = lazy_readback[1] = nullptr;
                 }
               }

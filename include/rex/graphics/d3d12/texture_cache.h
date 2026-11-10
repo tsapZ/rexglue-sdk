@@ -263,32 +263,49 @@ class D3D12TextureCache final : public TextureCache {
     uint32_t group_count_x = 0, group_count_y = 0;
     // The integer view of the mirror the rebuild reads (R8G8B8A8_UINT for k_8_8_8_8).
     DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
-    // Same surface and this rectangle containing the other's.
+    // gpu_lazy_resolve_copies_unscaled: a copy into shared memory (scale 1, or a 1x copy under
+    // draw_resolution_scale_threshold): the constants are the copy's full ones (dest_base too),
+    // the rebuild writes shared memory, and it waits for SharedMemory::RequestRanges (every
+    // reader of shared memory asks for its ranges first) instead of scaled texture loads.
+    bool unscaled = false;
+    // Same kind, same surface and this rectangle containing the other's.
     bool Covers(const LazyResolveCopy& other) const {
-      return dest_base == other.dest_base && pitch == other.pitch && format == other.format &&
-             endianness == other.endianness && rect_x <= other.rect_x && rect_y <= other.rect_y &&
-             rect_x + rect_width >= other.rect_x + other.rect_width &&
+      return unscaled == other.unscaled && dest_base == other.dest_base && pitch == other.pitch &&
+             format == other.format && endianness == other.endianness && rect_x <= other.rect_x &&
+             rect_y <= other.rect_y && rect_x + rect_width >= other.rect_x + other.rect_width &&
              rect_y + rect_height >= other.rect_y + other.rect_height;
     }
   };
-  // The rebuild pipeline and its root signature (the direct resolve colour one), owned by the
-  // render target cache.
-  void SetLazyResolveRebuild(ID3D12RootSignature* root_signature, ID3D12PipelineState* pipeline) {
+  // The rebuild pipelines (into the scaled resolve memory, into shared memory) and their root
+  // signature (the direct resolve colour one), owned by the render target cache.
+  void SetLazyResolveRebuild(ID3D12RootSignature* root_signature, ID3D12PipelineState* pipeline,
+                             ID3D12PipelineState* pipeline_unscaled) {
     lazy_rebuild_root_signature_ = root_signature;
     lazy_rebuild_pipeline_ = pipeline;
+    lazy_rebuild_unscaled_pipeline_ = pipeline_unscaled;
   }
-  bool IsLazyResolveRebuildAvailable() const {
-    return lazy_rebuild_root_signature_ && lazy_rebuild_pipeline_ && IsDrawResolutionScaled();
+  bool IsLazyResolveRebuildAvailable(bool unscaled = false) const {
+    return lazy_rebuild_root_signature_ &&
+           (unscaled ? lazy_rebuild_unscaled_pipeline_ != nullptr
+                     : lazy_rebuild_pipeline_ != nullptr && IsDrawResolutionScaled());
   }
   bool HasLazyResolveCopies() const { return !lazy_resolve_copies_.empty(); }
+  bool HasUnscaledLazyResolveCopies() const { return lazy_unscaled_pending_ != 0; }
   // Before a resolve writes its destination (resolve: its surface, rectangle and extent): rebuilds
   // the pending copies its extent overlaps, except those it covers completely, which are dropped.
   void PrepareLazyResolveCopiesForResolve(const LazyResolveCopy& resolve);
   // After WriteNativeResolveToTextures reported a mirror: the copy stays pending instead of being
   // made. False if the mirror is gone (the copy must be made then).
   bool AddLazyResolveCopy(const LazyResolveCopy& copy);
-  // Rebuilds the pending copies overlapping the range (before something reads it).
-  void MaterializeLazyResolveCopies(uint32_t start, uint32_t length);
+  // Which pending copies MaterializeLazyResolveCopies looks at.
+  enum LazyResolveKinds : uint32_t {
+    kLazyResolveScaled = 1,
+    kLazyResolveUnscaled = 2,
+    kLazyResolveAll = 3,
+  };
+  // Rebuilds the pending copies of the kinds overlapping the range (before something reads it).
+  void MaterializeLazyResolveCopies(uint32_t start, uint32_t length,
+                                    uint32_t kinds = kLazyResolveAll);
   // gpu_lazy_resolve_copies_verify: the rebuild of a copy that was made anyway, from the mirror
   // WriteNativeResolveToTextures reported last, over the copy's result (the caller reads the
   // destination back before and after).
@@ -760,14 +777,30 @@ class D3D12TextureCache final : public TextureCache {
   // Owned by the render target cache.
   ID3D12RootSignature* lazy_rebuild_root_signature_ = nullptr;
   ID3D12PipelineState* lazy_rebuild_pipeline_ = nullptr;
+  ID3D12PipelineState* lazy_rebuild_unscaled_pipeline_ = nullptr;
+  // How many of lazy_resolve_copies_ are unscaled (the RequestRanges hook returns at once if 0),
+  // and the range their extents span (the hook and the draws' vertex buffers check it first).
+  uint32_t lazy_unscaled_pending_ = 0;
+  uint32_t lazy_unscaled_start_ = UINT32_MAX;
+  uint32_t lazy_unscaled_end_ = 0;
   // Counts since the last report (every few seconds).
   uint64_t lazy_skipped_ = 0;
+  uint64_t lazy_skipped_unscaled_ = 0;
   uint64_t lazy_rebuilt_ = 0;
   uint64_t lazy_dropped_ = 0;
   uint64_t lazy_failed_ = 0;
+  // Unscaled copies a reader asked for while the hook was suppressed (should stay 0: the draw
+  // writes them before; one would mean a reader the draw doesn't know of).
+  uint64_t lazy_late_ = 0;
   uint64_t lazy_last_report_ms_ = 0;
-  // Dispatches the copy's rebuild from the mirror into the scaled resolve memory.
+  // Dispatches the copy's rebuild from the mirror into the scaled resolve memory, or into shared
+  // memory for an unscaled one.
   bool RebuildLazyResolveCopy(const LazyResolveCopy& copy, D3D12Texture& mirror);
+  // Removes pending copy i (keeping lazy_unscaled_pending_).
+  void EraseLazyResolveCopy(size_t i);
+  // SharedMemory's before-request hook: the unscaled pending copies overlapping the ranges.
+  static void BeforeSharedMemoryRequest(void* context, const std::pair<uint32_t, uint32_t>* ranges,
+                                        size_t count, bool suppressed);
   void ReportLazyResolveCopies();
 };
 

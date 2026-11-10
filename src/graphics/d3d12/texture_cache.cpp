@@ -408,6 +408,7 @@ D3D12TextureCache::D3D12TextureCache(const RegisterFile& register_file,
       bindless_resources_used_(bindless_resources_used) {}
 
 D3D12TextureCache::~D3D12TextureCache() {
+  shared_memory().SetBeforeRequestHook(nullptr, nullptr);
   StopReplacementWorkers();
   // While the texture descriptor cache still exists (referenced by
   // ~D3D12Texture), destroy all textures.
@@ -733,6 +734,9 @@ bool D3D12TextureCache::Initialize() {
       provider.OffsetViewDescriptor(null_srv_descriptor_heap_start_,
                                     uint32_t(NullSRVDescriptorIndex::kCube)));
 
+  // gpu_lazy_resolve_copies_unscaled: every reader of shared memory requests its ranges first.
+  shared_memory().SetBeforeRequestHook(BeforeSharedMemoryRequest, this);
+
   return true;
 }
 
@@ -743,6 +747,9 @@ void D3D12TextureCache::ClearCache() {
     REXGPU_WARN("LAZYRESOLVE: {} pending copies dropped with the texture cache",
                 lazy_resolve_copies_.size());
     lazy_resolve_copies_.clear();
+    lazy_unscaled_pending_ = 0;
+    lazy_unscaled_start_ = UINT32_MAX;
+    lazy_unscaled_end_ = 0;
   }
   last_native_resolve_mirror_ = nullptr;
   TextureCache::ClearCache();
@@ -1685,12 +1692,14 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
 
 bool D3D12TextureCache::RebuildLazyResolveCopy(const LazyResolveCopy& copy, D3D12Texture& mirror) {
   // A replacement (texture_replace_dir) would be read instead of the guest's data.
-  if (!IsLazyResolveRebuildAvailable() || mirror.replaced_mip_levels() || !mirror.resource() ||
-      !copy.group_count_x || !copy.group_count_y) {
+  if (!IsLazyResolveRebuildAvailable(copy.unscaled) || mirror.replaced_mip_levels() ||
+      !mirror.resource() || !copy.group_count_x || !copy.group_count_y) {
     return false;
   }
-  if (!EnsureScaledResolveMemoryCommitted(copy.extent_start, copy.extent_length) ||
-      !MakeScaledResolveRangeCurrent(copy.dest_base, copy.current_length)) {
+  D3D12SharedMemory& d3d12_shared_memory = static_cast<D3D12SharedMemory&>(shared_memory());
+  if (!copy.unscaled &&
+      (!EnsureScaledResolveMemoryCommitted(copy.extent_start, copy.extent_length) ||
+       !MakeScaledResolveRangeCurrent(copy.dest_base, copy.current_length))) {
     return false;
   }
   ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
@@ -1699,9 +1708,16 @@ bool D3D12TextureCache::RebuildLazyResolveCopy(const LazyResolveCopy& copy, D3D1
     return false;
   }
   // The destination as the copy writes it (uint4 elements, resolve_copy_shader_info's
-  // dest_bpe_log2 of the fast 32bpp copy).
-  CreateCurrentScaledResolveRangeUintPow2UAV(descriptors[0].first, 4);
-  TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  // dest_bpe_log2 of the fast 32bpp copy): the current scaled resolve range, or all of shared
+  // memory (the unscaled copy's constants address it from dest_base, as the copy does). The
+  // range was made resident when the copy was skipped (RequestRange there).
+  if (copy.unscaled) {
+    d3d12_shared_memory.WriteUintPow2UAVDescriptor(descriptors[0].first, 4);
+    d3d12_shared_memory.UseForWriting();
+  } else {
+    CreateCurrentScaledResolveRangeUintPow2UAV(descriptors[0].first, 4);
+    TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
   D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
   srv_desc.Format = copy.srv_format;
   srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -1721,22 +1737,29 @@ bool D3D12TextureCache::RebuildLazyResolveCopy(const LazyResolveCopy& copy, D3D1
                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   command_processor_.SubmitBarriers();
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
-  command_processor_.SetExternalPipeline(lazy_rebuild_pipeline_);
+  command_processor_.SetExternalPipeline(copy.unscaled ? lazy_rebuild_unscaled_pipeline_
+                                                       : lazy_rebuild_pipeline_);
   command_list.D3DSetComputeRootSignature(lazy_rebuild_root_signature_);
   // As the direct resolve colour root signature lays them out: constants, destination, source.
   command_list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
   command_list.D3DSetComputeRootDescriptorTable(2, descriptors[1].second);
-  // The first of the two direct resolve constants: the mirror's scaled size (the rebuild writes
-  // nothing past it).
+  // The first of the two direct resolve constants: the mirror's size in host pixels (the rebuild
+  // writes nothing past it); an unscaled mirror is an unscaled texture.
   std::array<uint32_t, 8> root_constants = copy.root_constants;
   const TextureKey& mirror_key = mirror.key();
+  const uint32_t mirror_scale_x = copy.unscaled ? 1 : draw_resolution_scale_x();
+  const uint32_t mirror_scale_y = copy.unscaled ? 1 : draw_resolution_scale_y();
   root_constants[copy.root_constant_count - 2] =
-      std::min(mirror_key.GetWidth() * draw_resolution_scale_x(), uint32_t(0xFFFF)) |
-      (std::min(mirror_key.GetHeight() * draw_resolution_scale_y(), uint32_t(0xFFFF)) << 16);
+      std::min(mirror_key.GetWidth() * mirror_scale_x, uint32_t(0xFFFF)) |
+      (std::min(mirror_key.GetHeight() * mirror_scale_y, uint32_t(0xFFFF)) << 16);
   command_list.D3DSetComputeRoot32BitConstants(0, copy.root_constant_count, root_constants.data(),
                                                0);
   command_list.D3DDispatch(copy.group_count_x, copy.group_count_y, 1);
-  MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
+  if (copy.unscaled) {
+    d3d12_shared_memory.MarkUAVWritesCommitNeeded();
+  } else {
+    MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
+  }
   // Leave the mirror in the state its users expect it to be in.
   command_processor_.PushTransitionBarrier(mirror_resource,
                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -1754,6 +1777,8 @@ void D3D12TextureCache::PrepareLazyResolveCopiesForResolve(const LazyResolveCopy
       ++i;
       continue;
     }
+    // A resolve of the other kind (scaled or not) at the same place writes the other buffer, so
+    // it never makes a pending copy moot (Covers compares the kinds), but it's rebuilt first.
     if (resolve.Covers(pending.copy)) {
       // Overwritten completely by the resolve, by its copy or by its own pending one.
       ++lazy_dropped_;
@@ -1762,30 +1787,64 @@ void D3D12TextureCache::PrepareLazyResolveCopiesForResolve(const LazyResolveCopy
     } else {
       ++lazy_failed_;
     }
-    lazy_resolve_copies_.erase(lazy_resolve_copies_.begin() + i);
+    EraseLazyResolveCopy(i);
   }
   ReportLazyResolveCopies();
 }
 
 bool D3D12TextureCache::AddLazyResolveCopy(const LazyResolveCopy& copy) {
-  if (!last_native_resolve_mirror_ || !IsLazyResolveRebuildAvailable()) {
+  if (!last_native_resolve_mirror_ || !IsLazyResolveRebuildAvailable(copy.unscaled)) {
     return false;
   }
   lazy_resolve_copies_.push_back({copy, last_native_resolve_mirror_});
   ++lazy_skipped_;
+  if (copy.unscaled) {
+    ++lazy_unscaled_pending_;
+    ++lazy_skipped_unscaled_;
+    lazy_unscaled_start_ = std::min(lazy_unscaled_start_, copy.extent_start);
+    lazy_unscaled_end_ = std::max(lazy_unscaled_end_, copy.extent_start + copy.extent_length);
+  }
   ReportLazyResolveCopies();
   return true;
 }
 
-void D3D12TextureCache::MaterializeLazyResolveCopies(uint32_t start, uint32_t length) {
+void D3D12TextureCache::EraseLazyResolveCopy(size_t i) {
+  const bool unscaled = lazy_resolve_copies_[i].copy.unscaled;
+  lazy_resolve_copies_.erase(lazy_resolve_copies_.begin() + i);
+  if (!unscaled) {
+    return;
+  }
+  assert_not_zero(lazy_unscaled_pending_);
+  --lazy_unscaled_pending_;
+  // The span of the ones left (a few at a time, so recounted).
+  lazy_unscaled_start_ = UINT32_MAX;
+  lazy_unscaled_end_ = 0;
+  for (const PendingLazyResolveCopy& pending : lazy_resolve_copies_) {
+    if (pending.copy.unscaled) {
+      lazy_unscaled_start_ = std::min(lazy_unscaled_start_, pending.copy.extent_start);
+      lazy_unscaled_end_ =
+          std::max(lazy_unscaled_end_, pending.copy.extent_start + pending.copy.extent_length);
+    }
+  }
+}
+
+void D3D12TextureCache::MaterializeLazyResolveCopies(uint32_t start, uint32_t length,
+                                                     uint32_t kinds) {
   if (lazy_resolve_copies_.empty() || !length) {
     return;
   }
   const uint64_t end = uint64_t(start) + length;
+  // Unscaled ones only (shared memory's readers, every draw's vertex buffers): outside their span
+  // nothing is pending.
+  if (kinds == kLazyResolveUnscaled &&
+      (!lazy_unscaled_pending_ || start >= lazy_unscaled_end_ || end <= lazy_unscaled_start_)) {
+    return;
+  }
   for (size_t i = 0; i < lazy_resolve_copies_.size();) {
     PendingLazyResolveCopy& pending = lazy_resolve_copies_[i];
     const uint64_t pending_end = uint64_t(pending.copy.extent_start) + pending.copy.extent_length;
-    if (pending.copy.extent_start >= end || start >= pending_end) {
+    const uint32_t kind = pending.copy.unscaled ? kLazyResolveUnscaled : kLazyResolveScaled;
+    if (!(kinds & kind) || pending.copy.extent_start >= end || start >= pending_end) {
       ++i;
       continue;
     }
@@ -1794,9 +1853,39 @@ void D3D12TextureCache::MaterializeLazyResolveCopies(uint32_t start, uint32_t le
     } else {
       ++lazy_failed_;
     }
-    lazy_resolve_copies_.erase(lazy_resolve_copies_.begin() + i);
+    EraseLazyResolveCopy(i);
   }
   ReportLazyResolveCopies();
+}
+
+void D3D12TextureCache::BeforeSharedMemoryRequest(void* context,
+                                                  const std::pair<uint32_t, uint32_t>* ranges,
+                                                  size_t count, bool suppressed) {
+  auto& cache = *static_cast<D3D12TextureCache*>(context);
+  if (!cache.lazy_unscaled_pending_) {
+    return;
+  }
+  for (size_t r = 0; r < count; ++r) {
+    if (suppressed) {
+      // A draw's bindings are set up: nothing may be dispatched (the draw wrote its vertex and
+      // memexport ranges' copies before). Only count what is still pending there.
+      const uint64_t end = uint64_t(ranges[r].first) + ranges[r].second;
+      if (ranges[r].first >= cache.lazy_unscaled_end_ || end <= cache.lazy_unscaled_start_) {
+        continue;
+      }
+      for (const PendingLazyResolveCopy& pending : cache.lazy_resolve_copies_) {
+        if (pending.copy.unscaled && pending.copy.extent_start < end &&
+            ranges[r].first < uint64_t(pending.copy.extent_start) + pending.copy.extent_length) {
+          ++cache.lazy_late_;
+        }
+      }
+      continue;
+    }
+    cache.MaterializeLazyResolveCopies(ranges[r].first, ranges[r].second, kLazyResolveUnscaled);
+    if (!cache.lazy_unscaled_pending_) {
+      break;
+    }
+  }
 }
 
 bool D3D12TextureCache::RebuildFromLastMirror(const LazyResolveCopy& copy) {
@@ -1814,13 +1903,17 @@ void D3D12TextureCache::ReportLazyResolveCopies() {
   if (now_ms - lazy_last_report_ms_ < 5000) {
     return;
   }
-  REXGPU_INFO("LAZYRESOLVE skipped {} rebuilt {} dropped {} failed {} pending {} in {} ms",
-              lazy_skipped_, lazy_rebuilt_, lazy_dropped_, lazy_failed_,
-              lazy_resolve_copies_.size(), now_ms - lazy_last_report_ms_);
+  REXGPU_INFO(
+      "LAZYRESOLVE skipped {} rebuilt {} dropped {} failed {} pending {} in {} ms; unscaled skipped "
+      "{} pending {} late {}",
+      lazy_skipped_, lazy_rebuilt_, lazy_dropped_, lazy_failed_, lazy_resolve_copies_.size(),
+      now_ms - lazy_last_report_ms_, lazy_skipped_unscaled_, lazy_unscaled_pending_, lazy_late_);
   lazy_skipped_ = 0;
+  lazy_skipped_unscaled_ = 0;
   lazy_rebuilt_ = 0;
   lazy_dropped_ = 0;
   lazy_failed_ = 0;
+  lazy_late_ = 0;
   lazy_last_report_ms_ = now_ms;
 }
 
@@ -2101,12 +2194,15 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
 
   // gpu_lazy_resolve_copies: the scaled resolve memory this load reads holds the skipped copies
   // first (from their mirrors, which may be this texture: it's only overwritten below).
+  // (Unscaled ones: shared memory's RequestRanges hook, before the load requested its ranges.)
   if (texture_key.scaled_resolve && !lazy_resolve_copies_.empty()) {
     if (load_base) {
-      MaterializeLazyResolveCopies(texture_key.base_page << 12, d3d12_texture.GetGuestBaseSize());
+      MaterializeLazyResolveCopies(texture_key.base_page << 12, d3d12_texture.GetGuestBaseSize(),
+                                   kLazyResolveScaled);
     }
     if (load_mips) {
-      MaterializeLazyResolveCopies(texture_key.mip_page << 12, d3d12_texture.GetGuestMipsSize());
+      MaterializeLazyResolveCopies(texture_key.mip_page << 12, d3d12_texture.GetGuestMipsSize(),
+                                   kLazyResolveScaled);
     }
   }
 

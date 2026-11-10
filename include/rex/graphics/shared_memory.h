@@ -81,6 +81,21 @@ class SharedMemory {
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
 
+  // gpu_lazy_resolve_copies_unscaled: called by RequestRanges with the sorted, merged ranges before
+  // anything is uploaded, so a copy still pending there is written first (a CPU write after the
+  // resolve is uploaded after it and wins, as when the copy was made right away). While suppressed
+  // (a draw's bindings are set up, nothing may be dispatched) it is called with suppressed = true
+  // and must only count; the draw writes those copies before (D3D12CommandProcessor::IssueDraw).
+  typedef void (*BeforeRequestHook)(void* context, const std::pair<uint32_t, uint32_t>* ranges,
+                                    size_t count, bool suppressed);
+  void SetBeforeRequestHook(BeforeRequestHook hook, void* context) {
+    before_request_hook_ = hook;
+    before_request_hook_context_ = context;
+  }
+  void SetBeforeRequestHookSuppressed(bool suppressed) {
+    before_request_hook_suppressed_ = suppressed;
+  }
+
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
   // count optimization) as modified by the CPU, also invalidating GPU-written
@@ -166,6 +181,12 @@ class SharedMemory {
   // for every draw's buffers, and a vector of its own each time cost about 6 % of the command
   // processor thread in Spyro's Adventure).
   std::vector<std::pair<uint32_t, uint32_t>> request_merged_ranges_;
+  // SetBeforeRequestHook. The hook must not request ranges itself (request_merged_ranges_ is in
+  // use); in_before_request_hook_ keeps it from being called again if it does anyway.
+  BeforeRequestHook before_request_hook_ = nullptr;
+  void* before_request_hook_context_ = nullptr;
+  bool before_request_hook_suppressed_ = false;
+  bool in_before_request_hook_ = false;
 
   // Mutex between the guest memory subsystem and the command processor, to be
   // locked when checking or updating validity of pages/ranges and when firing

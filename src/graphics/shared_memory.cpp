@@ -390,6 +390,14 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     }
   }
 
+  // gpu_lazy_resolve_copies_unscaled: pending copies into these ranges before the uploads.
+  if (before_request_hook_ && !in_before_request_hook_) {
+    in_before_request_hook_ = true;
+    before_request_hook_(before_request_hook_context_, merged_ranges.data(), merged_ranges.size(),
+                         before_request_hook_suppressed_);
+    in_before_request_hook_ = false;
+  }
+
   // Almost every draw asks for pages that are valid already (nothing to upload), and the global
   // critical region below is the one the guest threads take too, so waiting for it showed up in
   // the command processor's profile (~4 % of its samples, some of them blocked). Look at the

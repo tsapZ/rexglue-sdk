@@ -2570,6 +2570,47 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  // gpu_lazy_resolve_copies_unscaled: the vertex buffers and memexport ranges are requested only
+  // after the bindings are set up, when nothing may be dispatched any more, so copies still
+  // pending there are written now (shared memory's RequestRanges hook takes the other readers:
+  // textures below, indices above, resolves).
+  if (texture_cache_->HasUnscaledLazyResolveCopies()) {
+    const Shader::ConstantRegisterMap& lazy_vertex_map = vertex_shader->constant_register_map();
+    for (uint32_t i = 0; i < rex::countof(lazy_vertex_map.vertex_fetch_bitmap); ++i) {
+      uint32_t vfetch_bits = lazy_vertex_map.vertex_fetch_bitmap[i];
+      uint32_t j;
+      while (rex::bit_scan_forward(vfetch_bits, &j)) {
+        vfetch_bits &= ~(uint32_t(1) << j);
+        xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(i * 32 + j);
+        if (vfetch_constant.type == xenos::FetchConstantType::kVertex ||
+            vfetch_constant.type == xenos::FetchConstantType::kInvalidVertex) {
+          texture_cache_->MaterializeLazyResolveCopies(vfetch_constant.address << 2,
+                                                       vfetch_constant.size << 2,
+                                                       D3D12TextureCache::kLazyResolveUnscaled);
+        }
+      }
+    }
+    if (memexport_used) {
+      // Refilled below; the same ranges.
+      memexport_ranges_.clear();
+      if (memexport_used_vertex) {
+        draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
+      }
+      if (memexport_used_pixel) {
+        draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
+      }
+      if (memexport_ranges_.empty()) {
+        texture_cache_->MaterializeLazyResolveCopies(0, SharedMemory::kBufferSize,
+                                                     D3D12TextureCache::kLazyResolveUnscaled);
+      }
+      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+        texture_cache_->MaterializeLazyResolveCopies(memexport_range.base_address_dwords << 2,
+                                                     memexport_range.size_bytes,
+                                                     D3D12TextureCache::kLazyResolveUnscaled);
+      }
+    }
+  }
+
   // Update the textures - this may bind pipelines.
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
@@ -2644,6 +2685,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return false;
   }
   // Must not call anything that can change the descriptor heap from now on!
+  // So shared memory's RequestRanges hook only counts from here (lazy copies written above).
+  struct LazyRequestHookSuppression {
+    SharedMemory& shared_memory;
+    explicit LazyRequestHookSuppression(SharedMemory& memory) : shared_memory(memory) {
+      shared_memory.SetBeforeRequestHookSuppressed(true);
+    }
+    ~LazyRequestHookSuppression() { shared_memory.SetBeforeRequestHookSuppressed(false); }
+  } lazy_request_hook_suppression(*shared_memory_);
 
   // Ensure vertex buffers are resident.
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
