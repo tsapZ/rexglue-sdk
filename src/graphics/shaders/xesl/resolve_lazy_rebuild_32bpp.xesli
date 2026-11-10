@@ -15,7 +15,8 @@
 // endian swap (the native write applies the red / blue swap and the half-pixel gap fill as the copy
 // does). Same dispatch, constants and destination addressing as resolve_direct_fast_32bpp (1 thread
 // = 8 scaled pixels of the resolve rectangle); xe_resolve_direct_rt_flags bits 0:3 are the packing of
-// the texture's integer view: 0 = R8G8B8A8_UINT (k_8_8_8_8), 1 = R16G16_UINT (k_16_16_FLOAT).
+// the texture's integer view: 0 = R8G8B8A8_UINT (k_8_8_8_8), 1 = R16G16_UINT (k_16_16_FLOAT),
+// 2 = R10G10B10A2_UINT (k_2_10_10_10), 3 = R32_UINT (k_32_FLOAT, the bits as they are).
 // xe_resolve_direct_rt_tiles is the texture's scaled width (bits 0:15) and height (16:31): the
 // resolve rectangle is rounded up to 8 guest pixels, the texture is the game's real size, so rows
 // and 4-pixel groups past it aren't written (padding no texture of that size reads; the copy wrote
@@ -30,7 +31,12 @@
 uint XeResolveLazyPack32bpp(uint4_xe texel, uint packing) {
   uint packed;
   dont_flatten_xe
-  if (packing == 1u) {
+  if (packing == 3u) {
+    packed = texel.x;
+  } else if (packing == 2u) {
+    packed = (texel.x & 0x3FFu) | ((texel.y & 0x3FFu) << 10u) | ((texel.z & 0x3FFu) << 20u) |
+             (texel.w << 30u);
+  } else if (packing == 1u) {
     packed = (texel.x & 0xFFFFu) | (texel.y << 16u);
   } else {
     packed = (texel.x & 0xFFu) | ((texel.y & 0xFFu) << 8u) | ((texel.z & 0xFFu) << 16u) |

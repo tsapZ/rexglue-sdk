@@ -1782,8 +1782,24 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         lazy.extent_length = resolve_info.copy_dest_extent_length;
         lazy.current_length = resolve_info.copy_dest_extent_start - resolve_info.copy_dest_base +
                               resolve_info.copy_dest_extent_length;
+        // The texture's integer view the rebuild reads and how it packs it
+        // (resolve_lazy_rebuild_32bpp); other formats never wait.
+        uint32_t lazy_packing = 0;
+        switch (lazy.format) {
+          case xenos::TextureFormat::k_2_10_10_10:
+            lazy_packing = 2;
+            lazy.srv_format = DXGI_FORMAT_R10G10B10A2_UINT;
+            break;
+          case xenos::TextureFormat::k_32_FLOAT:
+            lazy_packing = 3;
+            lazy.srv_format = DXGI_FORMAT_R32_UINT;
+            break;
+          default:
+            lazy.srv_format = DXGI_FORMAT_R8G8B8A8_UINT;
+            break;
+        }
         // The copy's constants (scaled: without dest_base), then the direct resolve's two, here 0
-        // and the packing (0: R8G8B8A8_UINT).
+        // and the packing.
         static_assert(sizeof(copy_shader_constants.dest_relative) + 2 * sizeof(uint32_t) <=
                       sizeof(lazy.root_constants));
         std::memcpy(lazy.root_constants.data(), &copy_shader_constants.dest_relative,
@@ -1791,29 +1807,33 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         lazy.root_constant_count =
             uint32_t(sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t));
         lazy.root_constants[lazy.root_constant_count++] = 0;
-        lazy.root_constants[lazy.root_constant_count++] = 0;
+        lazy.root_constants[lazy.root_constant_count++] = lazy_packing;
         // As resolve_copy_shader_info's fast 32bpp copy: 64x8 scaled pixels per group.
         const uint32_t width_scaled =
             (resolve_info.coordinate_info.width_div_8 << 3) * draw_resolution_scale_x();
         const uint32_t height_scaled = (resolve_info.height_div_8 << 3) * draw_resolution_scale_y();
         lazy.group_count_x = (width_scaled + 63) >> 6;
         lazy.group_count_y = (height_scaled + 7) >> 3;
-        lazy.srv_format = DXGI_FORMAT_R8G8B8A8_UINT;
         // The pending copies this resolve overlaps: rebuilt first, or dropped if it covers them.
         if (texture_cache.HasLazyResolveCopies()) {
           texture_cache.PrepareLazyResolveCopiesForResolve(lazy);
         }
       }
-      // A k_8_8_8_8 colour copy from the render target (not with a readback after every resolve):
-      // the textures are written first, and if one holds the whole rectangle the copy waits.
+      // A k_8_8_8_8, k_2_10_10_10 or k_32_FLOAT colour copy from the render target (not with a
+      // readback after every resolve): the textures are written first, and if one holds the whole
+      // rectangle the copy waits.
       bool native_written = false;
       bool lazy_mirror = false;
       const bool lazy_enabled = REXCVAR_GET(gpu_lazy_resolve_copies);
       const bool lazy_direct_color =
           direct_rt && (direct_kind == DirectResolveSourceKind::kColor ||
-                        direct_kind == DirectResolveSourceKind::kColorFull);
-      const bool lazy_8888 = uint32_t(resolve_info.copy_dest_info.copy_dest_format) ==
-                             uint32_t(xenos::TextureFormat::k_8_8_8_8);
+                        direct_kind == DirectResolveSourceKind::kColorFull ||
+                        direct_kind == DirectResolveSourceKind::kColorUint);
+      const xenos::TextureFormat lazy_dest_format =
+          xenos::TextureFormat(uint32_t(resolve_info.copy_dest_info.copy_dest_format));
+      const bool lazy_format_ok = lazy_dest_format == xenos::TextureFormat::k_8_8_8_8 ||
+                                  lazy_dest_format == xenos::TextureFormat::k_2_10_10_10 ||
+                                  lazy_dest_format == xenos::TextureFormat::k_32_FLOAT;
       const bool lazy_settings_ok = !verify && !REXCVAR_GET(direct_host_resolve_keep_dump) &&
                                     !REXCVAR_GET(d3d12_readback_resolve);
       if (lazy_enabled && !resolve_info.IsCopyingDepth()) {
@@ -1823,7 +1843,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           CountLazyOutcome(LazyOutcome::kNotDirect);
         } else if (!lazy_direct_color) {
           CountLazyOutcome(LazyOutcome::kKind);
-        } else if (!lazy_8888) {
+        } else if (!lazy_format_ok) {
           CountLazyOutcome(LazyOutcome::kFormat);
         } else if (!native_resolve) {
           CountLazyOutcome(LazyOutcome::kNotNative);
@@ -1832,7 +1852,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         }
       }
       if (lazy_tracking && native_resolve && lazy_enabled && lazy_direct_color && lazy_settings_ok &&
-          lazy_8888) {
+          lazy_format_ok) {
         texture_cache.CaptureUpToDateBeforeResolve(
             resolve_info.copy_dest_base, lazy.current_length);
         texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
@@ -6840,6 +6860,8 @@ const char* const D3D12RenderTargetCache::kNativeResolvePairNames[size_t(
     "6>31",
     "3>32",
     "0>6",
+    "2>7",
+    "14>36",
     "d0>22",
     "d1>23",
 };
@@ -6847,7 +6869,9 @@ const char* const D3D12RenderTargetCache::kNativeResolvePairNames[size_t(
 bool D3D12RenderTargetCache::IsNativeResolveEligible(const draw_util::ResolveInfo& resolve_info) {
   // Depth resolves are copies of the depth (the swap and the exponent bias don't apply to them),
   // the exponent bias is applied by native_resolve_cs to floating-point color only, and red and
-  // blue are swapped by it for k_8_8_8_8 only.
+  // blue are swapped by it for k_8_8_8_8 and k_2_10_10_10 only (the resolve shaders swap the
+  // 10-bit fields of the latter, XeResolveSwapRedBlue_2_10_10_10, as .bgra through UNORM views
+  // does: 10 and 2 bits round-trip through float exactly).
   const bool is_depth = resolve_info.IsCopyingDepth();
   const auto source_color_format = xenos::GetStorageColorFormat(
       xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format));
@@ -6863,7 +6887,8 @@ bool D3D12RenderTargetCache::IsNativeResolveEligible(const draw_util::ResolveInf
              source_color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT) {
     reason = NativeResolveFallback::kExpBias;
   } else if (!is_depth && resolve_info.copy_dest_info.copy_dest_swap != 0 &&
-             source_color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+             source_color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+             source_color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10) {
     reason = NativeResolveFallback::kSwap;
   } else {
     return true;
@@ -6958,6 +6983,31 @@ bool D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
         write.source_srv_format = DXGI_FORMAT_R8G8B8A8_UNORM;
         write.dest_uav_format = DXGI_FORMAT_R8G8B8A8_UNORM;
       }
+    } else if (source_format == xenos::ColorRenderTargetFormat::k_2_10_10_10) {
+      // R10G10B10A2_UNORM render target, R10G10B10A2_TYPELESS texture loaded as is (32bpb): copied
+      // like k_8_8_8_8, the swap and the fill through UNORM views (exact, as for 8 bits).
+      pair = NativeResolvePair::k2101010;
+      texture_format = xenos::TextureFormat::k_2_10_10_10;
+      if (swap_red_blue) {
+        write.mode = D3D12TextureCache::NativeResolveMode::kSwapRedBlue;
+        write.source_srv_format = DXGI_FORMAT_R10G10B10A2_UNORM;
+        write.dest_uav_format = DXGI_FORMAT_R10G10B10A2_UNORM;
+      } else if (fill_half_pixel_offset && !exp_bias) {
+        write.mode = D3D12TextureCache::NativeResolveMode::kScale;
+        write.source_srv_format = DXGI_FORMAT_R10G10B10A2_UNORM;
+        write.dest_uav_format = DXGI_FORMAT_R10G10B10A2_UNORM;
+      }
+    } else if (source_format == xenos::ColorRenderTargetFormat::k_32_FLOAT) {
+      // R32_TYPELESS render target and texture (the texture loads the bits as they are, 32bpb):
+      // copied, keeping every bit; the fill through R32_FLOAT views (scaled by 1, which may flush
+      // denormals: depth-like values in the games seen).
+      pair = NativeResolvePair::k32Float;
+      texture_format = xenos::TextureFormat::k_32_FLOAT;
+      if (exp_bias || fill_half_pixel_offset) {
+        write.mode = D3D12TextureCache::NativeResolveMode::kScale;
+        write.source_srv_format = DXGI_FORMAT_R32_FLOAT;
+        write.dest_uav_format = DXGI_FORMAT_R32_FLOAT;
+      }
     } else {
       // Including k_16_16, which the guest stores with a different range than the host.
       fallback(NativeResolveFallback::kSourceFormat);
@@ -7001,6 +7051,12 @@ bool D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
             break;
           case NativeResolvePair::k8888:
             write.source_srv_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            break;
+          case NativeResolvePair::k2101010:
+            write.source_srv_format = DXGI_FORMAT_R10G10B10A2_UNORM;
+            break;
+          case NativeResolvePair::k32Float:
+            write.source_srv_format = DXGI_FORMAT_R32_FLOAT;
             break;
           default:
             fallback(NativeResolveFallback::kMsaa);

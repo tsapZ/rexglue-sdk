@@ -738,6 +738,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     k2101010FloatTo16161616Float,
     // Color k_8_8_8_8 to k_8_8_8_8, copied or with red and blue swapped.
     k8888,
+    // Color k_2_10_10_10 to k_2_10_10_10, copied or with red and blue swapped.
+    k2101010,
+    // Color k_32_FLOAT to k_32_FLOAT, copied.
+    k32Float,
     // Depth kD24S8 to k_24_8.
     kD24S8,
     // Depth kD24FS8 to k_24_8_FLOAT.

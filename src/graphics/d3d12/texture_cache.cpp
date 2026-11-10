@@ -277,7 +277,8 @@ const D3D12TextureCache::HostFormat D3D12TextureCache::host_formats_[64] = {
      kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown,
      xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA},
     // k_32_FLOAT
-    {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, kLoadShaderIndex32bpb, DXGI_FORMAT_R32_FLOAT,
+    // Typeless for gpu_lazy_resolve_copies (the rebuild reads the bits through an R32_UINT view).
+    {DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_FLOAT, kLoadShaderIndex32bpb, DXGI_FORMAT_R32_FLOAT,
      kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown,
      xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR},
     // k_32_32_FLOAT
@@ -2063,6 +2064,8 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
       (key.format == xenos::TextureFormat::k_16_16_FLOAT ||
        key.format == xenos::TextureFormat::k_16_16_16_16_FLOAT ||
        key.format == xenos::TextureFormat::k_8_8_8_8 ||
+       key.format == xenos::TextureFormat::k_2_10_10_10 ||
+       key.format == xenos::TextureFormat::k_32_FLOAT ||
        key.format == xenos::TextureFormat::k_24_8 ||
        key.format == xenos::TextureFormat::k_24_8_FLOAT)) {
     // Native resolve destinations written by native_resolve_cs (WriteNativeResolveToTextures).
