@@ -78,6 +78,10 @@ REXCVAR_DEFINE_BOOL(gpu_lazy_resolve_copies_verify, false, "GPU",
                     "Debug: with gpu_lazy_resolve_copies, make the copy anyway, rebuild it from the "
                     "texture over it and compare the two word for word (logged as a direct resolve "
                     "verify, 'lazy')");
+REXCVAR_DEFINE_BOOL(gpu_native_resolves_unscaled, false, "GPU",
+                    "With resolution scaling and gpu_native_resolves: a resolve from render targets "
+                    "drawn at 1x (draw_resolution_scale_threshold), copied at 1x into shared memory, "
+                    "is also written into its unscaled textures, so they skip the reload");
 
 namespace rex::graphics::d3d12 {
 
@@ -1755,10 +1759,11 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
 
       // gpu_native_resolves: the textures viewing the destination that are up to date now
       // stay up to date if the resolved region is also copied into them on the host.
-      // Not for a 1x copy: its textures load the unscaled data from shared memory.
-      const bool native_resolve = REXCVAR_GET(gpu_native_resolves) && !copy_native &&
-                                  GetPath() == Path::kHostRenderTargets &&
-                                  IsNativeResolveEligible(resolve_info);
+      // A 1x copy (copy_native) into its unscaled textures only with gpu_native_resolves_unscaled.
+      const bool native_resolve =
+          REXCVAR_GET(gpu_native_resolves) &&
+          (!copy_native || REXCVAR_GET(gpu_native_resolves_unscaled)) &&
+          GetPath() == Path::kHostRenderTargets && IsNativeResolveEligible(resolve_info);
       // gpu_lazy_resolve_copies (D3D12TextureCache::LazyResolveCopy): this resolve's surface,
       // rectangle and the rebuild dispatch of its copy.
       texture_cache.SetLazyResolveRebuild(direct_resolve_root_signature_color_,
@@ -1857,7 +1862,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             resolve_info.copy_dest_base, lazy.current_length);
         texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                           resolve_info.copy_dest_extent_length, copy_dest_scaled);
-        lazy_mirror = WriteResolveToTextures(resolve_info, texture_cache);
+        lazy_mirror = WriteResolveToTextures(resolve_info, texture_cache, false);
         native_written = true;
         if (!lazy_mirror) {
           CountLazyOutcome(LazyOutcome::kNoMirror);
@@ -2132,7 +2137,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                               resolve_info.copy_dest_extent_length,
                                               copy_dest_scaled);
             if (native_resolve) {
-              WriteResolveToTextures(resolve_info, texture_cache);
+              WriteResolveToTextures(resolve_info, texture_cache, copy_native);
             }
           }
 
@@ -6899,7 +6904,8 @@ bool D3D12RenderTargetCache::IsNativeResolveEligible(const draw_util::ResolveInf
 }
 
 bool D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo& resolve_info,
-                                                    D3D12TextureCache& texture_cache) {
+                                                    D3D12TextureCache& texture_cache,
+                                                    bool unscaled) {
   auto fallback = [this](NativeResolveFallback reason) {
     CountNativeResolveFallback(reason);
     ReportNativeResolves();
@@ -7142,6 +7148,12 @@ bool D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
     fallback(NativeResolveFallback::kSourceFormat);
     return false;
   }
+  // A 1x render target's host pixels are guest pixels, a scaled one's are scaled: the write's
+  // scale must be the render target's (a 1x copy always has 1x owners only).
+  if (bool(rt_key.scale_native) != unscaled) {
+    fallback(NativeResolveFallback::kSourcePlacement);
+    return false;
+  }
   if (rt_key.msaa_samples != edram_info.msaa_samples) {
     fallback(NativeResolveFallback::kMsaa);
     return false;
@@ -7172,6 +7184,7 @@ bool D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
     fallback(NativeResolveFallback::kSourcePlacement);
     return false;
   }
+  write.unscaled = unscaled;
   write.base_page = (resolve_info.copy_dest_base & 0x1FFFFFFF) >> 12;
   write.format = texture_format;
   // TextureKey::pitch is the fetch constant pitch, in 32-texel units like the aligned resolve one.

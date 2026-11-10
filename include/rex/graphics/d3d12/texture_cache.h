@@ -209,6 +209,9 @@ class D3D12TextureCache final : public TextureCache {
     DXGI_FORMAT source_srv_format = DXGI_FORMAT_UNKNOWN;
     // Shader modes: the format of the UAV of the textures.
     DXGI_FORMAT dest_uav_format = DXGI_FORMAT_UNKNOWN;
+    // With resolution scaling, a 1x copy (draw_resolution_scale_threshold) from a 1x render target:
+    // the source pixels and the textures (unscaled ones) are guest pixels.
+    bool unscaled = false;
   };
   struct NativeResolveWriteCounts {
     uint32_t written = 0;

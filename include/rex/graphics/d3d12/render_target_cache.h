@@ -755,9 +755,11 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // After DumpRenderTargets and MarkRangeAsResolved for the resolve, copies the resolved region
   // from the source host render target into the texture cache textures viewing the destination
   // that were up to date before the resolve, and marks them up to date. True if one of them holds
-  // the whole rectangle (a mirror for gpu_lazy_resolve_copies).
+  // the whole rectangle (a mirror for gpu_lazy_resolve_copies). unscaled: a 1x copy with resolution
+  // scaling (copy_native, the resolve info redone at 1x) from a 1x render target into the
+  // unscaled textures.
   bool WriteResolveToTextures(const draw_util::ResolveInfo& resolve_info,
-                              D3D12TextureCache& texture_cache);
+                              D3D12TextureCache& texture_cache, bool unscaled);
   void CountNativeResolveFallback(NativeResolveFallback reason, uint64_t count = 1) {
     native_resolve_fallbacks_[size_t(reason)] += count;
   }

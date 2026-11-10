@@ -1450,9 +1450,9 @@ void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& w
   if (!write.source || !write.width || !write.height) {
     return;
   }
-  const bool scaled = IsDrawResolutionScaled();
-  const uint32_t scale_x = draw_resolution_scale_x();
-  const uint32_t scale_y = draw_resolution_scale_y();
+  const bool scaled = IsDrawResolutionScaled() && !write.unscaled;
+  const uint32_t scale_x = scaled ? draw_resolution_scale_x() : 1;
+  const uint32_t scale_y = scaled ? draw_resolution_scale_y() : 1;
   // gpu_lazy_resolve_copies: a written texture containing the whole rectangle mirrors the
   // destination memory there. The rectangle is rounded up to 8 pixels (1040x620 resolves as
   // 1040x624): up to 7 more columns and rows than the texture are its padding, which the rebuild
