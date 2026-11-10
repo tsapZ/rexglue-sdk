@@ -7036,6 +7036,14 @@ bool D3D12RenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo
         write.source_samples = 1 | (host1 << 4);
       } else if (select == xenos::CopySampleSelect::k01 || select == xenos::CopySampleSelect::k0123) {
         write.source_samples = 2 | (host0 << 4) | (host1 << 6);
+        // UNORM: averaged with the resolve shaders' own math, so the texture gets the copy's
+        // values (a float mean of the UNORM view rounded about 1 in 1000 of Giants' words the
+        // other way).
+        if (pair == NativeResolvePair::k8888) {
+          write.source_samples |= 1u << 8;
+        } else if (pair == NativeResolvePair::k2101010) {
+          write.source_samples |= 2u << 8;
+        }
       } else {
         fallback(NativeResolveFallback::kMsaa);
         return false;

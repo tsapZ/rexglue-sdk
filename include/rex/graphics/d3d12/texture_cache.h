@@ -192,7 +192,9 @@ class D3D12TextureCache final : public TextureCache {
     uint32_t height;
     NativeResolveMode mode = NativeResolveMode::kCopy;
     // A multisampled source (shader modes only, native_resolve_ms_cs): bits 0-1 the number of host
-    // samples read per pixel (1, or 2 averaged), bits 4-5 and 6-7 their indices. 0: single-sampled.
+    // samples read per pixel (1, or 2 averaged), bits 4-5 and 6-7 their indices, bits 8-9 how two
+    // are averaged (0 float, 1 k_8_8_8_8 and 2 k_2_10_10_10 as the resolve shaders do it).
+    // 0: single-sampled.
     uint32_t source_samples = 0;
     // kScale multiplier.
     float scale = 1.0f;
