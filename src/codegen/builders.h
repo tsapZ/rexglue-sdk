@@ -133,6 +133,7 @@ bool build_rldic(BuilderContext& ctx);
 bool build_rldicl(BuilderContext& ctx);
 bool build_rldicr(BuilderContext& ctx);
 bool build_rldimi(BuilderContext& ctx);
+bool build_rotld(BuilderContext& ctx);
 bool build_rotldi(BuilderContext& ctx);
 
 // Rotate left word
