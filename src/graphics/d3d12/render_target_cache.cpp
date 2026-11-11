@@ -78,7 +78,7 @@ REXCVAR_DEFINE_BOOL(gpu_lazy_resolve_copies_verify, false, "GPU",
                     "Debug: with gpu_lazy_resolve_copies, make the copy anyway, rebuild it from the "
                     "texture over it and compare the two word for word (logged as a direct resolve "
                     "verify, 'lazy')");
-REXCVAR_DEFINE_BOOL(gpu_lazy_resolve_copies_unscaled, false, "GPU",
+REXCVAR_DEFINE_BOOL(gpu_lazy_resolve_copies_unscaled, true, "GPU",
                     "With gpu_lazy_resolve_copies: copies into shared memory (at scale 1, and the 1x "
                     "copies of draw_resolution_scale_threshold) also wait, rebuilt from their "
                     "texture when something asks shared memory for that range");
