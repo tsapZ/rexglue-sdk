@@ -88,6 +88,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_RLDICL, build_rldicl},
       {PPC_INST_RLDICR, build_rldicr},
       {PPC_INST_RLDIMI, build_rldimi},
+      {PPC_INST_ROTLD, build_rotld},
       {PPC_INST_ROTLDI, build_rotldi},
       {PPC_INST_RLWIMI, build_rlwimi},
       {PPC_INST_RLWINM, build_rlwinm},
