@@ -1211,9 +1211,14 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // fullscreen is ever used in, the allow tearing flag must not be passed in
   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
   // presentation model used in Direct3D 12).
+  // Tearing only with vsync off: the games' VSync setting promises a picture that never tears, and
+  // a player saw it tear with VSync on (Core of Light #75). Without the flag the flip model still
+  // doesn't wait here; the newest frame is shown at the next vblank instead of mid-scan. vsync is
+  // the GPU plugin's setting (graphics/command_processor.cpp), so it is looked up by name.
+  const bool allow_tearing =
+      paint_context_.swap_chain_allows_tearing && !rex::cvar::Query<bool>("vsync");
   HRESULT present_result = paint_context_.swap_chain->Present(
-      0, DXGI_PRESENT_RESTART |
-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+      0, DXGI_PRESENT_RESTART | (allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.
