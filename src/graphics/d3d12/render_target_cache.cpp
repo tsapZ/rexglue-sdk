@@ -69,11 +69,11 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve_full, true, "GPU",
                     "With direct_host_resolve: colour resolves that convert the format, apply an "
                     "exponent bias or average the two samples of 2x MSAA also copy straight from the "
                     "render target (false: they dump first)");
-REXCVAR_DEFINE_BOOL(gpu_lazy_resolve_copies, false, "GPU",
-                    "With resolution scaling, direct_host_resolve and gpu_native_resolves: a k_8_8_8_8 "
-                    "colour resolve whose rectangle a natively written texture holds completely skips "
-                    "its copy into the scaled resolve memory, which is rebuilt from that texture when "
-                    "something reads it (D3D12)");
+REXCVAR_DEFINE_BOOL(gpu_lazy_resolve_copies, true, "GPU",
+                    "With resolution scaling, direct_host_resolve and gpu_native_resolves: a "
+                    "k_8_8_8_8, k_2_10_10_10 or k_32_FLOAT resolve whose rectangle a natively written "
+                    "texture holds completely skips its copy into the scaled resolve memory, which is "
+                    "rebuilt from that texture when something reads it (D3D12)");
 REXCVAR_DEFINE_BOOL(gpu_lazy_resolve_copies_verify, false, "GPU",
                     "Debug: with gpu_lazy_resolve_copies, make the copy anyway, rebuild it from the "
                     "texture over it and compare the two word for word (logged as a direct resolve "
