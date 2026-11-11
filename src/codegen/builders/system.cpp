@@ -205,7 +205,8 @@ bool build_mcrf(BuilderContext& ctx) {
 //=============================================================================
 
 bool build_mfxer(BuilderContext& ctx) {
-  ctx.println("\t{}.u64 = ({}.so << 31) | ({}.ov << 30) | ({}.ca << 29);",
+  // As 64-bit values: an int-promoted so << 31 is negative and turned the result into 0xFFFFFFFF80000000.
+  ctx.println("\t{}.u64 = (uint64_t({}.so) << 31) | (uint64_t({}.ov) << 30) | (uint64_t({}.ca) << 29);",
               ctx.r(ctx.insn.operands[0]), ctx.xer(), ctx.xer(), ctx.xer());
   return true;
 }
