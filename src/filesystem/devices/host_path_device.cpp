@@ -12,6 +12,7 @@
 #include <rex/filesystem/devices/host_path_entry.h>
 
 #include <algorithm>
+#include <cctype>
 
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
@@ -134,6 +135,17 @@ void HostPathDevice::OverlayEntry(HostPathEntry* parent_entry, const std::filesy
       REXFS_WARN("Overlay: {} left out (a file and a folder of the same name)",
                  rex::path_to_utf8(full_path));
       continue;
+    }
+    // No program files: the runtime loads game:\default.xex through this device, and a mod is
+    // files only, never code (the code review 2026-11-12).
+    if (!is_directory) {
+      std::string extension = rex::path_to_utf8(full_path.extension());
+      for (char& c : extension) c = char(std::tolower(static_cast<unsigned char>(c)));
+      if (extension == ".xex") {
+        REXFS_WARN("Overlay: {} left out (a program file; mods can't replace code)",
+                   rex::path_to_utf8(full_path));
+        continue;
+      }
     }
     if (is_directory) {
       if (!existing) {
