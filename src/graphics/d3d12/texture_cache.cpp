@@ -3097,7 +3097,7 @@ bool D3D12TextureCache::MakeReplacement(const ReplacementJob& job, ReplacementRe
       if (!in.read(reinterpret_cast<char*>(file.data()), std::streamsize(file.size()))) file.clear();
     }
   }
-  const std::string source = job.patch_source.empty() ? job.path.string() : job.name + " (patch)";
+  const std::string what = job.patch_source.empty() ? job.path.string() : job.name + " (patch)";
   if (file.size() < 4 + sizeof(DdsHeader) || std::memcmp(file.data(), "DDS ", 4) != 0) return false;
   DdsHeader header;
   std::memcpy(&header, file.data() + 4, sizeof(header));
@@ -3123,7 +3123,7 @@ bool D3D12TextureCache::MakeReplacement(const ReplacementJob& job, ReplacementRe
   if (dds_family != job.family || !header.width || !header.height ||
       (blocks && ((header.width & 3) || (header.height & 3))) || mips > 16 ||
       header.width > 16384 || header.height > 16384) {
-    REXGPU_WARN("Texture replacement: {} is not a {}x{}-compatible {} DDS", source, job.width,
+    REXGPU_WARN("Texture replacement: {} is not a {}x{}-compatible {} DDS", what, job.width,
                 job.height,
                 job.family == 0   ? "DXT1"
                 : job.family == 1 ? "DXT3"
@@ -3146,7 +3146,7 @@ bool D3D12TextureCache::MakeReplacement(const ReplacementJob& job, ReplacementRe
   size_t needed = data_offset;
   for (uint32_t m = 0; m < mips; ++m) needed += size_t(rows[m]) * row_bytes[m];
   if (file.size() < needed) {
-    REXGPU_WARN("Texture replacement: {} is too short for {} mips", source, mips);
+    REXGPU_WARN("Texture replacement: {} is too short for {} mips", what, mips);
     return false;
   }
   D3D12_RESOURCE_DESC upload_desc;
