@@ -2941,10 +2941,18 @@ const std::unordered_map<uint64_t, std::filesystem::path>& ReplacementIndex() {
 bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
   const std::string& dump_dir = REXCVAR_GET(texture_dump_dir);
   const std::string& replace_dir = REXCVAR_GET(texture_replace_dir);
-  if (dump_dir.empty() && replace_dir.empty() && !HasTexturePatches()) return false;
+  const bool patches = HasTexturePatches();
+  if (dump_dir.empty() && replace_dir.empty() && !patches) return false;
   const TextureKey key = texture.key();
   const int family = BlockFamily(key.format);
   const uint32_t width = key.GetWidth(), height = key.GetHeight();
+  // With patches alone, only a texture of a size one is registered for is worth untiling and
+  // hashing (the patches of a game are a handful of known textures).
+  const bool patch_size = patches && HasTexturePatchSize(width, height);
+  if (dump_dir.empty() && replace_dir.empty() && !patch_size) return false;
+  // 8888 only for a dump or a patch, never a replacement file: at scale 1 resolves aren't scaled,
+  // so a render target's first content could match a file and the target would stay frozen.
+  if (family == kFamily8888 && dump_dir.empty() && !patch_size) return false;
   // 2D textures in BC1-BC3 the host keeps compressed and 8888 ones up to 1024x1024 (UI atlases;
   // bigger ones are mostly render targets), not render-to-texture results, not tiny.
   if (family < 0 || (family == kFamily8888 && (width > 1024 || height > 1024)) ||
@@ -3048,11 +3056,11 @@ bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
   // A texture patch (texture_patch.h) first: game code redraws it from the guest's data. Else
   // the replacement: <hash>.dds of the same format.
   ReplacementJob job;
-  if (HasTexturePatch(hash)) {
+  if (patch_size && HasTexturePatch(hash)) {
     job.patch_source = std::move(linear);
     job.hash = hash;
   } else {
-    if (replace_dir.empty()) return false;
+    if (replace_dir.empty() || family == kFamily8888) return false;
     const auto& index = ReplacementIndex();
     const auto it = index.find(hash);
     if (it == index.end()) return false;
@@ -3097,7 +3105,13 @@ bool D3D12TextureCache::MakeReplacement(const ReplacementJob& job, ReplacementRe
       if (!in.read(reinterpret_cast<char*>(file.data()), std::streamsize(file.size()))) file.clear();
     }
   }
-  const std::string what = job.patch_source.empty() ? job.path.string() : job.name + " (patch)";
+  // The name for a warning, made only then: path::string() throws for characters the ANSI code page
+  // can't hold (a user name in Cyrillic), and this runs on a worker thread.
+  const auto what = [&job] {
+    if (!job.patch_source.empty()) return job.name + " (patch)";
+    const auto u8 = job.path.u8string();
+    return std::string(u8.begin(), u8.end());
+  };
   if (file.size() < 4 + sizeof(DdsHeader) || std::memcmp(file.data(), "DDS ", 4) != 0) return false;
   DdsHeader header;
   std::memcpy(&header, file.data() + 4, sizeof(header));
@@ -3106,16 +3120,20 @@ bool D3D12TextureCache::MakeReplacement(const ReplacementJob& job, ReplacementRe
   for (int f = 0; f < 3; ++f) {
     if (header.pixel_format.four_cc == kFourCC[f]) dds_family = f;
   }
-  // 8888 as the dump writes it: 32 bits a texel, A8R8G8B8 masks (B, G, R, A in memory).
-  if (!(header.pixel_format.flags & 0x4) && header.pixel_format.rgb_bit_count == 32 &&
-      header.pixel_format.r_mask == 0x00FF0000 && header.pixel_format.g_mask == 0x0000FF00 &&
-      header.pixel_format.b_mask == 0x000000FF) {
+  // 8888 as the dump writes it: 32 bits a texel with alpha, A8R8G8B8 masks (B, G, R, A in memory).
+  if (!(header.pixel_format.flags & 0x4) && (header.pixel_format.flags & 0x1) &&
+      header.pixel_format.rgb_bit_count == 32 && header.pixel_format.r_mask == 0x00FF0000 &&
+      header.pixel_format.g_mask == 0x0000FF00 && header.pixel_format.b_mask == 0x000000FF &&
+      header.pixel_format.a_mask == 0xFF000000) {
     dds_family = kFamily8888;
   }
   if (header.pixel_format.four_cc == FourCC('D', 'X', '1', '0') && file.size() >= data_offset + 20) {
     uint32_t dxgi_format;
     std::memcpy(&dxgi_format, file.data() + data_offset, 4);
     dds_family = BlockFamily(DXGI_FORMAT(dxgi_format));
+    // 8888 only in the layout above: a DX10 R8G8B8A8 file holds R, G, B, A, the guest's texels
+    // B, G, R, A, and copied as they are red and blue would swap.
+    if (dds_family == kFamily8888) dds_family = -1;
     data_offset += 20;
   }
   const uint32_t mips = std::max(uint32_t(1), header.mip_map_count);
@@ -3123,7 +3141,7 @@ bool D3D12TextureCache::MakeReplacement(const ReplacementJob& job, ReplacementRe
   if (dds_family != job.family || !header.width || !header.height ||
       (blocks && ((header.width & 3) || (header.height & 3))) || mips > 16 ||
       header.width > 16384 || header.height > 16384) {
-    REXGPU_WARN("Texture replacement: {} is not a {}x{}-compatible {} DDS", what, job.width,
+    REXGPU_WARN("Texture replacement: {} is not a {}x{}-compatible {} DDS", what(), job.width,
                 job.height,
                 job.family == 0   ? "DXT1"
                 : job.family == 1 ? "DXT3"
@@ -3146,7 +3164,7 @@ bool D3D12TextureCache::MakeReplacement(const ReplacementJob& job, ReplacementRe
   size_t needed = data_offset;
   for (uint32_t m = 0; m < mips; ++m) needed += size_t(rows[m]) * row_bytes[m];
   if (file.size() < needed) {
-    REXGPU_WARN("Texture replacement: {} is too short for {} mips", what, mips);
+    REXGPU_WARN("Texture replacement: {} is too short for {} mips", what(), mips);
     return false;
   }
   D3D12_RESOURCE_DESC upload_desc;
