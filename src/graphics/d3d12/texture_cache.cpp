@@ -41,6 +41,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
+#include <rex/graphics/texture_patch.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
@@ -2869,6 +2870,9 @@ constexpr uint32_t FourCC(char a, char b, char c, char d) {
 }
 constexpr uint32_t kFourCC[3] = {FourCC('D', 'X', 'T', '1'), FourCC('D', 'X', 'T', '3'),
                                  FourCC('D', 'X', 'T', '5')};
+// 8888 texels, kept as the guest has them after the endian swap (B, G, R, A in memory for the
+// games' UI): a DDS with A8R8G8B8 masks shows them in their colours.
+constexpr int kFamily8888 = 3;
 
 // 0 BC1, 1 BC2, 2 BC3, or -1 for the formats this doesn't handle.
 int BlockFamily(xenos::TextureFormat format) {
@@ -2879,6 +2883,8 @@ int BlockFamily(xenos::TextureFormat format) {
       return 1;
     case xenos::TextureFormat::k_DXT4_5:
       return 2;
+    case xenos::TextureFormat::k_8_8_8_8:
+      return kFamily8888;
     default:
       return -1;
   }
@@ -2897,6 +2903,9 @@ int BlockFamily(DXGI_FORMAT format) {
     case DXGI_FORMAT_BC3_UNORM:
     case DXGI_FORMAT_BC3_UNORM_SRGB:
       return 2;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+      return kFamily8888;
     default:
       return -1;
   }
@@ -2932,12 +2941,14 @@ const std::unordered_map<uint64_t, std::filesystem::path>& ReplacementIndex() {
 bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
   const std::string& dump_dir = REXCVAR_GET(texture_dump_dir);
   const std::string& replace_dir = REXCVAR_GET(texture_replace_dir);
-  if (dump_dir.empty() && replace_dir.empty()) return false;
+  if (dump_dir.empty() && replace_dir.empty() && !HasTexturePatches()) return false;
   const TextureKey key = texture.key();
   const int family = BlockFamily(key.format);
   const uint32_t width = key.GetWidth(), height = key.GetHeight();
-  // 2D textures in BC1-BC3 the host keeps compressed, not render-to-texture results, not tiny.
-  if (family < 0 || key.scaled_resolve || key.dimension != xenos::DataDimension::k2DOrStacked ||
+  // 2D textures in BC1-BC3 the host keeps compressed and 8888 ones up to 1024x1024 (UI atlases;
+  // bigger ones are mostly render targets), not render-to-texture results, not tiny.
+  if (family < 0 || (family == kFamily8888 && (width > 1024 || height > 1024)) ||
+      key.scaled_resolve || key.dimension != xenos::DataDimension::k2DOrStacked ||
       key.GetDepthOrArraySize() != 1 || width < 32 || height < 32 ||
       IsDecompressionNeeded(key.format, width, height) ||
       BlockFamily(GetDXGIResourceFormat(key)) != family) {
@@ -2946,8 +2957,9 @@ bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
   // The top level in the guest's memory, untiled and in little-endian order, as a DDS has it.
   const FormatInfo* info = FormatInfo::Get(key.format);
   const uint32_t bytes_per_block = info->bytes_per_block();
-  const uint32_t bytes_per_block_log2 = bytes_per_block == 16 ? 4 : 3;
-  const uint32_t blocks_x = (width + 3) / 4, blocks_y = (height + 3) / 4;
+  const uint32_t bytes_per_block_log2 = bytes_per_block == 16 ? 4 : bytes_per_block == 8 ? 3 : 2;
+  const uint32_t blocks_x = (width + info->block_width - 1) / info->block_width,
+                 blocks_y = (height + info->block_height - 1) / info->block_height;
   const auto& base = texture.guest_layout().base;
   const uint32_t guest_size = texture.GetGuestBaseSize();
   const uint8_t* guest =
@@ -3000,18 +3012,28 @@ bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
       first = dumped.insert(hash).second;
     }
     if (first) {
-      std::thread([path = Utf8Dir(dump_dir) / name, data = linear, width, height,
-                   four_cc = kFourCC[family]] {
+      std::thread([path = Utf8Dir(dump_dir) / name, data = linear, width, height, family] {
         DdsHeader h = {};
         h.size = sizeof(DdsHeader);
-        h.flags = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000;  // caps, height, width, pixel format, linear size
         h.height = height;
         h.width = width;
-        h.pitch_or_linear_size = uint32_t(data.size());
         h.mip_map_count = 1;
         h.pixel_format.size = 32;
-        h.pixel_format.flags = 0x4;  // DDPF_FOURCC
-        h.pixel_format.four_cc = four_cc;
+        if (family == kFamily8888) {
+          h.flags = 0x1 | 0x2 | 0x4 | 0x8 | 0x1000;  // caps, height, width, pitch, pixel format
+          h.pitch_or_linear_size = width * 4;
+          h.pixel_format.flags = 0x40 | 0x1;  // DDPF_RGB | DDPF_ALPHAPIXELS
+          h.pixel_format.rgb_bit_count = 32;
+          h.pixel_format.r_mask = 0x00FF0000;
+          h.pixel_format.g_mask = 0x0000FF00;
+          h.pixel_format.b_mask = 0x000000FF;
+          h.pixel_format.a_mask = 0xFF000000;
+        } else {
+          h.flags = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000;  // caps, height, width, pixel format, linear size
+          h.pitch_or_linear_size = uint32_t(data.size());
+          h.pixel_format.flags = 0x4;  // DDPF_FOURCC
+          h.pixel_format.four_cc = kFourCC[family];
+        }
         h.caps = 0x1000;  // DDSCAPS_TEXTURE
         std::error_code ec;
         std::filesystem::create_directories(path.parent_path(), ec);
@@ -3023,14 +3045,20 @@ bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
     }
   }
 
-  // The replacement: <hash>.dds of the same block format.
-  if (replace_dir.empty()) return false;
-  const auto& index = ReplacementIndex();
-  const auto it = index.find(hash);
-  if (it == index.end()) return false;
+  // A texture patch (texture_patch.h) first: game code redraws it from the guest's data. Else
+  // the replacement: <hash>.dds of the same format.
   ReplacementJob job;
+  if (HasTexturePatch(hash)) {
+    job.patch_source = std::move(linear);
+    job.hash = hash;
+  } else {
+    if (replace_dir.empty()) return false;
+    const auto& index = ReplacementIndex();
+    const auto it = index.find(hash);
+    if (it == index.end()) return false;
+    job.path = it->second;
+  }
   job.key = key;
-  job.path = it->second;
   job.desc = texture.resource()->GetDesc();
   job.family = family;
   job.width = width;
@@ -3054,13 +3082,22 @@ bool D3D12TextureCache::MakeReplacement(const ReplacementJob& job, ReplacementRe
   // One read of the whole file: reading it through stream iterators byte by byte made a figure
   // change stutter with an HD pack (a 1024x1024 DXT5 with mips is about 1.4 MB, and a new character
   // brings dozens).
-  std::ifstream in(job.path, std::ios::binary | std::ios::ate);
-  const std::streamoff file_size = in ? std::streamoff(in.tellg()) : std::streamoff(0);
-  std::vector<uint8_t> file(file_size > 0 ? size_t(file_size) : 0);
-  if (!file.empty()) {
-    in.seekg(0);
-    if (!in.read(reinterpret_cast<char*>(file.data()), std::streamsize(file.size()))) file.clear();
+  std::vector<uint8_t> file;
+  if (!job.patch_source.empty()) {
+    if (!ApplyTexturePatch(job.hash, job.width, job.height, job.patch_source.data(),
+                           job.patch_source.size(), file)) {
+      return false;
+    }
+  } else {
+    std::ifstream in(job.path, std::ios::binary | std::ios::ate);
+    const std::streamoff file_size = in ? std::streamoff(in.tellg()) : std::streamoff(0);
+    file.resize(file_size > 0 ? size_t(file_size) : 0);
+    if (!file.empty()) {
+      in.seekg(0);
+      if (!in.read(reinterpret_cast<char*>(file.data()), std::streamsize(file.size()))) file.clear();
+    }
   }
+  const std::string source = job.patch_source.empty() ? job.path.string() : job.name + " (patch)";
   if (file.size() < 4 + sizeof(DdsHeader) || std::memcmp(file.data(), "DDS ", 4) != 0) return false;
   DdsHeader header;
   std::memcpy(&header, file.data() + 4, sizeof(header));
@@ -3069,6 +3106,12 @@ bool D3D12TextureCache::MakeReplacement(const ReplacementJob& job, ReplacementRe
   for (int f = 0; f < 3; ++f) {
     if (header.pixel_format.four_cc == kFourCC[f]) dds_family = f;
   }
+  // 8888 as the dump writes it: 32 bits a texel, A8R8G8B8 masks (B, G, R, A in memory).
+  if (!(header.pixel_format.flags & 0x4) && header.pixel_format.rgb_bit_count == 32 &&
+      header.pixel_format.r_mask == 0x00FF0000 && header.pixel_format.g_mask == 0x0000FF00 &&
+      header.pixel_format.b_mask == 0x000000FF) {
+    dds_family = kFamily8888;
+  }
   if (header.pixel_format.four_cc == FourCC('D', 'X', '1', '0') && file.size() >= data_offset + 20) {
     uint32_t dxgi_format;
     std::memcpy(&dxgi_format, file.data() + data_offset, 4);
@@ -3076,10 +3119,16 @@ bool D3D12TextureCache::MakeReplacement(const ReplacementJob& job, ReplacementRe
     data_offset += 20;
   }
   const uint32_t mips = std::max(uint32_t(1), header.mip_map_count);
-  if (dds_family != job.family || !header.width || !header.height || (header.width & 3) ||
-      (header.height & 3) || mips > 16 || header.width > 16384 || header.height > 16384) {
-    REXGPU_WARN("Texture replacement: {} is not a {}x{}-compatible DXT{} DDS", job.path.string(),
-                job.width, job.height, job.family == 0 ? 1 : job.family == 1 ? 3 : 5);
+  const bool blocks = dds_family >= 0 && dds_family < kFamily8888;
+  if (dds_family != job.family || !header.width || !header.height ||
+      (blocks && ((header.width & 3) || (header.height & 3))) || mips > 16 ||
+      header.width > 16384 || header.height > 16384) {
+    REXGPU_WARN("Texture replacement: {} is not a {}x{}-compatible {} DDS", source, job.width,
+                job.height,
+                job.family == 0   ? "DXT1"
+                : job.family == 1 ? "DXT3"
+                : job.family == 2 ? "DXT5"
+                                  : "8888");
     return false;
   }
   D3D12_RESOURCE_DESC desc = job.desc;
@@ -3097,7 +3146,7 @@ bool D3D12TextureCache::MakeReplacement(const ReplacementJob& job, ReplacementRe
   size_t needed = data_offset;
   for (uint32_t m = 0; m < mips; ++m) needed += size_t(rows[m]) * row_bytes[m];
   if (file.size() < needed) {
-    REXGPU_WARN("Texture replacement: {} is too short for {} mips", job.path.string(), mips);
+    REXGPU_WARN("Texture replacement: {} is too short for {} mips", source, mips);
     return false;
   }
   D3D12_RESOURCE_DESC upload_desc;

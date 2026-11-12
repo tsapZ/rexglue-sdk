@@ -342,10 +342,14 @@ class D3D12TextureCache final : public TextureCache {
   // place. True when it was replaced (nothing else to load then).
   class D3D12Texture;
   bool DumpOrReplaceTexture(D3D12Texture& texture);
-  // A replacement file to load, and what came of it.
+  // A replacement file to load (or a texture patch to run on the guest's data), and what came
+  // of it.
   struct ReplacementJob {
     TextureKey key;
     std::filesystem::path path;
+    // texture_patch.h: the top level as the dump has it, for the patch of `hash`.
+    std::vector<uint8_t> patch_source;
+    uint64_t hash = 0;
     D3D12_RESOURCE_DESC desc;
     int family = -1;
     uint32_t width = 0, height = 0;
