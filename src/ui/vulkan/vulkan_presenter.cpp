@@ -766,10 +766,12 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
     VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
     bool surface_unusable;
+    const bool vsync = rex::cvar::Query<bool>("vsync");
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
-        old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
+        old_swapchain, vsync, paint_context_.present_queue_family, new_swapchain_format,
         paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+    paint_context_.swapchain_vsync = vsync;
     // Destroy the old swapchain that may be retired now.
     if (old_swapchain != VK_NULL_HANDLE) {
       dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
@@ -870,10 +872,12 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
       return SurfacePaintConnectResult::kFailure;
     }
     bool surface_unusable;
+    const bool vsync = rex::cvar::Query<bool>("vsync");
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
-        VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
+        VK_NULL_HANDLE, vsync, paint_context_.present_queue_family, new_swapchain_format,
         paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+    paint_context_.swapchain_vsync = vsync;
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Failed to create the swapchain for the new Vulkan surface - destroy the
       // Vulkan surface.
@@ -1108,8 +1112,9 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
 
 VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
-    VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out, VkFormat& image_format_out,
-    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& ui_surface_unusable_out) {
+    VkSwapchainKHR old_swapchain, bool vsync, uint32_t& present_queue_family_out,
+    VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out,
+    bool& ui_surface_unusable_out) {
   ui_surface_unusable_out = false;
 
   const VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
@@ -1381,7 +1386,11 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // interfering with GPU command processing, and also to allow tearing so
   // variable refresh rate may be used where it's available.
   // Note: If the priorities here are changes, update the cvar descriptions.
-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+  // With vsync on, no mode that tears: the games' VSync setting promises a picture that never
+  // tears, and immediate (and FIFO relaxed on a late frame) tore in exclusive fullscreen (Core of
+  // Light #76; a window is composited, so it hid this). Mailbox doesn't wait and doesn't tear; the
+  // command processor keeps the pace. The D3D12 presenter does the same with its tearing flag.
+  if (!vsync && REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate
@@ -1393,7 +1402,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
                  present_modes.cend()) {
     // Allowing dropping frames to reduce latency, but no tearing.
     swapchain_create_info.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
-  } else if (REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed) &&
+  } else if (!vsync && REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed) &&
              std::find(present_modes.cbegin(), present_modes.cend(),
                        VK_PRESENT_MODE_FIFO_RELAXED_KHR) != present_modes.cend()) {
     // Limiting the frame rate, but lets too long frames cause tearing not to
@@ -1529,6 +1538,13 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  // VSync switched since the swapchain was made: its present mode follows the setting, so the
+  // connection is made again, as after a resize. vsync is the GPU plugin's setting, looked up by
+  // name as in the D3D12 presenter.
+  if (paint_context_.swapchain != VK_NULL_HANDLE &&
+      rex::cvar::Query<bool>("vsync") != paint_context_.swapchain_vsync) {
+    return PaintResult::kNotPresentedConnectionOutdated;
+  }
   // Begin the submission in place of the one not currently potentially used on
   // the GPU.
   uint64_t current_paint_submission_index =

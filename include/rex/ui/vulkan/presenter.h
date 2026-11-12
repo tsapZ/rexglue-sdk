@@ -351,7 +351,7 @@ class VulkanPresenter final : public Presenter {
     // be destroyed externally no matter what the result is.
     static VkSwapchainKHR CreateSwapchainForVulkanSurface(
         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
-        VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out,
+        VkSwapchainKHR old_swapchain, bool vsync, uint32_t& present_queue_family_out,
         VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out,
         bool& ui_surface_unusable_out);
 
@@ -414,6 +414,8 @@ class VulkanPresenter final : public Presenter {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D swapchain_extent = {};
     bool swapchain_is_fifo = false;
+    // The vsync setting the swapchain's present mode was chosen for; a change makes it again.
+    bool swapchain_vsync = false;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
   };
