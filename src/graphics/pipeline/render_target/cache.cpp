@@ -408,6 +408,15 @@ void RenderTargetCache::InitializeCommon() {
                   REXCVAR_GET(draw_resolution_scale_threshold));
     }
   }
+
+  native_surfaces_ = false;
+  if (REXCVAR_GET(gpu_native_surfaces)) {
+    if (GetPath() != Path::kHostRenderTargets || !SupportsNativeSurfaces()) {
+      REXGPU_WARN("gpu_native_surfaces needs D3D12 host render targets - ignoring");
+    } else {
+      native_surfaces_ = true;
+    }
+  }
 }
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
@@ -1001,7 +1010,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                         interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index],
                         last_update_transfer_cutout());
         if (!interlock_barrier_only &&
-            (REXCVAR_GET(gpu_transfer_report) || REXCVAR_GET(gpu_native_surfaces))) {
+            (REXCVAR_GET(gpu_transfer_report) || native_surfaces_)) {
           NoteNativeSurfaceTransfers(last_update_transfers_[rt_bit_index], rt_keys[rt_bit_index]);
         }
       }
@@ -1643,7 +1652,7 @@ void RenderTargetCache::NoteNativeSurfaceTransfers(std::vector<Transfer>& transf
     return native_surfaces::SurfaceKind{key.is_depth != 0, key.resource_format, uint32_t(key.msaa_samples)};
   };
   const native_surfaces::SurfaceKind dest_kind = kind_of(dest_key);
-  const bool drop = REXCVAR_GET(gpu_native_surfaces);
+  const bool drop = native_surfaces_;
   const bool report = REXCVAR_GET(gpu_transfer_report);
   auto dropped_begin = std::remove_if(transfers.begin(), transfers.end(), [&](const Transfer& transfer) {
     const native_surfaces::SurfaceKind source_kind = kind_of(transfer.source->key());

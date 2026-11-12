@@ -130,6 +130,10 @@ class RenderTargetCache {
   // Whether the backend makes and draws 1x render targets for draw_resolution_scale_threshold
   // (D3D12 host render targets; the Vulkan backend isn't ported).
   virtual bool SupportsScaleThreshold() const { return false; }
+  // Whether gpu_native_surfaces may drop the ownership transfers between render target kinds:
+  // D3D12 host render targets, where it was measured and checked. On Vulkan the picture comes
+  // out in false colours with it (Spyro's Adventure, Core of Light #76).
+  virtual bool SupportsNativeSurfaces() const { return false; }
   // The sample count (log2) of the render target that last used the EDRAM tile, -1 if none did.
   int OwnerMsaaSamplesLog2(uint32_t tile) const;
 
@@ -762,6 +766,8 @@ class RenderTargetCache {
   // gpu_native_surfaces: whether a transfer kind (native_surfaces::PairKey) is kept, decided once
   // per kind (the keep list is set at start).
   std::map<uint32_t, bool> native_surface_keep_by_pair_;
+  // gpu_native_surfaces where the backend and path support it (InitializeCommon).
+  bool native_surfaces_ = false;
 
   // Bumped by everything that changes ownership_ranges_ or may delete render targets (for
   // update_skip_).
