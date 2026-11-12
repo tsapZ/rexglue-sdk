@@ -15,6 +15,7 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/null_device.h>
 #include <rex/filesystem/vfs.h>
@@ -331,8 +332,9 @@ bool Runtime::SetupVfs() {
       if (root.empty()) {
         continue;
       }
-      const std::u8string root_u8(reinterpret_cast<const char8_t*>(root.data()), root.size());
-      const auto [replaced, added] = device->AddOverlay(std::filesystem::path(root_u8));
+      // The root is UTF-8 (the game's folder may have any letters): rex::to_path, as the SDK's other
+      // paths from settings (this build has no char8_t).
+      const auto [replaced, added] = device->AddOverlay(rex::to_path(root));
       REXSYS_INFO("Overlay {}: {} files replaced, {} added", root, replaced, added);
     }
   }
