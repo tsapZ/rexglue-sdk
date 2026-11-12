@@ -267,6 +267,13 @@ bool build_mffs(BuilderContext& ctx) {
 bool build_mftb(BuilderContext& ctx) {
   // Xbox 360 timebase runs at 50 MHz (guest tick frequency)
   // Using REX_QUERY_TIMEBASE() macro provides properly scaled timing from the runtime
+  // The opcode table's generic mftb (31/371, any TBR) comes before mftbu (TBR 269), so mftbu lands here as well,
+  // with its TBR as the second operand (extract_tbr: 0 for 268, the number otherwise): the upper word then, as
+  // build_mftbu does (the SDK's PowerPC tests: instr_sysregs.s).
+  if (ctx.insn.operands[1] == 269) {
+    ctx.println("\t{}.u64 = REX_QUERY_TIMEBASE() >> 32;", ctx.r(ctx.insn.operands[0]));
+    return true;
+  }
   ctx.println("\t{}.u64 = REX_QUERY_TIMEBASE();", ctx.r(ctx.insn.operands[0]));
   return true;
 }
