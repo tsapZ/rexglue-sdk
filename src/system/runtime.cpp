@@ -40,7 +40,7 @@ REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
 REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
 REXCVAR_DEFINE_STRING(vfs_overlay_roots, "", "Runtime",
                       "Folders whose files take the place of the game's files at the same path, or "
-                      "are added to them (mods), in order (a later one wins), separated by ;")
+                      "are added to them (mods), in order (a later one wins), separated by |")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex {
@@ -321,12 +321,19 @@ bool Runtime::SetupVfs() {
     return false;
   }
   // Mods (vfs_overlay_roots, set by the game before the runtime is set up): their files take the
-  // place of the disc's at the same path, or are added; the disc's folder is not touched.
-  {
+  // place of the disc's at the same path, or are added; the disc's folder is not touched. Only on a
+  // read-only game folder: with game-relative writes on, an overlaid file's writes, deletes and
+  // renames would reach the mod's or the disc's folder (the code review 2026-11-12). The folders
+  // are separated by |, which Windows doesn't allow in a name (; it does).
+  if (REXCVAR_GET(allow_game_relative_writes)) {
+    if (!REXCVAR_GET(vfs_overlay_roots).empty()) {
+      REXSYS_WARN("Overlay: left out, the game's folder is writable (allow_game_relative_writes)");
+    }
+  } else {
     const std::string roots = REXCVAR_GET(vfs_overlay_roots);
     size_t start = 0;
     while (start <= roots.size()) {
-      const size_t end = std::min(roots.find(';', start), roots.size());
+      const size_t end = std::min(roots.find('|', start), roots.size());
       const std::string root = roots.substr(start, end - start);
       start = end + 1;
       if (root.empty()) {
