@@ -714,6 +714,9 @@ class RenderTargetCache {
   void ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,
                        uint32_t length_tiles, std::vector<Transfer>* transfers_append_out,
                        const Transfer::Rectangle* resolve_clear_cutout = nullptr);
+  // gpu_native_surfaces where this backend can (D3D12 host render targets), read now; logged once
+  // each time it changes.
+  bool NativeSurfaces();
   // gpu_transfer_report, gpu_native_surfaces: counts the transfers into dest_key by kind; with
   // gpu_native_surfaces also removes those KeepTransfer doesn't keep.
   void NoteNativeSurfaceTransfers(std::vector<Transfer>& transfers, const RenderTargetKey& dest_key);
@@ -766,8 +769,12 @@ class RenderTargetCache {
   // gpu_native_surfaces: whether a transfer kind (native_surfaces::PairKey) is kept, decided once
   // per kind (the keep list is set at start).
   std::map<uint32_t, bool> native_surface_keep_by_pair_;
-  // gpu_native_surfaces where the backend and path support it (InitializeCommon).
-  bool native_surfaces_ = false;
+  // Whether this backend and path can drop transfers for gpu_native_surfaces (InitializeCommon).
+  // The setting itself is read on each use (NativeSurfaces): games set its default in OnPostSetup,
+  // which can come after the cache started (Spyro's Adventure at scale 1, 2026-11-12).
+  bool native_surfaces_supported_ = false;
+  // NativeSurfaces' state as last logged (-1 none yet, 0 off, 1 on, 2 wanted but not here).
+  int native_surfaces_logged_ = -1;
 
   // Bumped by everything that changes ownership_ranges_ or may delete render targets (for
   // update_skip_).

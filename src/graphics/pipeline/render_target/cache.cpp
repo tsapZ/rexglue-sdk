@@ -409,14 +409,28 @@ void RenderTargetCache::InitializeCommon() {
     }
   }
 
-  native_surfaces_ = false;
-  if (REXCVAR_GET(gpu_native_surfaces)) {
-    if (GetPath() != Path::kHostRenderTargets || !SupportsNativeSurfaces()) {
+  // Only whether this backend can is fixed here; gpu_native_surfaces itself is read on each use
+  // (NativeSurfaces), as a game's default for it can come after this.
+  native_surfaces_supported_ = GetPath() == Path::kHostRenderTargets && SupportsNativeSurfaces();
+  native_surfaces_logged_ = -1;
+}
+
+bool RenderTargetCache::NativeSurfaces() {
+  // Read on each use, as before the Vulkan fix: Spyro's Adventure sets its default in OnPostSetup,
+  // which can come after InitializeCommon (its Vulkan check route at resolution scale 1 found the
+  // setting still off there, the smoke at scale 2 on).
+  const bool wanted = REXCVAR_GET(gpu_native_surfaces);
+  const bool on = wanted && native_surfaces_supported_;
+  const int state = !wanted ? 0 : (on ? 1 : 2);
+  if (state != native_surfaces_logged_) {
+    native_surfaces_logged_ = state;
+    if (state == 1) {
+      REXGPU_INFO("gpu_native_surfaces: on (D3D12 host render targets)");
+    } else if (state == 2) {
       REXGPU_WARN("gpu_native_surfaces needs D3D12 host render targets - ignoring");
-    } else {
-      native_surfaces_ = true;
     }
   }
+  return on;
 }
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
@@ -1010,7 +1024,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                         interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index],
                         last_update_transfer_cutout());
         if (!interlock_barrier_only &&
-            (REXCVAR_GET(gpu_transfer_report) || native_surfaces_)) {
+            (REXCVAR_GET(gpu_transfer_report) || NativeSurfaces())) {
           NoteNativeSurfaceTransfers(last_update_transfers_[rt_bit_index], rt_keys[rt_bit_index]);
         }
       }
@@ -1652,7 +1666,7 @@ void RenderTargetCache::NoteNativeSurfaceTransfers(std::vector<Transfer>& transf
     return native_surfaces::SurfaceKind{key.is_depth != 0, key.resource_format, uint32_t(key.msaa_samples)};
   };
   const native_surfaces::SurfaceKind dest_kind = kind_of(dest_key);
-  const bool drop = native_surfaces_;
+  const bool drop = NativeSurfaces();
   const bool report = REXCVAR_GET(gpu_transfer_report);
   auto dropped_begin = std::remove_if(transfers.begin(), transfers.end(), [&](const Transfer& transfer) {
     const native_surfaces::SurfaceKind source_kind = kind_of(transfer.source->key());
