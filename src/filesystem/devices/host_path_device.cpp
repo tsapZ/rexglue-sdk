@@ -113,6 +113,52 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
   return current_entry;
 }
 
+std::pair<size_t, size_t> HostPathDevice::AddOverlay(const std::filesystem::path& root) {
+  size_t replaced = 0;
+  size_t added = 0;
+  std::error_code ec;
+  if (root_entry_ && std::filesystem::is_directory(root, ec)) {
+    OverlayEntry(static_cast<HostPathEntry*>(root_entry_.get()), root, replaced, added);
+  }
+  return {replaced, added};
+}
+
+void HostPathDevice::OverlayEntry(HostPathEntry* parent_entry, const std::filesystem::path& host_dir,
+                                  size_t& replaced, size_t& added) {
+  for (auto& child_info : rex::filesystem::ListFiles(host_dir)) {
+    const std::filesystem::path full_path = host_dir / child_info.name;
+    const bool is_directory = child_info.type == rex::filesystem::FileInfo::Type::kDirectory;
+    auto* existing =
+        static_cast<HostPathEntry*>(parent_entry->GetChild(rex::path_to_utf8(child_info.name)));
+    if (existing && ((existing->attributes() & kFileAttributeDirectory) != 0) != is_directory) {
+      REXFS_WARN("Overlay: {} left out (a file and a folder of the same name)",
+                 rex::path_to_utf8(full_path));
+      continue;
+    }
+    if (is_directory) {
+      if (!existing) {
+        existing = HostPathEntry::Create(this, parent_entry, full_path, child_info);
+        parent_entry->children_.push_back(std::unique_ptr<Entry>(existing));
+      }
+      OverlayEntry(existing, full_path, replaced, added);
+      continue;
+    }
+    if (existing) {
+      existing->host_path_ = full_path;
+      existing->size_ = child_info.total_size;
+      existing->allocation_size_ = rex::round_up(child_info.total_size, bytes_per_sector());
+      existing->create_timestamp_ = child_info.create_timestamp;
+      existing->access_timestamp_ = child_info.access_timestamp;
+      existing->write_timestamp_ = child_info.write_timestamp;
+      ++replaced;
+    } else {
+      parent_entry->children_.push_back(std::unique_ptr<Entry>(
+          HostPathEntry::Create(this, parent_entry, full_path, child_info)));
+      ++added;
+    }
+  }
+}
+
 void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
   auto child_infos = rex::filesystem::ListFiles(parent_entry->host_path());
   for (auto& child_info : child_infos) {

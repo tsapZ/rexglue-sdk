@@ -9,6 +9,7 @@ add_executable(unit_tests
     core/fiber_test.cpp
     core/filesystem_test.cpp
     core/vfs_overwrite_test.cpp
+    core/vfs_overlay_test.cpp
     core/hash_test.cpp
     core/log_redact_test.cpp
     core/stream_test.cpp
