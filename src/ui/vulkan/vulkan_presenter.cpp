@@ -50,13 +50,15 @@ REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                     "Clear render pass during presentation");
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, true, "UI/Vulkan",
-                    "Allow immediate present mode (no vsync)");
+                    "Allow immediate present mode (tears; the first choice with vsync off, never "
+                    "used with vsync on)");
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
-                    "Allow mailbox present mode (triple buffering)");
+                    "Allow mailbox present mode (triple buffering, no tearing; the first choice "
+                    "with vsync on, else FIFO)");
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
-                    "Allow FIFO relaxed present mode");
+                    "Allow FIFO relaxed present mode (a late frame tears; only with vsync off)");
 
 namespace rex {
 namespace ui {
@@ -1390,6 +1392,9 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // tears, and immediate (and FIFO relaxed on a late frame) tore in exclusive fullscreen (Core of
   // Light #76; a window is composited, so it hid this). Mailbox doesn't wait and doesn't tear; the
   // command processor keeps the pace. The D3D12 presenter does the same with its tearing flag.
+  // Without mailbox (this NVIDIA driver offers none: "presentation mode 2" in the log) it is plain
+  // FIFO, the classic VSync: a late frame waits for the next refresh, as a composited D3D12 frame
+  // does. The next5 smoke runs on Vulkan (2026-11-13) kept 60 FPS with it.
   if (!vsync && REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
