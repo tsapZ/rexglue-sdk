@@ -31,6 +31,14 @@ class DynamicLibrary {
   DynamicLibrary& operator=(DynamicLibrary&& other) noexcept;
 
   bool Load(const std::filesystem::path& path, SymbolResolution mode = SymbolResolution::kLazy);
+
+  /**
+   * @brief Attach to a library only if it is already loaded in this process.
+   *
+   * Increments the module reference count like Load(), without triggering
+   * a new disk load or library initialization when absent.
+   */
+  bool OpenLoaded(const std::filesystem::path& path, SymbolResolution mode = SymbolResolution::kLazy);
   void Close();
   explicit operator bool() const { return handle_ != nullptr; }
 

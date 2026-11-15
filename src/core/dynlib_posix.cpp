@@ -24,10 +24,23 @@ DynamicLibrary& DynamicLibrary::operator=(DynamicLibrary&& other) noexcept {
   return *this;
 }
 
+static int ResolveDlopenFlags(SymbolResolution mode, bool only_if_loaded) {
+  int flags = (mode == SymbolResolution::kImmediate) ? RTLD_NOW : RTLD_LAZY;
+  if (only_if_loaded) {
+    flags |= RTLD_NOLOAD;
+  }
+  return flags;
+}
+
 bool DynamicLibrary::Load(const std::filesystem::path& path, SymbolResolution mode) {
   Close();
-  int flags = (mode == SymbolResolution::kImmediate) ? RTLD_NOW : RTLD_LAZY;
-  handle_ = dlopen(path.c_str(), flags);
+  handle_ = dlopen(path.c_str(), ResolveDlopenFlags(mode, false));
+  return handle_ != nullptr;
+}
+
+bool DynamicLibrary::OpenLoaded(const std::filesystem::path& path, SymbolResolution mode) {
+  Close();
+  handle_ = dlopen(path.c_str(), ResolveDlopenFlags(mode, true));
   return handle_ != nullptr;
 }
 

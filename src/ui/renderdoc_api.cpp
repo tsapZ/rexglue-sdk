@@ -25,10 +25,10 @@ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
 
   pRENDERDOC_GetAPI get_api = nullptr;
 
-  // Try to load the RenderDoc library. If RenderDoc is attached, the library
-  // should already be loaded into the process and this will increment the
-  // reference count. If not attached, the load will fail and we return nullptr.
-  if (!renderdoc_api->library_.Load(platform::lib_names::kRenderDoc)) {
+  // Attach only if RenderDoc has already injected itself into the process.
+  // Calling Load() (dlopen without RTLD_NOLOAD) would load a dormant
+  // librenderdoc.so whose hooks interfere with native Wayland Vulkan surfaces.
+  if (!renderdoc_api->library_.OpenLoaded(platform::lib_names::kRenderDoc)) {
     return nullptr;
   }
   get_api = renderdoc_api->library_.GetSymbol<pRENDERDOC_GetAPI>("RENDERDOC_GetAPI");
