@@ -86,6 +86,7 @@ function(rexglue_configure_target target_name)
 
     if(UNIX AND NOT APPLE)
         set_target_properties(${target_name} PROPERTIES
+            BUILD_RPATH "$ORIGIN"
             INSTALL_RPATH "$ORIGIN"
             BUILD_WITH_INSTALL_RPATH ON
         )
@@ -109,27 +110,36 @@ function(rexglue_configure_target target_name)
             COMMAND_EXPAND_LISTS
             VERBATIM
         )
-    elseif(APPLE)
-        # macOS: $<TARGET_RUNTIME_DLLS> does not resolve imported dylibs, so
-        # stage the shared runtime libraries explicitly next to the executable
-        # (paired with the @executable_path rpath above). Everything else the
-        # runtime links (fmt, spdlog, SDL3, ...) is static. Target names
-        # differ between an in-tree build and an installed SDK import.
+    elseif(UNIX)
+        # macOS (@executable_path) and Linux ($ORIGIN): $<TARGET_RUNTIME_DLLS> is empty on POSIX,
+        # so stage the shared runtime libraries explicitly next to the executable so the app is
+        # self-contained. Everything else the runtime links (fmt, spdlog, SDL3, ...) is static.
+        # Target names differ between an in-tree build and an installed SDK import.
         foreach(_rexglue_runtime_lib rex::runtime rexruntime rex::TracyClient TracyClient)
             if(TARGET ${_rexglue_runtime_lib})
-                add_custom_command(TARGET ${target_name} POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        $<TARGET_FILE:${_rexglue_runtime_lib}>
-                        $<TARGET_FILE_DIR:${target_name}>
-                    VERBATIM
-                )
+                if(_rexglue_runtime_lib MATCHES "TracyClient")
+                    # rexruntime does not link Tracy in Release builds; skip copying libTracyClient.
+                    add_custom_command(TARGET ${target_name} POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E $<IF:$<CONFIG:Release>,true,copy_if_different>
+                            $<TARGET_FILE:${_rexglue_runtime_lib}>
+                            $<TARGET_FILE_DIR:${target_name}>
+                        VERBATIM
+                    )
+                else()
+                    add_custom_command(TARGET ${target_name} POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            $<TARGET_FILE:${_rexglue_runtime_lib}>
+                            $<TARGET_FILE_DIR:${target_name}>
+                        VERBATIM
+                    )
+                endif()
             endif()
         endforeach()
     endif()
 
-    if(WIN32)
-        # FidelityFX is linked PRIVATE by rexui (to avoid propagating DLL
-        # requirements to tool-mode targets), so copy its DLLs explicitly.
+    if(WIN32 OR (UNIX AND NOT APPLE))
+        # FidelityFX is linked PRIVATE by rexui (to avoid propagating shared-lib
+        # requirements to tool-mode targets), so copy its shared libraries explicitly.
         foreach(_fx amd_fidelityfx_vk amd_fidelityfx_dx12)
             if(TARGET ${_fx})
                 add_custom_command(TARGET ${target_name} POST_BUILD
@@ -220,6 +230,7 @@ function(rexglue_configure_module_target target_name)
 
     if(UNIX AND NOT APPLE)
         set_target_properties(${target_name} PROPERTIES
+            BUILD_RPATH "$ORIGIN"
             INSTALL_RPATH "$ORIGIN"
             BUILD_WITH_INSTALL_RPATH ON
         )

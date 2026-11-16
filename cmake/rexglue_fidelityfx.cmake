@@ -58,6 +58,54 @@ if(NOT fidelityfx_POPULATED)
     FetchContent_Populate(fidelityfx)
 endif()
 
+# Ninja runs custom commands through /bin/sh (often bash on Linux), and bash brace-expands
+# the shader compiler's "-DX={0,1}" permutation lists into "-DX=0 -DX=1" (glslang:
+# "Macro redefined"). Escape the brace so every POSIX shell passes it through literally.
+if(NOT WIN32)
+    set(_rexglue_ffx_sc_file
+        "${fidelityfx_SOURCE_DIR}/sdk/include/FidelityFX/gpu/CMakeCompileShaders.txt")
+    file(READ "${_rexglue_ffx_sc_file}" _rexglue_ffx_sc_text)
+    string(FIND "${_rexglue_ffx_sc_text}" "Keep {0,1} permutation lists" _rexglue_ffx_sc_done)
+    if(_rexglue_ffx_sc_done EQUAL -1)
+        set(_rexglue_ffx_sc_anchor "\t\tset(SC_ARGS \${BASE_ARGS} \${API_BASE_ARGS} \${PERMUTATION_ARGS})\n")
+        string(FIND "${_rexglue_ffx_sc_text}" "${_rexglue_ffx_sc_anchor}" _rexglue_ffx_sc_pos)
+        if(_rexglue_ffx_sc_pos EQUAL -1)
+            message(FATAL_ERROR "FidelityFX shader compile script changed; update the brace-escape patch")
+        endif()
+        string(REPLACE "${_rexglue_ffx_sc_anchor}"
+            "${_rexglue_ffx_sc_anchor}\t\t# Keep {0,1} permutation lists away from shell brace expansion.\n\t\tif (NOT WIN32)\n\t\t\tstring(REPLACE \"{\" \"\\\\{\" SC_ARGS \"\${SC_ARGS}\")\n\t\tendif()\n"
+            _rexglue_ffx_sc_text "${_rexglue_ffx_sc_text}")
+        file(WRITE "${_rexglue_ffx_sc_file}" "${_rexglue_ffx_sc_text}")
+    endif()
+endif()
+
+# The Vulkan backend carves its scratch buffer into arrays aligned to only 4 bytes, but clang
+# vectorizes stores into them with aligned SSE moves; on Linux/POSIX the resulting fault would be
+# swallowed by the runtime's guest-memory signal handler and retried forever. Align the arrays
+# (and their start) to 16 bytes.
+set(_rexglue_ffx_vk_file "${fidelityfx_SOURCE_DIR}/sdk/src/backends/vk/ffx_vk.cpp")
+file(READ "${_rexglue_ffx_vk_file}" _rexglue_ffx_vk_text)
+string(FIND "${_rexglue_ffx_vk_text}" "FFX_ALIGN_UP((uintptr_t)(backendContext + 1), 16)"
+    _rexglue_ffx_vk_done)
+if(_rexglue_ffx_vk_done EQUAL -1)
+    set(_rexglue_ffx_vk_start "(uint8_t*)((BackendContext_VK*)(backendContext + 1));")
+    set(_rexglue_ffx_vk_size "FFX_ALIGN_UP(sizeof(BackendContext_VK) + extensionPropArraySize")
+    string(FIND "${_rexglue_ffx_vk_text}" "${_rexglue_ffx_vk_start}" _rexglue_ffx_vk_pos1)
+    string(FIND "${_rexglue_ffx_vk_text}" "${_rexglue_ffx_vk_size}" _rexglue_ffx_vk_pos2)
+    if(_rexglue_ffx_vk_pos1 EQUAL -1 OR _rexglue_ffx_vk_pos2 EQUAL -1)
+        message(FATAL_ERROR "FidelityFX ffx_vk.cpp changed; update the scratch alignment patch")
+    endif()
+    string(REGEX REPLACE "(ArraySize *= FFX_ALIGN_UP\\([^\n]*), sizeof\\(uint32_t\\)\\);"
+        "\\1, 16);" _rexglue_ffx_vk_text "${_rexglue_ffx_vk_text}")
+    string(REPLACE "${_rexglue_ffx_vk_start}"
+        "(uint8_t*)FFX_ALIGN_UP((uintptr_t)(backendContext + 1), 16);"
+        _rexglue_ffx_vk_text "${_rexglue_ffx_vk_text}")
+    string(REPLACE "${_rexglue_ffx_vk_size}"
+        "FFX_ALIGN_UP(sizeof(BackendContext_VK) + 16 + extensionPropArraySize"
+        _rexglue_ffx_vk_text "${_rexglue_ffx_vk_text}")
+    file(WRITE "${_rexglue_ffx_vk_file}" "${_rexglue_ffx_vk_text}")
+endif()
+
 set(REXGLUE_FIDELITYFX_SOURCE_DIR "${fidelityfx_SOURCE_DIR}" CACHE INTERNAL
     "Root of the fetched FidelityFX SDK source tree")
 
