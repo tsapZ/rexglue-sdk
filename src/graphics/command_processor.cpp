@@ -335,8 +335,11 @@ class MsaaFillAt1x {
 void ReportMsaaFillAt1x(xenos::MsaaSamples samples) {
   static uint64_t counts[2] = {};
   const uint32_t i = samples == xenos::MsaaSamples::k1X ? 0 : 1;
-  if ((counts[i]++ & 0x3FFF) == 0) {
+  const uint64_t n = counts[i]++;
+  if (n == 0) {
     REXGPU_INFO("MSAAFILL1X {} 4x fills drawn at 1x, {} at 2x", counts[0], counts[1]);
+  } else if ((n & 0x3FFF) == 0) {  // the running count: debug level, for performance work
+    REXGPU_DEBUG("MSAAFILL1X {} 4x fills drawn at 1x, {} at 2x", counts[0], counts[1]);
   }
 }
 

@@ -971,9 +971,13 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
           transfer_skip_tiles_ += overwritten_tiles[i];
         }
       }
-      if (transfer_skip_draws_ == 1 || (transfer_skip_draws_ & 0xFFF) == 0) {
+      // The first at info (the path is in use), the running count at debug level.
+      if (transfer_skip_draws_ == 1) {
         REXGPU_INFO("Transfer skip: {} draws overwrote {} tiles without an ownership transfer",
                     transfer_skip_draws_, transfer_skip_tiles_);
+      } else if ((transfer_skip_draws_ & 0xFFF) == 0) {
+        REXGPU_DEBUG("Transfer skip: {} draws overwrote {} tiles without an ownership transfer",
+                     transfer_skip_draws_, transfer_skip_tiles_);
       }
     }
     // The narrower draw: every render target it would transfer into must be a color one it writes
@@ -1002,10 +1006,14 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
         last_update_transfer_cutout_.height_pixels = cutout_height;
         last_update_transfer_cutout_bits_ = transfer_bits;
         ++transfer_cutout_draws_;
-        if (transfer_cutout_draws_ == 1 || (transfer_cutout_draws_ & 0xFFF) == 0) {
+        if (transfer_cutout_draws_ == 1) {
           REXGPU_INFO("Transfer skip: {} draws narrower than their render targets left what they "
                       "overwrite out of the transfers",
                       transfer_cutout_draws_);
+        } else if ((transfer_cutout_draws_ & 0xFFF) == 0) {
+          REXGPU_DEBUG("Transfer skip: {} draws narrower than their render targets left what they "
+                       "overwrite out of the transfers",
+                       transfer_cutout_draws_);
         }
       }
     }
