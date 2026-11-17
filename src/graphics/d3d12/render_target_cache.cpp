@@ -7287,7 +7287,7 @@ void D3D12RenderTargetCache::CountLazyOutcome(LazyOutcome outcome) {
       text += fmt::format(" {}={}", kNames[i], lazy_outcomes_[i]);
     }
   }
-  REXGPU_INFO("LAZYRESOLVE colour copies:{}", text);
+  REXGPU_DEBUG("LAZYRESOLVE colour copies:{}", text);  // periodic, for performance work
   lazy_outcomes_ = {};
 }
 
@@ -7315,7 +7315,7 @@ void D3D12RenderTargetCache::ReportNativeResolves() {
     }
   }
   if (native_resolve_written_ || fallback_total) {
-    REXGPU_INFO("NATIVERESOLVE written {}{} covered={} fallback {}{}", native_resolve_written_,
+    REXGPU_DEBUG("NATIVERESOLVE written {}{} covered={} fallback {}{}", native_resolve_written_,
                 written_pairs, native_resolve_covered_, fallback_total, fallbacks);
   }
   native_resolve_written_ = 0;

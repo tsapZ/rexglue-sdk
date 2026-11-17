@@ -1904,7 +1904,8 @@ void D3D12TextureCache::ReportLazyResolveCopies() {
   if (now_ms - lazy_last_report_ms_ < 5000) {
     return;
   }
-  REXGPU_INFO(
+  // A 5-second report for performance work: debug level (--log_level=debug), not in players' logs.
+  REXGPU_DEBUG(
       "LAZYRESOLVE skipped {} rebuilt {} dropped {} failed {} pending {} in {} ms; unscaled skipped "
       "{} pending {} late {}",
       lazy_skipped_, lazy_rebuilt_, lazy_dropped_, lazy_failed_, lazy_resolve_copies_.size(),
