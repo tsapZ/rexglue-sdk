@@ -899,7 +899,14 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
     }
   } else {
-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
+    // Once per run: the games move their threads between the six cores many times a second, and on
+    // a four-thread PC this line came about 70 times a second (49407 lines in a 12-minute player log,
+    // 2026-11-16), each a log write on the CPU that has the least to spare.
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+      REXSYS_WARN("Too few processor cores ({} of 6) - the game's threads run without core affinities",
+                  rex::thread::logical_processor_count());
+    }
   }
 }
 
