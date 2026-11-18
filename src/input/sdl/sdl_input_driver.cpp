@@ -10,7 +10,9 @@
  */
 
 #include <array>
+#include <chrono>
 #include <filesystem>
+#include <string>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
@@ -29,6 +31,26 @@ namespace {
 
 // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
 constexpr uint32_t kRumbleDurationMs = 0xFFFF;
+
+// A game's "controller_in_background" setting (when it defines one, e.g. skylanders-portal's F4 > Controller row) put
+// into this driver's SDL as SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS. The runtime library carries its own SDL, so a
+// hint the game sets in the copy linked into its exe never reaches this one (found 2026-11-18: with the setting on, a
+// real pad stopped in the background; with the hint in the environment, which both copies read, it worked). Called on
+// the UI thread before the gamepad subsystem starts and then at most once a second while events are pumped, so a
+// change in the game's menu takes effect at once. Read by name: the SDK doesn't define the setting itself.
+void ApplyBackgroundHint(bool force) {
+  static std::string last;
+  static auto next_check = std::chrono::steady_clock::time_point{};
+  const auto now = std::chrono::steady_clock::now();
+  if (!force && now < next_check) return;
+  next_check = now + std::chrono::seconds(1);
+  const std::string value = rex::cvar::GetFlagByName("controller_in_background");
+  if (value.empty() || value == last) return;
+  last = value;
+  const bool on = value == "true" || value == "1";
+  SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, on ? "1" : "0");
+  REXLOG_INFO("SDL: controller input in the background {}", on ? "on" : "off");
+}
 
 }  // namespace
 
@@ -88,7 +110,8 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
           },
           this);
 
-      // Initialize game controller subsystem
+      // Initialize game controller subsystem (the background hint first: SDL reads it when the subsystem starts)
+      ApplyBackgroundHint(true);
       if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         REXLOG_ERROR("SDL: Failed to init gamecontroller subsystem: {}", SDL_GetError());
         return;
@@ -676,6 +699,7 @@ void SDLInputDriver::QueueControllerUpdate() {
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
   if (!is_queued) {
     attached_window_->app_context().CallInUIThread([this]() {
+      ApplyBackgroundHint(false);
       SDL_PumpEvents();
       sdl_pumpevents_queued_ = false;
     });
