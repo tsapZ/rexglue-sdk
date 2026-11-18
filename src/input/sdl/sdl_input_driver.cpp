@@ -43,6 +43,7 @@ void ApplyBackgroundHint(bool force) {
   static auto next_check = std::chrono::steady_clock::time_point{};
   const auto now = std::chrono::steady_clock::now();
   if (!force && now < next_check) return;
+  if (force) last.clear();  // at the subsystem start always (code review 2026-11-18: a re-init would skip it)
   next_check = now + std::chrono::seconds(1);
   const std::string value = rex::cvar::GetFlagByName("controller_in_background");
   if (value.empty() || value == last) return;
