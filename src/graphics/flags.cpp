@@ -28,6 +28,15 @@ REXCVAR_DEFINE_BOOL(gamma_render_target_as_unorm16, true, "GPU",
                     "Use R16G16B16A16_UNORM for gamma render targets (more accurate than sRGB)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU", "Path to dump shaders to");
+// Off by default: a pass that reads a texture 1:1 at the pixel position itself, without the D3D9
+// half texel, wants the corner (Xenia's way). A game whose passes add the half texel turns it on
+// (SSARecomp does, in OnPostSetup). Both shader translators read it, so it lives here: defined in
+// the DXBC translator, which only Windows builds, it was missing on Linux and the GPU plugin could
+// not load there (undefined symbol).
+REXCVAR_DEFINE_BOOL(draw_resolution_scaled_pixel_position_centered, false, "GPU/Shader",
+                    "With resolution scaling, the pixel position a shader reads is each host "
+                    "pixel's centre in guest pixels, for passes that add the D3D9 half texel "
+                    "(false: its corner)");
 REXCVAR_DEFINE_BOOL(use_fuzzy_alpha_epsilon, false, "GPU",
                     "Use approximate compare for alpha test values to prevent "
                     "flickering on NVIDIA graphics cards");

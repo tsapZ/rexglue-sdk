@@ -28,13 +28,8 @@ REXCVAR_DEFINE_BOOL(dxbc_switch, true, "GPU/Shader", "Use switch statements in D
 
 REXCVAR_DEFINE_BOOL(dxbc_source_map, false, "GPU/Shader", "Generate source maps for DXBC");
 
-// Off by default: a pass that reads a texture 1:1 at the pixel position itself, without the D3D9
-// half texel, wants the corner (Xenia's way). A game whose passes add the half texel turns it on
-// (SSARecomp does, in OnPostSetup).
-REXCVAR_DEFINE_BOOL(draw_resolution_scaled_pixel_position_centered, false, "GPU/Shader",
-                    "With resolution scaling, the pixel position a shader reads is each host "
-                    "pixel's centre in guest pixels, for passes that add the D3D9 half texel "
-                    "(false: its corner)");
+// (defined in graphics/flags.cpp: the SPIR-V translator reads it too)
+REXCVAR_DECLARE(bool, draw_resolution_scaled_pixel_position_centered);
 
 namespace rex::graphics {
 using namespace ucode;
