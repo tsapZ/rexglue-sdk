@@ -21,10 +21,14 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
+
+// dxbc_translator.cpp: the pixel position at resolution scale as each host pixel's centre.
+REXCVAR_DECLARE(bool, draw_resolution_scaled_pixel_position_centered);
 
 namespace rex::graphics {
 
@@ -3200,6 +3204,28 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     // see the actual hardware instructions in both OpBitwiseXor and OpFNegate
     // cases.
     spv::Id const_sign_bit = builder_->makeUintConstant(UINT32_C(1) << 31);
+    // Revert the resolution scale (after rounding down, so a position passed to tfetch samples the
+    // scaled picture): each host pixel's corner in guest pixels, i / scale, or with
+    // draw_resolution_scaled_pixel_position_centered its centre, (i + 0.5) / scale - 0.5, as the D3D12
+    // translator does (dxbc_translator.cpp). The corner lies a quarter guest pixel off at scale 2, and a pass
+    // that adds the D3D9 half texel then reads a host pixel off: SSARecomp #40's ghost outline, on Vulkan
+    // still (Core of Light #76). The first host pixel lands a little below 0 and is clamped: the sign
+    // bits carry flags below.
+    auto unscale = [&](spv::Id position, uint32_t scale) -> spv::Id {
+      if (scale <= 1) {
+        return position;
+      }
+      const float inverse = 1.0f / float(scale);
+      position = builder_->createNoContractionBinOp(spv::OpFMul, type_float_, position,
+                                                    builder_->makeFloatConstant(inverse));
+      if (REXCVAR_GET(draw_resolution_scaled_pixel_position_centered)) {
+        position = builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, position,
+                                                      builder_->makeFloatConstant(0.5f * inverse - 0.5f));
+        position = builder_->createBinBuiltinCall(type_float_, ext_inst_glsl_std_450_, GLSLstd450FMax,
+                                                  position, const_float_0_);
+      }
+      return position;
+    };
     // X - pixel X .0 in the magnitude, is back-facing in the sign bit.
     assert_true(input_fragment_coordinates_ != spv::NoResult);
     id_vector_temp_.clear();
@@ -3210,11 +3236,7 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                         id_vector_temp_),
             spv::NoPrecision));
-    if (draw_resolution_scale_x_ > 1) {
-      param_gen_x = builder_->createNoContractionBinOp(
-          spv::OpFMul, type_float_, param_gen_x,
-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_x_)));
-    }
+    param_gen_x = unscale(param_gen_x, draw_resolution_scale_x_);
     param_gen_x = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                    GLSLstd450FAbs, param_gen_x);
     if (!modification.pixel.param_gen_point) {
@@ -3246,11 +3268,7 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                         id_vector_temp_),
             spv::NoPrecision));
-    if (draw_resolution_scale_y_ > 1) {
-      param_gen_y = builder_->createNoContractionBinOp(
-          spv::OpFMul, type_float_, param_gen_y,
-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_y_)));
-    }
+    param_gen_y = unscale(param_gen_y, draw_resolution_scale_y_);
     param_gen_y = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                    GLSLstd450FAbs, param_gen_y);
     if (modification.pixel.param_gen_point) {
