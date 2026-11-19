@@ -1402,6 +1402,26 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       depth = SpirvShaderTranslator::Depth20e4To32(*builder_, depth_float24, 0, true, false,
                                                    ext_inst_glsl_std_450_);
       builder_->createStore(depth, output_fragment_depth_);
+    } else if (current_shader().writes_depth()) {
+      // Not converting, but the shader writes depth itself: for float24, scale it from guest
+      // [0, 1] to host [0, 0.5] like the viewport does for interpolated depth (host render
+      // targets keep the full float24 range in [0, 1) for ownership transfer round trips), as
+      // the viewport doesn't apply to gl_FragDepth. Without this, a shader-written float24 depth
+      // is twice what the rasterizer writes for the same surface, and draws tested against it
+      // fail (Imaginators' hub light cone: a half-resolution depth downsample). The Direct3D 12
+      // translator does the same in CompletePixelShader_DSV_DepthTo24Bit.
+      spv::Id depth_is_float24 = builder_->createBinOp(
+          spv::OpINotEqual, type_bool_,
+          builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
+                                builder_->makeUintConstant(kSysFlag_DepthFloat24)),
+          const_uint_0_);
+      spv::Id depth = builder_->createLoad(output_fragment_depth_, spv::NoPrecision);
+      builder_->createStore(
+          builder_->createTriOp(spv::OpSelect, type_float_, depth_is_float24,
+                                builder_->createNoContractionBinOp(spv::OpFMul, type_float_, depth,
+                                                                   builder_->makeFloatConstant(0.5f)),
+                                depth),
+          output_fragment_depth_);
     }
   }
 
