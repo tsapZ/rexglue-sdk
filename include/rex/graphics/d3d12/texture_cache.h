@@ -341,7 +341,13 @@ class D3D12TextureCache final : public TextureCache {
   // DDS named by its content hash, and/or puts <hash>.dds from the replacement folder in its
   // place. True when it was replaced (nothing else to load then).
   class D3D12Texture;
-  bool DumpOrReplaceTexture(D3D12Texture& texture);
+  // probe_hash: only works out the hash of the guest's current data for the texture (true when
+  // it could), without dumping or replacing anything.
+  bool DumpOrReplaceTexture(D3D12Texture& texture, uint64_t* probe_hash = nullptr);
+  // Resources a reverted replacement left behind: frames under way may still use them, so they
+  // are released once the submission they were retired in has completed.
+  std::deque<std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12Resource>>> retired_replacements_;
+  void ReleaseRetiredReplacements();
   // A replacement file to load (or a texture patch to run on the guest's data), and what came
   // of it.
   struct ReplacementJob {
@@ -362,6 +368,8 @@ class D3D12TextureCache final : public TextureCache {
     std::string name;
     uint32_t guest_width = 0, guest_height = 0, width = 0, height = 0, mips = 0;
     uint64_t make_us = 0;
+    // The hash of the guest data this was made for (a texture may get other data meanwhile).
+    uint64_t hash = 0;
   };
   bool MakeReplacement(const ReplacementJob& job, ReplacementResult& out) const;
   void ApplyReplacement(D3D12Texture& texture, ReplacementResult& result, bool in_use);
@@ -474,10 +482,20 @@ class D3D12TextureCache final : public TextureCache {
                         D3D12_RESOURCE_STATES state, Microsoft::WRL::ComPtr<ID3D12Resource> upload,
                         uint32_t mip_levels, bool in_use);
     uint32_t replaced_mip_levels() const { return replaced_mip_levels_; }
-    // Looked at once for texture_dump_dir / texture_replace_dir (on its first load).
+    // Looked at once for texture_dump_dir / texture_replace_dir (on its first load, and again when
+    // the guest wrote other data to the texture's memory).
     bool files_checked = false;
+    // The hash of the guest data that check was made for.
+    uint64_t checked_hash = 0;
+    bool checked_hash_valid = false;
+    // Puts the resource made for the guest texture back (the guest wrote other data into the
+    // texture's memory, which the replacement doesn't fit). The replacement's resources go to
+    // `retired`, as frames under way may still use them. False if it couldn't be made.
+    bool RevertReplacement(std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& retired);
 
    private:
+    D3D12_RESOURCE_DESC unreplaced_desc_ = {};
+    bool has_unreplaced_desc_ = false;
     uint32_t replaced_mip_levels_ = 0;
     Microsoft::WRL::ComPtr<ID3D12Resource> replacement_upload_;
     Microsoft::WRL::ComPtr<ID3D12Resource> replaced_original_;
