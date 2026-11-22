@@ -15,6 +15,12 @@
 #include <rex/logging.h>
 #include <rex/system/xmemory.h>
 
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #include "test_memory.h"
 
 namespace {
@@ -752,3 +758,34 @@ TEST_CASE("LookupHeapByType selects correct heap", "[memory][heap]") {
     // Should be vC0000000 heap
   }
 }
+
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+TEST_CASE("Guest memory backing survives through views without a shared name", "[memory]") {
+  using namespace rex::memory;
+  const auto name = "rex-guest-memory-test-" + std::to_string(getpid());
+  const size_t length = page_size();
+  const auto handle = CreateFileMappingHandle(name, length, PageAccess::kReadWrite, false);
+  REQUIRE(handle != kFileMappingHandleInvalid);
+
+  const int reopened = shm_open(("/" + name).c_str(), O_RDONLY, 0);
+  CHECK(reopened == -1);
+  if (reopened >= 0) {
+    close(reopened);
+  }
+  auto* first = static_cast<uint8_t*>(MapFileView(handle, nullptr, length, PageAccess::kReadWrite, 0));
+  auto* second = static_cast<uint8_t*>(MapFileView(handle, nullptr, length, PageAccess::kReadWrite, 0));
+  CHECK(first);
+  CHECK(second);
+  if (first && second) {
+    first[0] = 37;
+    CHECK(second[0] == 37);
+  }
+  if (first) {
+    CHECK(UnmapFileView(handle, first, length));
+  }
+  if (second) {
+    CHECK(UnmapFileView(handle, second, length));
+  }
+  CloseFileMappingHandle(handle, name);
+}
+#endif

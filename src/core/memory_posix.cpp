@@ -472,15 +472,16 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
       assert_always();
       return kFileMappingHandleInvalid;
   }
-  oflag |= O_CREAT;
+  oflag |= O_CREAT | O_EXCL;
   auto full_path = MakeShmName(path);
   int ret = shm_open(full_path.c_str(), oflag, 0777);
   if (ret < 0) {
     return kFileMappingHandleInvalid;
   }
-  if (rex_ftruncate64(ret, static_cast<off_t>(length)) != 0) {
+  // All views use this fd. Unlink now so a crash also releases the backing tmpfs.
+  if (shm_unlink(full_path.c_str()) != 0 ||
+      rex_ftruncate64(ret, static_cast<off_t>(length)) != 0) {
     close(ret);
-    shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
   // The name only served to create the object: views are mapped from the descriptor, and nothing
@@ -492,12 +493,8 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
 #endif
 }
 
-void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
+void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& /*path*/) {
   close(static_cast<int>(handle));
-#if !REX_PLATFORM_ANDROID
-  auto full_path = MakeShmName(path);
-  shm_unlink(full_path.c_str());
-#endif
 }
 
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, PageAccess access,
