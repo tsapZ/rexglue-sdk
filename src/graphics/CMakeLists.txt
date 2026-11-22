@@ -30,6 +30,12 @@ set(REXGPU_XENOS_SOURCES
     pipeline/shader/translator_disasm.cpp
 )
 
+# Everything except the Xenos plugin entry point: the native plugin needs its
+# own copies of GraphicsSystem and CommandProcessor, since those symbols are
+# not part of rexruntime.
+set(REXGPU_NATIVE_BASE_SOURCES ${REXGPU_XENOS_SOURCES})
+list(REMOVE_ITEM REXGPU_NATIVE_BASE_SOURCES plugin_main.cpp)
+
 # SPIR-V shader translation
 set(REXGPU_XENOS_SPIRV_SOURCES
     pipeline/shader/spirv_builder.cpp
@@ -156,5 +162,61 @@ if(REXGLUE_USE_D3D12)
         d3d12
         dxgi
         dxguid
+    )
+endif()
+
+# rexgpu-native: native Vulkan renderer plugin (work in progress).
+if(REXGLUE_USE_VULKAN)
+    set(REXGPU_NATIVE_SOURCES
+        native/plugin_main.cpp
+        native/graphics_system.cpp
+        native/command_processor.cpp
+        native/color_image.cpp
+        native/depth_resolve.cpp
+        native/draw_pass.cpp
+        native/output_gamma.cpp
+        ${REXGPU_NATIVE_BASE_SOURCES}
+        ${REXGPU_XENOS_SPIRV_SOURCES}
+    )
+
+    add_library(rexgpu-native SHARED ${REXGPU_NATIVE_SOURCES})
+    add_library(rex::gpu-native ALIAS rexgpu-native)
+
+    set_target_properties(rexgpu-native PROPERTIES
+        EXPORT_NAME gpu-native
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+
+    target_include_directories(rexgpu-native PRIVATE
+        ${REXGLUE_ROOT}/thirdparty/renderdoc
+        ${REXGLUE_ROOT}
+    )
+
+    target_compile_options(rexgpu-native PRIVATE -Wno-unused-variable)
+
+    rex_target_pch(rexgpu-native
+        <mutex>
+        <unordered_map>
+        <rex/math.h>
+        <rex/memory.h>
+        <rex/thread/mutex.h>
+        <rex/system/xmemory.h>
+        <rex/graphics/xenos.h>
+        <rex/graphics/registers.h>
+        <rex/graphics/format/ucode.h>
+        <rex/graphics/pipeline/shader/shader.h>
+    )
+
+    target_link_libraries(rexgpu-native PRIVATE
+        rexruntime
+        xxHash::xxhash
+        Vulkan::Headers
+        glslang::SPIRV
+        glslang
+        MachineIndependent
+        GenericCodeGen
+        OSDependent
+        OGLCompiler
     )
 endif()
