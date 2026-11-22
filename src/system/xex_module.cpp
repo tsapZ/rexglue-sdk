@@ -15,6 +15,7 @@
 #include "pe/pe_image.h"
 
 #include <algorithm>
+#include <cstring>
 #include <unordered_map>
 
 #include <fmt/format.h>
@@ -57,6 +58,51 @@ void aes_decrypt_buffer(const uint8_t* session_key, const uint8_t* input_buffer,
 }
 
 namespace rex::runtime {
+
+namespace {
+
+// The unpacked image against the header's page digests, once after loading (Core of Light #118, 2026-11-22: a disc
+// whose code matched a supported one crashed in the CRT start-up on a pointer in read-only data that held text; this
+// says whether such an image was unpacked right). Page descriptor i-1 holds SHA-1(the pages of run i, then the 24
+// bytes of descriptor i), found on SuperChargers' disc: every code and read-only run matched; the first run's digest
+// isn't in the table, so runs 1..n-1 are checked. Logs one line. Reads only (~25 MB of SHA-1, before the game runs).
+void CheckImageDigests(const uint8_t* image, uint32_t base, uint32_t image_size,
+                       const xex2_page_descriptor* descs, uint32_t count, uint32_t page_size) {
+  static_assert(sizeof(xex2_page_descriptor) == 24, "a page descriptor is 24 bytes");
+  uint64_t offset = 0;
+  uint32_t checked = 0;
+  uint32_t bad = 0;
+  std::string first;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t value = descs[i].value;
+    const uint64_t size = uint64_t(value >> 4) * page_size;
+    if (i > 0 && offset + size <= image_size) {
+      uint8_t digest[0x14];
+      sha1::SHA1 s;
+      s.processBytes(image + offset, size_t(size));
+      s.processBytes(&descs[i], sizeof(xex2_page_descriptor));
+      s.finalize(digest);
+      ++checked;
+      if (std::memcmp(digest, descs[i - 1].data_digest, sizeof(digest)) != 0) {
+        if (bad++ < 3) {
+          static const char* const kKinds[] = {"?", "code", "data", "read-only data"};
+          first += fmt::format("{}{:08X} ({} pages, {})", first.empty() ? "" : ", ", uint32_t(base + offset),
+                               value >> 4, kKinds[(value & 0xF) < 4 ? (value & 0xF) : 0]);
+        }
+      }
+    }
+    offset += size;
+  }
+  if (bad == 0) {
+    REXLOG_INFO("XEX image: all {} page runs after the first match the header", checked);
+  } else {
+    REXLOG_WARN("XEX image: {} of {} page runs don't match the header, from {}: the loaded image isn't what "
+                "its own header says (unpacked wrong here, or the file is damaged)",
+                bad, checked, first);
+  }
+}
+
+}  // namespace
 
 using rex::system::KernelState;
 
@@ -912,6 +958,11 @@ bool XexModule::Load(const std::string_view name, const std::string_view path, c
       return false;
     }
   }
+
+  CheckImageDigests(memory()->TranslateVirtual<const uint8_t*>(base_address_), base_address_,
+                    image_size(),
+                    sec_header->page_descriptors, sec_header->page_descriptor_count,
+                    memory()->LookupHeap(base_address_)->page_size());
 
   // Note: caller will have to call LoadContinue once it's determined whether a
   // patch file exists or not!
