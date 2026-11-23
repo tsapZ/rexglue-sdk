@@ -786,6 +786,7 @@ void D3D12TextureCache::BeginSubmission(uint64_t new_submission_index) {
 
 void D3D12TextureCache::BeginFrame() {
   TextureCache::BeginFrame();
+  ReleaseRetiredReplacements();
   ApplyReadyReplacements();
 
   std::memset(unsupported_format_features_used_, 0, sizeof(unsupported_format_features_used_));
@@ -2009,6 +2010,10 @@ void D3D12TextureCache::D3D12Texture::SetReplacement(Microsoft::WRL::ComPtr<ID3D
                                                      Microsoft::WRL::ComPtr<ID3D12Resource> upload,
                                                      uint32_t mip_levels, bool in_use) {
   auto& d3d12_texture_cache = static_cast<D3D12TextureCache&>(texture_cache());
+  if (!has_unreplaced_desc_ && resource_) {
+    unreplaced_desc_ = resource_->GetDesc();
+    has_unreplaced_desc_ = true;
+  }
   for (const auto& descriptor_pair : srv_descriptors_) {
     // Frames under way may still read through them.
     if (in_use) {
@@ -2026,6 +2031,38 @@ void D3D12TextureCache::D3D12Texture::SetReplacement(Microsoft::WRL::ComPtr<ID3D
   ID3D12Device* device = d3d12_texture_cache.command_processor_.GetD3D12Provider().GetDevice();
   D3D12_RESOURCE_DESC resource_desc = resource_->GetDesc();
   SetHostMemoryUsage(device->GetResourceAllocationInfo(0, 1, &resource_desc).SizeInBytes);
+}
+
+bool D3D12TextureCache::D3D12Texture::RevertReplacement(
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& retired) {
+  if (!replaced_mip_levels_ || !has_unreplaced_desc_) return false;
+  auto& d3d12_texture_cache = static_cast<D3D12TextureCache&>(texture_cache());
+  const ui::d3d12::D3D12Provider& provider =
+      d3d12_texture_cache.command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  // Assuming untiling will be the next operation, as in CreateTexture.
+  Microsoft::WRL::ComPtr<ID3D12Resource> fresh;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(),
+          &unreplaced_desc_, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&fresh)))) {
+    return false;
+  }
+  // The descriptors of the replacement: frames under way may still read through them.
+  for (const auto& descriptor_pair : srv_descriptors_) {
+    retired_srv_descriptors_.push_back(descriptor_pair.second);
+  }
+  srv_descriptors_.clear();
+  if (resource_) retired.push_back(std::move(resource_));
+  if (replacement_upload_) retired.push_back(std::move(replacement_upload_));
+  if (replaced_original_) retired.push_back(std::move(replaced_original_));
+  replacement_upload_.Reset();
+  replaced_original_.Reset();
+  resource_ = std::move(fresh);
+  resource_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
+  replaced_mip_levels_ = 0;
+  D3D12_RESOURCE_DESC resource_desc = resource_->GetDesc();
+  SetHostMemoryUsage(device->GetResourceAllocationInfo(0, 1, &resource_desc).SizeInBytes);
+  return true;
 }
 
 D3D12TextureCache::D3D12Texture::~D3D12Texture() {
@@ -2182,7 +2219,28 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                               bool load_mips) {
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
-  // A replacement (texture_replace_dir) stays: the guest's data doesn't go into it.
+  // The base level is loaded again when the guest wrote into the texture's memory: a figure
+  // change puts another texture of the same address, size and format there. A replacement (or the
+  // lack of one) belongs to the data the files were checked for, so look at the data again.
+  if (load_base && d3d12_texture.files_checked && d3d12_texture.checked_hash_valid) {
+    uint64_t current_hash = 0;
+    if (!DumpOrReplaceTexture(d3d12_texture, &current_hash) ||
+        current_hash != d3d12_texture.checked_hash) {
+      if (d3d12_texture.replaced_mip_levels()) {
+        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> retired;
+        if (d3d12_texture.RevertReplacement(retired)) {
+          const uint64_t submission = command_processor_.GetCurrentSubmission();
+          for (auto& resource : retired) {
+            retired_replacements_.emplace_back(submission, std::move(resource));
+          }
+        }
+      }
+      d3d12_texture.files_checked = false;
+      d3d12_texture.checked_hash_valid = false;
+    }
+  }
+  // A replacement (texture_replace_dir) stays while the guest's data is the same: the guest's
+  // data doesn't go into it.
   if (d3d12_texture.replaced_mip_levels()) {
     return true;
   }
@@ -2939,7 +2997,7 @@ const std::unordered_map<uint64_t, std::filesystem::path>& ReplacementIndex() {
 
 }  // namespace
 
-bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
+bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture, uint64_t* probe_hash) {
   const std::string& dump_dir = REXCVAR_GET(texture_dump_dir);
   const std::string& replace_dir = REXCVAR_GET(texture_replace_dir);
   const bool patches = HasTexturePatches();
@@ -3009,6 +3067,12 @@ bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
   const uint64_t hash =
       XXH3_64bits_withSeed(linear.data(), linear.size(),
                            uint64_t(family) | uint64_t(width) << 8 | uint64_t(height) << 24);
+  if (probe_hash) {
+    *probe_hash = hash;
+    return true;
+  }
+  texture.checked_hash = hash;
+  texture.checked_hash_valid = true;
   const std::string name = fmt::format("{:016X}.dds", hash);
 
   // The dump: once per content, written on a thread of its own.
@@ -3067,6 +3131,7 @@ bool D3D12TextureCache::DumpOrReplaceTexture(D3D12Texture& texture) {
     if (it == index.end()) return false;
     job.path = it->second;
   }
+  job.hash = hash;
   job.key = key;
   job.desc = texture.resource()->GetDesc();
   job.family = family;
@@ -3193,6 +3258,7 @@ bool D3D12TextureCache::MakeReplacement(const ReplacementJob& job, ReplacementRe
   }
   out.upload->Unmap(0, nullptr);
   out.key = job.key;
+  out.hash = job.hash;
   out.name = job.name;
   out.guest_width = job.width;
   out.guest_height = job.height;
@@ -3231,6 +3297,13 @@ void D3D12TextureCache::ApplyReplacement(D3D12Texture& texture, ReplacementResul
     REXGPU_INFO("Texture replacement: {} ({}x{} -> {}x{}, {} mips, {:.1f} ms), {} so far, {} ms in all", result.name,
                 result.guest_width, result.guest_height, result.width, result.height, result.mips,
                 double(result.make_us) / 1000.0, replaced, spent_us / 1000);
+  }
+}
+
+void D3D12TextureCache::ReleaseRetiredReplacements() {
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  while (!retired_replacements_.empty() && retired_replacements_.front().first <= completed) {
+    retired_replacements_.pop_front();
   }
 }
 
@@ -3276,6 +3349,8 @@ void D3D12TextureCache::ApplyReadyReplacements() {
     if (!found) continue;
     D3D12Texture& texture = static_cast<D3D12Texture&>(*found);
     if (texture.replaced_mip_levels()) continue;
+    // The guest may have put other data into the texture since the file was queued.
+    if (!texture.checked_hash_valid || texture.checked_hash != result.hash) continue;
     ApplyReplacement(texture, result, true);
     applied = true;
   }
