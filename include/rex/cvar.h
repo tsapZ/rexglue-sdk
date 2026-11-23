@@ -150,6 +150,8 @@ enum class Lifecycle {
 // never overwrites a value a higher-priority source already set.
 enum class Source {
   kDefault,      // Compiled-in default
+  kProgram,      // The program's own default, set at start-up (SetFlagAsProgramDefault): not the
+                 // user's choice, so SaveConfig leaves it out and a later version's default applies
   kConfig,       // TOML config file
   kEnvironment,  // REX_* environment variable
   kCommandLine,  // --flag on the command line
@@ -197,6 +199,12 @@ std::optional<size_t> RegisterFlag(FlagEntry entry);
 void UnregisterFlag(std::string_view name);
 
 bool SetFlagByName(std::string_view name, std::string_view value);
+
+// Sets the program's own default for a flag (Source::kProgram), e.g. an app's preferred value
+// for an SDK flag, applied at start-up when nothing set it. Unlike SetFlagByName it is not a
+// user's choice: SaveConfig doesn't write it into the settings file. Skipped (returns false)
+// when a higher source (the config file, the command line, ...) already set the flag.
+bool SetFlagAsProgramDefault(std::string_view name, std::string_view value);
 
 // Applies a value parsed off the command line. Returns false only when the
 // value is rejected (unparseable, or outside the flag's constraints); a value
@@ -247,6 +255,13 @@ bool HasNonDefaultValue(std::string_view name);
 std::vector<std::string> ListModifiedFlags();
 std::string SerializeToTOML();
 std::string SerializeToTOML(std::string_view category);
+// What SaveConfig writes: only the flags the user chose, from the settings file (Source::kConfig)
+// or changed at runtime (Source::kRuntime: the settings overlay, the console). Left out: values
+// code set directly (REXCVAR_SET leaves the source at kDefault), program defaults (kProgram), and
+// one run's command line or environment (a test's switches). Before, the overlay's "Save to config"
+// froze such derived values into the file (e.g. a language's country), and they then counted as
+// the user's own on the next start.
+std::string SerializeUserSettingsToTOML();
 
 /// Callback invoked when a CVAR value changes
 /// @param name The CVAR name

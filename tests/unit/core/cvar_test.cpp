@@ -574,6 +574,44 @@ TEST_CASE("cvar TOML serialization", "[cvar]") {
   CHECK(toml.find("[\"Test\"]\n[\"Test\"]") == std::string::npos);
 }
 
+TEST_CASE("cvar SerializeUserSettingsToTOML writes only the user's choices", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  auto config_path = std::filesystem::temp_directory_path() / "test_user_settings.toml";
+  {
+    std::ofstream file(config_path);
+    file << "test_string_flag = \"from config\"\n";
+  }
+  rex::cvar::LoadConfig(config_path);
+  std::filesystem::remove(config_path);
+
+  REXCVAR_SET(test_int32_flag, 999);                                     // set by code: derived
+  CHECK(rex::cvar::SetFlagAsProgramDefault("test_double_flag", "2.5"));  // the program's default
+  CHECK(rex::cvar::SetFlagFromCommandLine("test_enum_flag", "high"));   // one run's switch
+  CHECK(rex::cvar::SetFlagByName("test_bool_flag", "true"));            // the user, at runtime
+
+  CHECK(rex::cvar::GetFlagSource("test_double_flag") == rex::cvar::Source::kProgram);
+  CHECK(rex::cvar::GetFlagSource("test_int32_flag") == rex::cvar::Source::kDefault);
+
+  auto user = rex::cvar::SerializeUserSettingsToTOML();
+  CHECK(user.find("test_string_flag = \"from config\"") != std::string::npos);
+  CHECK(user.find("test_bool_flag = true") != std::string::npos);
+  CHECK(user.find("test_int32_flag") == std::string::npos);
+  CHECK(user.find("test_double_flag") == std::string::npos);
+  CHECK(user.find("test_enum_flag") == std::string::npos);
+
+  // The full serialization still has every changed value.
+  auto all = rex::cvar::SerializeToTOML();
+  CHECK(all.find("test_int32_flag = 999") != std::string::npos);
+  CHECK(all.find("test_double_flag") != std::string::npos);
+
+  // A program default doesn't override the config file or the command line.
+  CHECK_FALSE(rex::cvar::SetFlagAsProgramDefault("test_string_flag", "program"));
+  CHECK(REXCVAR_GET(test_string_flag) == "from config");
+  CHECK_FALSE(rex::cvar::SetFlagAsProgramDefault("test_enum_flag", "low"));
+  CHECK(REXCVAR_GET(test_enum_flag) == "high");
+}
+
 TEST_CASE("cvar metadata integration test", "[cvar][integration]") {
   rex::cvar::testing::ResetAllForTesting();
 
@@ -752,8 +790,11 @@ TEST_CASE("cvar SaveConfig", "[cvar]") {
   std::filesystem::remove(save_path);
 
   SECTION("SaveConfig writes modified flags to file") {
-    REXCVAR_SET(test_int32_flag, 777);
-    REXCVAR_SET(test_string_flag, "saved_value");
+    // Changed as the settings overlay changes them (Source::kRuntime): SaveConfig writes only the
+    // user's choices, not values code set with REXCVAR_SET (SerializeUserSettingsToTOML).
+    CHECK(rex::cvar::SetFlagByName("test_int32_flag", "777"));
+    CHECK(rex::cvar::SetFlagByName("test_string_flag", "saved_value"));
+    REXCVAR_SET(test_double_flag, 9.5);  // set by code: stays out of the file
 
     rex::cvar::SaveConfig(save_path);
 
@@ -769,6 +810,7 @@ TEST_CASE("cvar SaveConfig", "[cvar]") {
 
     CHECK(content.find("test_int32_flag = 777") != std::string::npos);
     CHECK(content.find("test_string_flag = \"saved_value\"") != std::string::npos);
+    CHECK(content.find("test_double_flag") == std::string::npos);
 
     std::filesystem::remove(save_path);
   }

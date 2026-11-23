@@ -350,6 +350,10 @@ bool SetFlagByName(std::string_view name, std::string_view value) {
   return SetFlagFromSource(name, value, Source::kRuntime) == ApplyResult::kApplied;
 }
 
+bool SetFlagAsProgramDefault(std::string_view name, std::string_view value) {
+  return SetFlagFromSource(name, value, Source::kProgram) == ApplyResult::kApplied;
+}
+
 bool SetFlagFromCommandLine(std::string_view name, std::string_view value) {
   return SetFlagFromSource(name, value, Source::kCommandLine) != ApplyResult::kRejected;
 }
@@ -567,15 +571,39 @@ std::string EscapeTomlBasicString(std::string_view s) {
 
 }  // namespace
 
+namespace {
+
+// A value the user chose (see SerializeUserSettingsToTOML in cvar.h).
+bool IsUserChoice(const FlagEntry& entry) {
+  return entry.source == Source::kConfig || entry.source == Source::kRuntime;
+}
+
+std::string SerializeEntries(bool user_only);
+
+}  // namespace
+
 std::string SerializeToTOML() {
+  return SerializeEntries(false);
+}
+
+std::string SerializeUserSettingsToTOML() {
+  return SerializeEntries(true);
+}
+
+namespace {
+
+std::string SerializeEntries(bool user_only) {
   std::lock_guard lock(GetRegistryMutex());
+  auto skip = [user_only](const FlagEntry& entry) {
+    return entry.getter() == entry.default_value || (user_only && !IsUserChoice(entry));
+  };
 
   // Group by each cvar's own category (set where it's REXCVAR_DEFINE'd) so the file reads the
   // same way the console/help grouping does, and so [Headers] written by hand survive a save:
   // the header is regenerated from this same category data, not preserved literally.
   std::vector<std::string> category_order;
   for (const auto& entry : GetRegistryStorage()) {
-    if (entry.getter() == entry.default_value) continue;
+    if (skip(entry)) continue;
     if (std::find(category_order.begin(), category_order.end(), entry.category) ==
         category_order.end()) {
       category_order.push_back(entry.category);
@@ -586,7 +614,7 @@ std::string SerializeToTOML() {
   for (const auto& category : category_order) {
     std::string body;
     for (const auto& entry : GetRegistryStorage()) {
-      if (entry.category != category || entry.getter() == entry.default_value) continue;
+      if (entry.category != category || skip(entry)) continue;
       if (entry.type == FlagType::String) {
         body += entry.name + " = \"" + EscapeTomlBasicString(entry.getter()) + "\"\n";
       } else {
@@ -599,6 +627,8 @@ std::string SerializeToTOML() {
   }
   return result;
 }
+
+}  // namespace
 
 std::string SerializeToTOML(std::string_view category) {
   std::lock_guard lock(GetRegistryMutex());
@@ -842,7 +872,8 @@ bool IsFinalized() {
 }
 
 void SaveConfig(const std::filesystem::path& config_path) {
-  std::string content = SerializeToTOML();
+  // Only what the user chose: derived values, program defaults and one run's switches stay out.
+  std::string content = SerializeUserSettingsToTOML();
   if (content.empty()) {
     REXLOG_DEBUG("SaveConfig: no modified flags to save");
     return;
