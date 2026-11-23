@@ -224,6 +224,8 @@ TEST_CASE("Depfile escapes characters make treats as syntax", "[output_stamp]") 
   std::ifstream in(depfile, std::ios::binary);
   std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 
-  CHECK(content.find("has\ space.toml") != std::string::npos);
-  CHECK(content.find("hash\#.toml") != std::string::npos);
+  // Raw strings: "has\ space" in a plain literal is an unknown escape that the compiler turns into
+  // a bare space, so the check looked for the unescaped name and failed against a correct depfile.
+  CHECK(content.find(R"(has\ space.toml)") != std::string::npos);
+  CHECK(content.find(R"(hash\#.toml)") != std::string::npos);
 }
