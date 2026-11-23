@@ -551,6 +551,7 @@ int XexModule::ReadImageUncompressed(const void* xex_addr, size_t xex_length) {
           ->AllocFixed(base_address_, uncompressed_size, 4096,
                        rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit,
                        rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite);
+  loaded_image_size_ = alloc_result ? uncompressed_size : 0;
   if (!alloc_result) {
     REXLOG_ERROR("Unable to allocate XEX memory at {:08X}-{:08X}.", base_address_,
                  uncompressed_size);
@@ -614,6 +615,7 @@ int XexModule::ReadImageBasicCompressed(const void* xex_addr, size_t xex_length)
       heap->AllocFixed(base_address_, total_size, 4096,
                        rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit,
                        rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite);
+  loaded_image_size_ = alloc_result ? total_size : 0;
   if (!alloc_result) {
     REXLOG_ERROR("Unable to allocate XEX memory at {:08X}-{:08X}.", base_address_,
                  uncompressed_size);
@@ -759,6 +761,7 @@ int XexModule::ReadImageCompressed(const void* xex_addr, size_t xex_length) {
                 base_address_, uncompressed_size, 4096,
                 rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit,
                 rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite);
+    loaded_image_size_ = alloc_result ? uncompressed_size : 0;
 
     if (alloc_result) {
       uint8_t* buffer = memory()->TranslateVirtual(base_address_);
@@ -959,10 +962,21 @@ bool XexModule::Load(const std::string_view name, const std::string_view path, c
     }
   }
 
-  CheckImageDigests(memory()->TranslateVirtual<const uint8_t*>(base_address_), base_address_,
-                    image_size(),
-                    sec_header->page_descriptors, sec_header->page_descriptor_count,
-                    memory()->LookupHeap(base_address_)->page_size());
+  // Not for a patch (a title update: ReadImage unpacks nothing for it). The descriptors are read only
+  // as far as the header holds them, the image only as far as ReadImage allocated it (a damaged file
+  // may claim more; found in a review, 2026-11-22).
+  if (!is_patch() && loaded_image_size_) {
+    const auto* header_begin = xex_header_mem_.data();
+    const auto* header_end = header_begin + xex_header_mem_.size();
+    const auto* descs = reinterpret_cast<const uint8_t*>(sec_header->page_descriptors);
+    uint32_t count = sec_header->page_descriptor_count;
+    if (descs >= header_begin && descs <= header_end) {
+      count = std::min<uint32_t>(count, uint32_t((header_end - descs) / sizeof(xex2_page_descriptor)));
+      CheckImageDigests(memory()->TranslateVirtual<const uint8_t*>(base_address_), base_address_,
+                        loaded_image_size_, sec_header->page_descriptors, count,
+                        memory()->LookupHeap(base_address_)->page_size());
+    }
+  }
 
   // Note: caller will have to call LoadContinue once it's determined whether a
   // patch file exists or not!

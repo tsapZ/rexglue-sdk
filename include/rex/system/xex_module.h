@@ -233,6 +233,9 @@ class XexModule : public Module {
 
   XexFormat xex_format_ = kFormatUnknown;
   SecurityInfoContext security_info_ = {};
+  // How much ReadImage allocated and unpacked at base_address_ (0: nothing): the image digest check
+  // reads no further than this, whatever the descriptors claim.
+  uint32_t loaded_image_size_ = 0;
 };
 
 }  // namespace rex::runtime
