@@ -414,9 +414,12 @@ class PosixConditionBase {
       if (timeout == std::chrono::milliseconds::max()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       } else {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-        std::this_thread::sleep_for(sleep_time);
+        // Sleep to the deadline at full precision. A duration_cast to milliseconds rounded anything under
+        // 1 ms down to a zero sleep, which returns at once: the alertable waits call this with 1 ms slices,
+        // so a thread waiting on several objects with no timeout spun a whole core.
+        std::chrono::steady_clock::duration remaining = end_time - now;
+        std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(
+            remaining, std::chrono::milliseconds(1)));
       }
     }
   }
@@ -1106,7 +1109,9 @@ std::chrono::milliseconds ComputeAlertableWaitTimeout(
   if (deadline == std::chrono::steady_clock::time_point::max()) {
     return kAlertablePollSlice;
   }
-  auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+  // Rounded up: truncating would turn the last part of a deadline (less than 1 ms) into a zero wait, which
+  // returns at once, so the caller's loop spins until the deadline has passed.
+  auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
       deadline - std::chrono::steady_clock::now());
   if (remaining <= std::chrono::milliseconds::zero()) {
     return std::chrono::milliseconds::zero();
