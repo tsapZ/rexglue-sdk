@@ -13,6 +13,7 @@ add_executable(unit_tests
     core/log_redact_test.cpp
     core/stream_test.cpp
     core/chrono_test.cpp
+    core/wait_multiple_test.cpp
     ppc/import_function_test.cpp
     ppc/stack_test.cpp
     system/guest_path_test.cpp
