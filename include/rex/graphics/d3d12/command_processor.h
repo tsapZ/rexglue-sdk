@@ -461,6 +461,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;
   uint64_t frame_completed_ = 0;
+  // How long the CPU waited for the GPU (blocking fence waits) and how many frames began, logged a few times per
+  // session (LogGpuWait), as the Vulkan backend does: near the whole frame time = the GPU is the limit.
+  int64_t gpu_wait_us_ = 0;
+  uint64_t gpu_wait_frames_ = 0;
+  int64_t gpu_wait_since_us_ = 0;
+  int gpu_wait_reports_ = 0;
+  void LogGpuWait();
   // Submission indices of frames that have already been submitted.
   uint64_t closed_frame_submissions_[kQueueFrames] = {};
 
