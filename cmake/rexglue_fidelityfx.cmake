@@ -4,6 +4,24 @@
 # On success, creates amd_fidelityfx_vk and/or amd_fidelityfx_dx12 targets
 # and sets REXGLUE_FIDELITYFX_SOURCE_DIR to the fetched SDK root.
 
+# Changes the Vulkan backend's scratch array-size declarations from 4-byte to 16-byte alignment.
+# The pattern has to match exactly the declarations at the pinned FidelityFX commit; a pin update
+# that renames or reshapes them would otherwise leave the arrays at 4 bytes, silently regressing
+# the fault this patch prevents. Kept outside the enable check so the patch logic can be tested.
+function(_rexglue_patch_ffx_vk_scratch_arrays text_var)
+    set(_text "${${text_var}}")
+    set(_array_pattern "(ArraySize *= FFX_ALIGN_UP\\([^\n]*), sizeof\\(uint32_t\\)\\)")
+    string(REGEX MATCHALL "${_array_pattern}" _arrays "${_text}")
+    list(LENGTH _arrays _array_count)
+    if(NOT _array_count EQUAL 12)
+        message(FATAL_ERROR
+            "FidelityFX ffx_vk.cpp changed; expected 12 scratch arrays aligned to 4 bytes, "
+            "found ${_array_count}; update the scratch alignment patch")
+    endif()
+    string(REGEX REPLACE "${_array_pattern};" "\\1, 16);" _patched "${_text}")
+    set(${text_var} "${_patched}" PARENT_SCOPE)
+endfunction()
+
 if(NOT REXGLUE_ENABLE_FIDELITYFX)
     return()
 endif()
@@ -95,8 +113,7 @@ if(_rexglue_ffx_vk_done EQUAL -1)
     if(_rexglue_ffx_vk_pos1 EQUAL -1 OR _rexglue_ffx_vk_pos2 EQUAL -1)
         message(FATAL_ERROR "FidelityFX ffx_vk.cpp changed; update the scratch alignment patch")
     endif()
-    string(REGEX REPLACE "(ArraySize *= FFX_ALIGN_UP\\([^\n]*), sizeof\\(uint32_t\\)\\);"
-        "\\1, 16);" _rexglue_ffx_vk_text "${_rexglue_ffx_vk_text}")
+    _rexglue_patch_ffx_vk_scratch_arrays(_rexglue_ffx_vk_text)
     string(REPLACE "${_rexglue_ffx_vk_start}"
         "(uint8_t*)FFX_ALIGN_UP((uintptr_t)(backendContext + 1), 16);"
         _rexglue_ffx_vk_text "${_rexglue_ffx_vk_text}")

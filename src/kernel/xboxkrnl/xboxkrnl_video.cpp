@@ -67,7 +67,7 @@
 // keeps the fix host-side and low-risk: it doesn't touch any guest simulation/physics math, just
 // makes this already-host-implemented kernel export block like Present() did on real hardware.
 //
-// This shares the *same* frame_rate_limit cvar the host present loop uses (d3d12_presenter.cpp),
+// This shares the *same* frame_rate_limit cvar the host present loop uses (ui/presenter.cpp),
 // rather than a separate guest-only cvar, so there is one knob: at frame_rate_limit=0 (default)
 // the guest ticks at the safe console-authentic 30Hz regardless of host present rate; setting
 // frame_rate_limit=N raises both the host present cap and the guest tick rate to N together, the
@@ -167,7 +167,7 @@ void PreciseSleepUntil(std::chrono::steady_clock::time_point deadline) {
 
 // Blocks the calling (guest) thread until the next frame deadline, mirroring the implicit
 // vblank-wait real Xbox 360 hardware performed inside Present(). See the frame_rate_limit comment
-// above (d3d12_presenter.cpp) for why this exists and why it shares that cvar rather than having
+// above (ui/presenter.cpp) for why this exists and why it shares that cvar rather than having
 // its own. This is the only frame limiter: the host presenter shows each guest frame as soon as it
 // arrives, so pacing here is what the monitor sees. Deadlines are absolute (next += period), so
 // wake-up jitter never accumulates into drift. Only ever called from VdSwap, always from the

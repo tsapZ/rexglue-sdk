@@ -41,7 +41,7 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
 
 REXCVAR_DECLARE(int32_t, frame_rate_limit);
 
-REXCVAR_DECLARE(double, guest_vblank_rate);  // d3d12_presenter.cpp
+REXCVAR_DECLARE(double, guest_vblank_rate);  // ui/presenter.cpp
 
 namespace {
 
@@ -174,7 +174,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           // the guest vblank rate to match automatically -- otherwise this thread would still only
           // mark vblank at the old (lower) rate, silently capping anything paced off vblank
           // interrupts even though ThrottleGuestTickRate (xboxkrnl_video.cpp) and the host present
-          // loop (d3d12_presenter.cpp) were both told to go faster. No separate cvar to keep in
+          // loop (ui/presenter.cpp) were both told to go faster. No separate cvar to keep in
           // sync by hand: frame_rate_limit alone is enough. Read in every round: the setting is
           // live (hot reload, the game's settings menu), and read once a raised limit did nothing
           // until the next start.
