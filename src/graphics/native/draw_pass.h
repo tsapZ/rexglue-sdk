@@ -28,6 +28,12 @@ struct DrawTexture {
   VkComponentMapping swizzle{};
   std::vector<std::vector<uint8_t>> levels;
   std::shared_ptr<ColorImage> resolved_image;
+  // Cached resolve of the same format but up to 8x8 larger than this texture;
+  // its top-left corner is copied into a host image during the upload.
+  std::shared_ptr<ColorImage> crop_source;
+  // Device-lifetime zero-cleared view bound when the fetch constant cannot
+  // produce texels. Non-owning; the host image is allocated once.
+  VkImageView fallback_view = VK_NULL_HANDLE;
 };
 
 struct DrawSampler {
@@ -116,9 +122,12 @@ class DrawPass {
   VkDeviceMemory buffer_memory_ = VK_NULL_HANDLE;
   struct Texture {
     std::shared_ptr<ColorImage> resolved;
+    std::shared_ptr<ColorImage> crop_source;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    VkImageView fallback_view = VK_NULL_HANDLE;
+    VkExtent2D extent{};
     uint32_t array_layers = 1;
     std::vector<VkBufferImageCopy> uploads;
   };

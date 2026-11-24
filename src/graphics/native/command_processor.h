@@ -42,6 +42,9 @@ class NativeCommandProcessor : public CommandProcessor {
   std::span<const uint8_t> ReadPhysical(uint32_t address, size_t size);
   bool ReadTextures(const SpirvShader& shader, DrawInput& input);
   bool ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch, DrawTexture& texture);
+  bool InitializeNullTextures();
+  void DestroyNullTextures();
+  void RecordNullTextureInitialization();
   struct QueuedDraw {
     std::array<std::shared_ptr<ColorImage>, xenos::kMaxColorRenderTargets> colors;
     std::shared_ptr<ColorImage> depth;
@@ -104,6 +107,13 @@ class NativeCommandProcessor : public CommandProcessor {
   VkCommandPool command_pool_ = VK_NULL_HANDLE;
   VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
   VkFence fence_ = VK_NULL_HANDLE;
+  // 1x1 zero-cleared cube-compatible image shared by the 2D array and cube
+  // fallback views bound for fetch constants that cannot produce texels.
+  VkImage null_texture_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory null_texture_memory_ = VK_NULL_HANDLE;
+  VkImageView null_texture_2d_view_ = VK_NULL_HANDLE;
+  VkImageView null_texture_cube_view_ = VK_NULL_HANDLE;
+  bool null_textures_initialized_ = false;
   std::multimap<uint64_t, std::unique_ptr<SpirvShader>> shaders_;
   std::unique_ptr<SpirvShaderTranslator> translator_;
   DrawPipelines pipelines_;

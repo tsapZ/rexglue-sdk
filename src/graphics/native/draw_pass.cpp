@@ -96,7 +96,10 @@ DrawPass::~DrawPass() {
     vk.vkDestroySampler(device, sampler, nullptr);
   }
   for (const auto& texture : textures_) {
-    vk.vkDestroyImageView(device, texture.view, nullptr);
+    // Fallback views are owned by the command processor, not this pass.
+    if (texture.fallback_view == VK_NULL_HANDLE) {
+      vk.vkDestroyImageView(device, texture.view, nullptr);
+    }
     vk.vkDestroyImage(device, texture.image, nullptr);
     vk.vkFreeMemory(device, texture.memory, nullptr);
   }
@@ -250,8 +253,18 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     const auto& input_texture = input.textures[i];
     auto& texture = textures_[i];
     texture.resolved = input_texture.resolved_image;
+    texture.crop_source = input_texture.crop_source;
+    texture.fallback_view = input_texture.fallback_view;
     texture.array_layers = texture.resolved ? 1 : input_texture.array_layers;
-    const uint32_t level_count = texture.resolved ? 1 : uint32_t(texture.uploads.size());
+    texture.extent = {input_texture.width, input_texture.height};
+    // The fallback view is a 1x1 zero-cleared image owned by the command
+    // processor, so this pass neither allocates nor destroys anything for it.
+    if (texture.fallback_view != VK_NULL_HANDLE) {
+      texture.view = texture.fallback_view;
+      continue;
+    }
+    const uint32_t level_count =
+        texture.resolved ? 1 : std::max(1u, uint32_t(texture.uploads.size()));
     if (!texture.resolved) {
       VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
       info.imageType = VK_IMAGE_TYPE_2D;
@@ -261,6 +274,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       info.arrayLayers = texture.array_layers;
       info.samples = VK_SAMPLE_COUNT_1_BIT;
       info.tiling = VK_IMAGE_TILING_OPTIMAL;
+      // A cropped resolve is filled by an image copy during the upload.
       info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
       if (input_texture.view_type == VK_IMAGE_VIEW_TYPE_CUBE) {
         info.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
@@ -438,6 +452,10 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
 void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
   const auto& vk = device_.functions();
   for (const auto& texture : textures_) {
+    if (texture.fallback_view != VK_NULL_HANDLE) {
+      // Zero-cleared and already in the shader-read layout for the device's life.
+      continue;
+    }
     if (texture.resolved) {
       texture.resolved->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
@@ -449,13 +467,31 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
     barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = texture.image;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, uint32_t(texture.uploads.size()), 0,
-                                texture.array_layers};
+    barrier.subresourceRange = {
+        VK_IMAGE_ASPECT_COLOR_BIT, 0,
+        texture.crop_source ? 1u : uint32_t(texture.uploads.size()), 0, texture.array_layers};
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     vk.vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-    vk.vkCmdCopyBufferToImage(commands, buffer_, texture.image, barrier.newLayout,
-                              uint32_t(texture.uploads.size()), texture.uploads.data());
+    if (texture.crop_source) {
+      // The resolved image may have been written earlier in this command
+      // buffer, so transition and copy it here, right before the draw.
+      texture.crop_source->Transition(commands, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      VK_ACCESS_TRANSFER_READ_BIT);
+      VkImageCopy copy{};
+      copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      copy.extent = {texture.extent.width, texture.extent.height, 1};
+      vk.vkCmdCopyImage(commands, texture.crop_source->image(),
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture.image,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+      texture.crop_source->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                      VK_ACCESS_SHADER_READ_BIT);
+    } else {
+      vk.vkCmdCopyBufferToImage(commands, buffer_, texture.image, barrier.newLayout,
+                                uint32_t(texture.uploads.size()), texture.uploads.data());
+    }
     barrier.oldLayout = barrier.newLayout;
     barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;

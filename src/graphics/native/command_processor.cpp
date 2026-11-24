@@ -19,6 +19,7 @@
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
+#include <rex/ui/vulkan/util.h>
 
 #include "draw_input.h"
 #include "graphics_system.h"
@@ -249,14 +250,85 @@ bool NativeCommandProcessor::SetupContext() {
     }
     frame_timing_ << "swap,address,width,height,ready_ns,result\n";
   }
-  if (RequestedEdramLayout().is_extended()) {
-    REXLOG_WARN(
-        "Native Vulkan does not support edram_tile_count 4096 (a narrow surface image would exceed "
-        "the maximum 2D image dimension); using 2048");
+  if (!InitializeNullTextures()) {
+    ShutdownContext();
+    return false;
   }
-  SetActiveEdramLayout(EdramLayout{});
+  SetActiveEdramLayout(RequestedEdramLayout());
   REXLOG_INFO("Native Vulkan: command processor initialized");
   return true;
+}
+
+bool NativeCommandProcessor::InitializeNullTextures() {
+  const auto& vk = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  image.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+  image.imageType = VK_IMAGE_TYPE_2D;
+  image.format = ColorImage::kFormat;
+  image.extent = {1, 1, 1};
+  image.mipLevels = 1;
+  image.arrayLayers = 6;
+  image.samples = VK_SAMPLE_COUNT_1_BIT;
+  image.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+          vulkan_device_, image, ui::vulkan::util::MemoryPurpose::kDeviceLocal, null_texture_image_,
+          null_texture_memory_)) {
+    return false;
+  }
+  VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  view.image = null_texture_image_;
+  view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+  view.format = ColorImage::kFormat;
+  view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  if (vk.vkCreateImageView(device, &view, nullptr, &null_texture_2d_view_) != VK_SUCCESS) {
+    return false;
+  }
+  view.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+  view.subresourceRange.layerCount = 6;
+  return vk.vkCreateImageView(device, &view, nullptr, &null_texture_cube_view_) == VK_SUCCESS;
+}
+
+void NativeCommandProcessor::DestroyNullTextures() {
+  const auto& vk = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  vk.vkDestroyImageView(device, null_texture_cube_view_, nullptr);
+  vk.vkDestroyImageView(device, null_texture_2d_view_, nullptr);
+  vk.vkDestroyImage(device, null_texture_image_, nullptr);
+  vk.vkFreeMemory(device, null_texture_memory_, nullptr);
+  null_texture_cube_view_ = null_texture_2d_view_ = VK_NULL_HANDLE;
+  null_texture_image_ = VK_NULL_HANDLE;
+  null_texture_memory_ = VK_NULL_HANDLE;
+  null_textures_initialized_ = false;
+}
+
+void NativeCommandProcessor::RecordNullTextureInitialization() {
+  if (null_textures_initialized_ || null_texture_image_ == VK_NULL_HANDLE) {
+    return;
+  }
+  const auto& vk = vulkan_device_->functions();
+  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};
+  VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.image = null_texture_image_;
+  barrier.subresourceRange = range;
+  barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  vk.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+  const VkClearColorValue zero{};
+  vk.vkCmdClearColorImage(command_buffer_, null_texture_image_,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+  barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  vk.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          0, 0, nullptr, 0, nullptr, 1, &barrier);
+  null_textures_initialized_ = true;
 }
 
 void NativeCommandProcessor::ShutdownContext() {
@@ -280,6 +352,7 @@ void NativeCommandProcessor::ShutdownContext() {
   presented_resolve_address_.reset();
   resolved_images_.clear();
   targets_.clear();
+  DestroyNullTextures();
   for (const auto& entry : pipelines_) {
     vk.vkDestroyPipeline(device, entry.second, nullptr);
   }
@@ -354,21 +427,29 @@ bool NativeCommandProcessor::ReadTextures(const SpirvShader& shader, DrawInput& 
     }
     const uint32_t slot = binding.fetch_constant;
     const auto fetch = register_file_->GetTextureFetch(slot);
-    if (fetch.dimension != (cube ? xenos::DataDimension::kCube
-                                 : xenos::DataDimension::k2DOrStacked) ||
-        fetch.stacked) {
-      return false;
-    }
+    // A fetch constant that isn't a usable texture of the fetched dimension
+    // reads as zero on the guest - bind a zero-cleared fallback rather than
+    // dropping the draw. Its signs stay unsigned.
+    const bool use_fallback = ShouldUseFallbackTexture(
+        fetch.type == xenos::FetchConstantType::kTexture,
+        (fetch.base_address & 0x1FFFF) != 0, fetch.stacked,
+        fetch.dimension == (cube ? xenos::DataDimension::kCube
+                                 : xenos::DataDimension::k2DOrStacked));
     if (indices[slot] < 0) {
       auto& texture = input.textures.emplace_back();
-      if (!ReadTexture(fetch, texture)) {
+      if (use_fallback) {
+        texture.fallback_view =
+            cube ? null_texture_cube_view_ : null_texture_2d_view_;
+      } else if (!ReadTexture(fetch, texture)) {
         REXGPU_DEBUG(
             "Native Vulkan texture {} unsupported: format={} base={:05X} flags={:08X}/{:08X}", slot,
             uint32_t(fetch.format), uint32_t(fetch.base_address), fetch.dword_4, fetch.dword_5);
         return false;
       }
-      input.system.texture_swizzled_signs[slot / 4] |= uint32_t(texture_util::SwizzleSigns(fetch))
-                                                       << ((slot % 4) * 8);
+      if (!use_fallback) {
+        input.system.texture_swizzled_signs[slot / 4] |= uint32_t(texture_util::SwizzleSigns(fetch))
+                                                         << ((slot % 4) * 8);
+      }
       indices[slot] = int(input.textures.size() - 1);
     }
     input.texture_bindings.push_back(uint32_t(indices[slot]));
@@ -398,10 +479,17 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
                                          DrawTexture& texture) {
   const bool cube = fetch.dimension == xenos::DataDimension::kCube;
   if (fetch.type != xenos::FetchConstantType::kTexture ||
-      (!cube && fetch.dimension != xenos::DataDimension::k2DOrStacked) || fetch.stacked ||
-
-      fetch.sign_x == xenos::TextureSign::kSigned || fetch.sign_y == xenos::TextureSign::kSigned ||
-      fetch.sign_z == xenos::TextureSign::kSigned || fetch.sign_w == xenos::TextureSign::kSigned) {
+      (!cube && fetch.dimension != xenos::DataDimension::k2DOrStacked) || fetch.stacked) {
+    return false;
+  }
+  // IEEE float host formats are natively signed, so a signed guest fetch maps
+  // straight onto them. Integer, UNORM and BC formats would need separate SNORM
+  // views, so those signed fetches are still rejected until they exist.
+  if (!IsFloatTextureFormat(fetch.format) &&
+      (fetch.sign_x == xenos::TextureSign::kSigned ||
+       fetch.sign_y == xenos::TextureSign::kSigned ||
+       fetch.sign_z == xenos::TextureSign::kSigned ||
+       fetch.sign_w == xenos::TextureSign::kSigned)) {
     return false;
   }
 
@@ -469,20 +557,28 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
       block_width = 4;
       block_size = 16;
       break;
+    case xenos::TextureFormat::k_DXN:
+      texture.format = VK_FORMAT_BC5_UNORM_BLOCK;
+      block_width = 4;
+      block_size = 16;
+      break;
     default:
       return false;
   }
 
+  // Replicate the guest components that the format actually stores, matching
+  // the Xenos Vulkan host format swizzle: RRRR for one channel, RGGG for two,
+  // RGBA otherwise. Block sizes don't map to channels, so use the count.
+  const uint32_t channel_count = TextureChannelCount(fetch.format);
   const VkComponentSwizzle r = VK_COMPONENT_SWIZZLE_R;
+  const VkComponentSwizzle g = VK_COMPONENT_SWIZZLE_G;
+  const VkComponentSwizzle b = VK_COMPONENT_SWIZZLE_B;
+  const VkComponentSwizzle a = VK_COMPONENT_SWIZZLE_A;
   const std::array<VkComponentSwizzle, 8> swizzles{
       r,
-      (block_size == 1 || depth_texture) ? r : VK_COMPONENT_SWIZZLE_G,
-      block_size == 1   ? r
-      : block_size == 2 ? VK_COMPONENT_SWIZZLE_G
-                        : VK_COMPONENT_SWIZZLE_B,
-      block_size == 1   ? r
-      : block_size == 2 ? VK_COMPONENT_SWIZZLE_G
-                        : VK_COMPONENT_SWIZZLE_A,
+      channel_count == 1 ? r : g,
+      channel_count == 1 ? r : channel_count == 2 ? g : b,
+      channel_count == 1 ? r : channel_count == 2 ? g : a,
       VK_COMPONENT_SWIZZLE_ZERO,
       VK_COMPONENT_SWIZZLE_ONE,
       VK_COMPONENT_SWIZZLE_ZERO,
@@ -500,11 +596,18 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
   if (!cube && !mip_max && resolved != resolved_images_.end() &&
       texture.format == resolved->second.image->format()) {
     const auto extent = resolved->second.image->extent();
-    if (extent.width != texture.width || extent.height != texture.height) {
+    if (extent.width == texture.width && extent.height == texture.height) {
+      resolved->second.last_use_submission = next_submission_;
+      texture.resolved_image = resolved->second.image;
+      return true;
+    }
+    // Resolves are 8x8-aligned, so the cached image can be up to one alignment
+    // unit larger than the texture. Crop its top-left corner during the upload.
+    if (!CanCropAlignedResolve(extent.width, extent.height, texture.width, texture.height)) {
       return false;
     }
     resolved->second.last_use_submission = next_submission_;
-    texture.resolved_image = resolved->second.image;
+    texture.crop_source = resolved->second.image;
     return true;
   }
 
@@ -1431,6 +1534,9 @@ bool NativeCommandProcessor::BeginCommands() {
 }
 
 size_t NativeCommandProcessor::RecordPending() {
+  // Clear the fallback textures and move them to the shader-read layout once,
+  // before any draw that may sample them.
+  RecordNullTextureInitialization();
   size_t drawn = 0;
   for (size_t first = 0; first < pending_.size();) {
     const auto& command = pending_[first];

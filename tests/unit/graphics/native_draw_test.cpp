@@ -226,6 +226,68 @@ TEST_CASE("Native cache eviction skips in-flight and protected entries", "[gpu][
               }).has_value());
 }
 
+TEST_CASE("Native texture channel counts drive swizzle replication", "[gpu][native]") {
+  using xenos::TextureFormat;
+  // Single-channel formats replicate R into every component.
+  CHECK(native::TextureChannelCount(TextureFormat::k_8) == 1);
+  CHECK(native::TextureChannelCount(TextureFormat::k_8_A) == 1);
+  CHECK(native::TextureChannelCount(TextureFormat::k_8_B) == 1);
+  CHECK(native::TextureChannelCount(TextureFormat::k_32_FLOAT) == 1);
+  CHECK(native::TextureChannelCount(TextureFormat::k_24_8) == 1);
+  CHECK(native::TextureChannelCount(TextureFormat::k_24_8_FLOAT) == 1);
+  // Two-channel formats replicate RGGG.
+  CHECK(native::TextureChannelCount(TextureFormat::k_8_8) == 2);
+  CHECK(native::TextureChannelCount(TextureFormat::k_16_16_FLOAT) == 2);
+  // DXN is BC5: two channels in a 16-byte block, so a block size of 16 must not
+  // be mistaken for a channel count.
+  CHECK(native::TextureChannelCount(TextureFormat::k_DXN) == 2);
+  // Four-channel formats pass RGBA through.
+  CHECK(native::TextureChannelCount(TextureFormat::k_8_8_8_8) == 4);
+  CHECK(native::TextureChannelCount(TextureFormat::k_2_10_10_10) == 4);
+  CHECK(native::TextureChannelCount(TextureFormat::k_DXT1) == 4);
+}
+
+TEST_CASE("Native signed fetches only pass through float formats", "[gpu][native]") {
+  using xenos::TextureFormat;
+  CHECK(native::IsFloatTextureFormat(TextureFormat::k_32_FLOAT));
+  CHECK(native::IsFloatTextureFormat(TextureFormat::k_16_16_FLOAT));
+  CHECK_FALSE(native::IsFloatTextureFormat(TextureFormat::k_8_8_8_8));
+  CHECK_FALSE(native::IsFloatTextureFormat(TextureFormat::k_8_8));
+  CHECK_FALSE(native::IsFloatTextureFormat(TextureFormat::k_DXN));
+  CHECK_FALSE(native::IsFloatTextureFormat(TextureFormat::k_2_10_10_10));
+}
+
+TEST_CASE("Native invalid fetches bind a zero-cleared fallback", "[gpu][native]") {
+  // Only a real texture of the fetched dimension with a base level avoids the
+  // fallback.
+  CHECK_FALSE(native::ShouldUseFallbackTexture(true, true, false, true));
+  // Anything the guest would read as zero takes the fallback instead.
+  CHECK(native::ShouldUseFallbackTexture(false, true, false, true));
+  CHECK(native::ShouldUseFallbackTexture(true, false, false, true));
+  CHECK(native::ShouldUseFallbackTexture(true, true, true, true));
+  CHECK(native::ShouldUseFallbackTexture(true, true, false, false));
+  // Unsupported formats or unreadable memory still reject, and those never
+  // reach this decision because ReadTexture fails first - the checks above only
+  // cover the pre-ReadTexture fallback conditions.
+}
+
+TEST_CASE("Native aligned resolve crop stays within one alignment unit", "[gpu][native]") {
+  // Giants resolves a 500x300 texture from an 8x8-aligned 504x304 image.
+  CHECK(native::CanCropAlignedResolve(504, 304, 500, 300));
+  // 504 - 500 = 4 < 8, 304 - 300 = 4 < 8: both fit.
+  CHECK(native::CanCropAlignedResolve(500, 300, 500, 300));
+  // Too much slack cannot be cropped from the top-left corner.
+  CHECK_FALSE(native::CanCropAlignedResolve(512, 304, 500, 300));
+  CHECK_FALSE(native::CanCropAlignedResolve(504, 312, 500, 300));
+  // A cached image smaller than the texture cannot be cropped from.
+  CHECK_FALSE(native::CanCropAlignedResolve(496, 304, 500, 300));
+  CHECK_FALSE(native::CanCropAlignedResolve(504, 296, 500, 300));
+  // The maximum accepted slack is one alignment unit less.
+  CHECK(native::CanCropAlignedResolve(507, 307, 500, 300));
+  CHECK_FALSE(native::CanCropAlignedResolve(508, 300, 500, 300));
+  CHECK_FALSE(native::CanCropAlignedResolve(500, 308, 500, 300));
+}
+
 TEST_CASE("Native resolve rectangles use multisample tile dimensions", "[gpu][native]") {
   draw_util::ResolveInfo copy{};
   copy.depth_edram_info.pitch_tiles = 4;

@@ -18,6 +18,54 @@ constexpr bool IsPhysicalRange(uint32_t address, size_t size) {
   return address < kPhysicalMemorySize && size && size <= kPhysicalMemorySize - address;
 }
 
+// Number of components a guest texture format actually samples. Single-channel
+// formats replicate R into all channels, two-channel ones replicate G into B
+// and A, matching the host format swizzle of the Xenos Vulkan backend.
+constexpr uint32_t TextureChannelCount(xenos::TextureFormat format) {
+  switch (format) {
+    case xenos::TextureFormat::k_8:
+    case xenos::TextureFormat::k_8_A:
+    case xenos::TextureFormat::k_8_B:
+    case xenos::TextureFormat::k_32_FLOAT:
+    case xenos::TextureFormat::k_24_8:
+    case xenos::TextureFormat::k_24_8_FLOAT:
+      return 1;
+    case xenos::TextureFormat::k_8_8:
+    case xenos::TextureFormat::k_16_16_FLOAT:
+    case xenos::TextureFormat::k_DXN:
+      return 2;
+    default:
+      return 4;
+  }
+}
+
+// IEEE floating-point host formats are natively signed, so a signed guest fetch
+// maps directly onto them without a separate SNORM view.
+constexpr bool IsFloatTextureFormat(xenos::TextureFormat format) {
+  return format == xenos::TextureFormat::k_32_FLOAT ||
+         format == xenos::TextureFormat::k_16_16_FLOAT;
+}
+
+// A fetch constant that cannot produce texels - not a texture fetch, no base
+// level, stacked, or a resource dimension the shader doesn't fetch as - reads as
+// zero on the guest, so bind a zero-cleared fallback view rather than rejecting
+// the draw. Valid textures that merely use unsupported formats or unreadable
+// memory are still rejected so real errors stay visible.
+constexpr bool ShouldUseFallbackTexture(bool fetch_is_texture, bool has_base_level, bool stacked,
+                                        bool dimension_matches) {
+  return !fetch_is_texture || !has_base_level || stacked || !dimension_matches;
+}
+
+// Resolve offsets and sizes are 8x8-aligned, so a cached resolve can be up to
+// one alignment unit wider and taller than the texture that samples it. Such a
+// resolve can be cropped from its top-left corner instead of being rejected.
+constexpr bool CanCropAlignedResolve(uint32_t cached_width, uint32_t cached_height,
+                                     uint32_t requested_width, uint32_t requested_height) {
+  return cached_width >= requested_width && cached_height >= requested_height &&
+         cached_width - requested_width < xenos::kResolveAlignmentPixels &&
+         cached_height - requested_height < xenos::kResolveAlignmentPixels;
+}
+
 // Cube textures are hosted as a cube-compatible image with all six faces as
 // array layers of a single level; everything else is a single layer.
 constexpr uint32_t kTextureCubeArrayLayers = 6;
