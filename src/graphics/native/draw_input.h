@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <compare>
 #include <cstdint>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <vulkan/vulkan_core.h>
 
 #include <rex/graphics/edram_layout.h>
+#include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 
@@ -84,6 +86,34 @@ constexpr uint32_t TextureChannelCount(xenos::TextureFormat format) {
     default:
       return 4;
   }
+}
+
+// Component mapping for sampling a guest texture. One- and two-channel formats
+// replicate the stored components into the unused ones, matching the Xenos
+// Vulkan host format swizzle. 32bpp 3/4-channel resolves copied with
+// copy_dest_swap store red and blue swapped, which the guest fetch swizzle
+// (0x60A BGRA or 0xA0A BGR1) normally undoes - swap_red_blue applies that swap
+// here for cached resolves that keep the EDRAM RGBA order.
+constexpr VkComponentMapping MakeTextureComponentMapping(uint32_t fetch_swizzle,
+                                                        uint32_t channel_count,
+                                                        bool swap_red_blue) {
+  const VkComponentSwizzle r = VK_COMPONENT_SWIZZLE_R;
+  const VkComponentSwizzle g = VK_COMPONENT_SWIZZLE_G;
+  const VkComponentSwizzle b = VK_COMPONENT_SWIZZLE_B;
+  const VkComponentSwizzle a = VK_COMPONENT_SWIZZLE_A;
+  const VkComponentSwizzle first = channel_count >= 3 && swap_red_blue ? b : r;
+  const VkComponentSwizzle third = channel_count >= 3 && swap_red_blue ? r : b;
+  const std::array<VkComponentSwizzle, 8> swizzles{
+      first,
+      channel_count == 1 ? r : g,
+      channel_count == 1 ? r : channel_count == 2 ? g : third,
+      channel_count == 1 ? r : channel_count == 2 ? g : a,
+      VK_COMPONENT_SWIZZLE_ZERO,
+      VK_COMPONENT_SWIZZLE_ONE,
+      VK_COMPONENT_SWIZZLE_ZERO,
+      VK_COMPONENT_SWIZZLE_ZERO};
+  return {swizzles[fetch_swizzle & 7], swizzles[(fetch_swizzle >> 3) & 7],
+          swizzles[(fetch_swizzle >> 6) & 7], swizzles[(fetch_swizzle >> 9) & 7]};
 }
 
 // IEEE floating-point host formats are natively signed, so a signed guest fetch
@@ -219,6 +249,89 @@ constexpr uint32_t GetTargetHeight(uint32_t pitch, xenos::MsaaSamples samples,
   return height < aligned_max ? height : aligned_max;
 }
 
+// Xbox 360 D3D9 clears 1x- and 2x-MSAA EDRAM targets by issuing a 4x-MSAA
+// depth-only draw at the same tile with half the horizontal pitch, so one host
+// pixel of the alias covers scale_x by scale_y guest pixels.
+struct FastClearScale {
+  uint32_t x;
+  uint32_t y;
+};
+
+constexpr FastClearScale GetMsaa4xAliasScale(xenos::MsaaSamples target_samples) {
+  switch (target_samples) {
+    case xenos::MsaaSamples::k1X:
+      return {2, 2};
+    case xenos::MsaaSamples::k2X:
+      return {2, 1};
+    default:
+      return {1, 1};
+  }
+}
+
+// Rescales a guest-space viewport, scissor and NDC scale/offset to cover the
+// aliased target. When the scaled viewport would exceed the host limits, the
+// extent is clamped and the NDC scale/offset are adjusted so the covered
+// framebuffer coordinates stay identical.
+inline void ScaleViewportAndScissor(draw_util::ViewportInfo& viewport, draw_util::Scissor& scissor,
+                                    std::array<float, 3>& ndc_scale,
+                                    std::array<float, 3>& ndc_offset, uint32_t scale_x,
+                                    uint32_t scale_y, uint32_t max_viewport_w,
+                                    uint32_t max_viewport_h) {
+  scissor.offset[0] *= scale_x;
+  scissor.offset[1] *= scale_y;
+  scissor.extent[0] *= scale_x;
+  scissor.extent[1] *= scale_y;
+  viewport.xy_offset[0] *= scale_x;
+  viewport.xy_offset[1] *= scale_y;
+  for (uint32_t axis = 0; axis < 2; ++axis) {
+    const uint32_t scale = axis ? scale_y : scale_x;
+    const uint32_t max_viewport = axis ? max_viewport_h : max_viewport_w;
+    const uint32_t orig_extent = viewport.xy_extent[axis];
+    if (uint64_t(orig_extent) * scale <= max_viewport) {
+      viewport.xy_extent[axis] = orig_extent * scale;
+      continue;
+    }
+    viewport.xy_extent[axis] = max_viewport;
+    const double k = (double(orig_extent) * double(scale)) / double(max_viewport);
+    ndc_scale[axis] *= float(k);
+    ndc_offset[axis] = float((double(ndc_offset[axis]) + 1.0) * k - 1.0);
+  }
+}
+
+// Whether a 4x-MSAA depth-only draw is actually a D3D9 fast clear of an aliased
+// 32bpp color target: it writes the whole depth range and stencil without a
+// depth test and replaces or zeros the stencil, which is how the "color" is
+// packed into the depth-stencil words.
+constexpr bool IsEdramDepthClearToColor(xenos::DepthRenderTargetFormat depth_format,
+                                        reg::RB_DEPTHCONTROL depth_control,
+                                        uint8_t stencil_write_mask) {
+  return depth_format == xenos::DepthRenderTargetFormat::kD24S8 && depth_control.z_enable &&
+         depth_control.z_write_enable &&
+         depth_control.zfunc == xenos::CompareFunction::kAlways && depth_control.stencil_enable &&
+         depth_control.stencilfunc == xenos::CompareFunction::kAlways &&
+         (depth_control.stencilzpass == xenos::StencilOp::kReplace ||
+          depth_control.stencilzpass == xenos::StencilOp::kZero) &&
+         stencil_write_mask == 0xFF;
+}
+
+// Index of the shader packing mode that unpacks a 32-bit EDRAM clear color into
+// an aliased color target of this host format, matching the format indices used
+// by ColorResolve.
+constexpr std::optional<uint32_t> GetEdramClearColorFormatMode(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+      return 0;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+      return 1;
+    case VK_FORMAT_R16G16_SFLOAT:
+      return 2;
+    case VK_FORMAT_R32_SFLOAT:
+      return 3;
+    default:
+      return std::nullopt;
+  }
+}
+
 // Rasterizer face culling for a host pipeline. Guest rectangle, point and line
 // primitives are non-polygonal, so they have no front or back face and must not
 // inherit the cull state left behind by the last polygonal draw.
@@ -226,7 +339,6 @@ struct CullFaces {
   bool front;
   bool back;
 };
-
 constexpr CullFaces GetCullFaces(bool primitive_polygonal, bool cull_front, bool cull_back) {
   return primitive_polygonal ? CullFaces{cull_front, cull_back} : CullFaces{false, false};
 }

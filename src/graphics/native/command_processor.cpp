@@ -372,6 +372,7 @@ void NativeCommandProcessor::ShutdownContext() {
   presented_.reset();
   presented_resolve_address_.reset();
   resolved_images_.clear();
+  pending_fast_clears_.clear();
   targets_.clear();
   DestroyNullTextures();
   for (const auto& entry : pipelines_) {
@@ -676,21 +677,6 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
   // the Xenos Vulkan host format swizzle: RRRR for one channel, RGGG for two,
   // RGBA otherwise. Block sizes don't map to channels, so use the count.
   const uint32_t channel_count = TextureChannelCount(fetch.format);
-  const VkComponentSwizzle r = VK_COMPONENT_SWIZZLE_R;
-  const VkComponentSwizzle g = VK_COMPONENT_SWIZZLE_G;
-  const VkComponentSwizzle b = VK_COMPONENT_SWIZZLE_B;
-  const VkComponentSwizzle a = VK_COMPONENT_SWIZZLE_A;
-  const std::array<VkComponentSwizzle, 8> swizzles{
-      r,
-      channel_count == 1 ? r : g,
-      channel_count == 1 ? r : channel_count == 2 ? g : b,
-      channel_count == 1 ? r : channel_count == 2 ? g : a,
-      VK_COMPONENT_SWIZZLE_ZERO,
-      VK_COMPONENT_SWIZZLE_ONE,
-      VK_COMPONENT_SWIZZLE_ZERO,
-      VK_COMPONENT_SWIZZLE_ZERO};
-  texture.swizzle = {swizzles[fetch.swizzle & 7], swizzles[(fetch.swizzle >> 3) & 7],
-                     swizzles[(fetch.swizzle >> 6) & 7], swizzles[(fetch.swizzle >> 9) & 7]};
   uint32_t base_page, mip_page, mip_min, mip_max;
   texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &base_page,
                                                  &mip_page, &mip_min, &mip_max);
@@ -701,9 +687,16 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
   auto resolved = resolved_images_.find(address);
   if (!cube && !mip_max && resolved != resolved_images_.end() &&
       texture.format == resolved->second.image->format()) {
+    // A 32bpp 3/4-channel resolve copied with copy_dest_swap keeps the EDRAM
+    // red/blue order, while the guest fetch swizzle expects them swapped in
+    // memory, so apply that swap to the host view instead.
+    const bool swap_red_blue =
+        !depth_texture && reg::RB_COPY_DEST_INFO{resolved->second.dest_info}.copy_dest_swap != 0;
     const auto extent = resolved->second.image->extent();
     if (extent.width == texture.width && extent.height == texture.height) {
       resolved->second.last_use_submission = next_submission_;
+      texture.swizzle =
+          MakeTextureComponentMapping(fetch.swizzle, channel_count, swap_red_blue);
       texture.resolved_image = resolved->second.image;
       return true;
     }
@@ -713,9 +706,11 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
       return false;
     }
     resolved->second.last_use_submission = next_submission_;
+    texture.swizzle = MakeTextureComponentMapping(fetch.swizzle, channel_count, swap_red_blue);
     texture.crop_source = resolved->second.image;
     return true;
   }
+  texture.swizzle = MakeTextureComponentMapping(fetch.swizzle, channel_count, false);
 
   const auto layout = texture_util::GetGuestTextureLayout(
       fetch.dimension, fetch.pitch, texture.width, texture.height, 1, fetch.tiled, fetch.format,
@@ -1221,6 +1216,70 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       texture.cached_texture->uploaded = true;
     }
   }
+
+  // D3D9 clears whole EDRAM tiles of 1x/2x depth and color targets by issuing a
+  // 4x-MSAA depth-only draw at the same tile with half the horizontal pitch.
+  // Replay it on every aliased target that already exists, and remember it so
+  // targets created later start out cleared instead of uninitialized.
+  const bool aliased_4x_depth_clear =
+      !use_color && use_depth && dimensions.msaa_samples == xenos::MsaaSamples::k4X && !ps;
+  const uint32_t depth_tile = layout.DecodeBase(depth_info.value);
+  const uint32_t pitch_tiles_4x =
+      xenos::GetSurfacePitchTiles(dimensions.surface_pitch, xenos::MsaaSamples::k4X, false);
+  if (aliased_4x_depth_clear && pitch_tiles_4x) {
+    PendingFastClear clear;
+    clear.input = input;
+    clear.indices = indices;
+    clear.vertex = &vertex;
+    clear.depth_format = depth_info.depth_format;
+    clear.color_clear_capable =
+        IsEdramDepthClearToColor(depth_info.depth_format, depth_control, front.stencilwritemask);
+    clear.clear_stencil =
+        depth_control.stencilzpass == xenos::StencilOp::kReplace ? front.stencilref : 0u;
+    // Collect the aliases first - replaying must not mutate targets_ while it is
+    // being iterated.
+    std::vector<std::pair<std::shared_ptr<ColorImage>, xenos::MsaaSamples>> aliases;
+    for (auto& [target_key, entry] : targets_) {
+      const uint32_t tile = std::get<0>(target_key);
+      const uint32_t pitch = std::get<1>(target_key);
+      const xenos::MsaaSamples samples = std::get<2>(target_key);
+      if (tile != depth_tile || samples >= xenos::MsaaSamples::k4X ||
+          xenos::GetSurfacePitchTiles(pitch, samples, false) != pitch_tiles_4x) {
+        continue;
+      }
+      const bool depth_target = (entry.image->aspects() & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 &&
+                                entry.image->format() == input.depth_format;
+      const bool color_target =
+          (entry.image->aspects() & VK_IMAGE_ASPECT_COLOR_BIT) != 0 && clear.color_clear_capable &&
+          GetEdramClearColorFormatMode(entry.image->format()).has_value();
+      if (!depth_target && !color_target) {
+        continue;
+      }
+      // Keep the aliased targets alive while pending_ references them.
+      entry.last_use_submission = next_submission_;
+      aliases.emplace_back(entry.image, samples);
+    }
+    for (const auto& [image, samples] : aliases) {
+      ReplayAliasedFastClear(clear, image, samples);
+    }
+    pending_fast_clears_.insert_or_assign({depth_tile, pitch_tiles_4x}, std::move(clear));
+  } else if (!aliased_4x_depth_clear) {
+    // Any ordinary draw at a tile consumes its pending fast clear.
+    const uint32_t pitch_tiles =
+        xenos::GetSurfacePitchTiles(dimensions.surface_pitch, dimensions.msaa_samples, false);
+    if (pitch_tiles) {
+      if (use_depth) {
+        pending_fast_clears_.erase({depth_tile, pitch_tiles});
+      }
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+        if ((writes >> (i * 4)) & 15) {
+          const auto target =
+              regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+          pending_fast_clears_.erase({layout.DecodeBase(target.value), pitch_tiles});
+        }
+      }
+    }
+  }
   return true;
 }
 
@@ -1229,6 +1288,92 @@ VkFormat NativeCommandProcessor::GetDepthFormat(xenos::DepthRenderTargetFormat f
     return VK_FORMAT_D24_UNORM_S8_UINT;
   }
   return VK_FORMAT_D32_SFLOAT_S8_UINT;
+}
+
+void NativeCommandProcessor::ReplayAliasedFastClear(const PendingFastClear& clear,
+                                                    const std::shared_ptr<ColorImage>& image,
+                                                    xenos::MsaaSamples samples) {
+  const bool depth_target = (image->aspects() & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
+  std::optional<uint32_t> clear_format;
+  if (!depth_target) {
+    clear_format = GetEdramClearColorFormatMode(image->format());
+    if (!clear_format) {
+      return;
+    }
+  }
+  // The 4x-MSAA clear covers the aliased target with half the horizontal pitch;
+  // scale the guest-space viewport and scissor to the host pixels of the alias.
+  const auto scale = GetMsaa4xAliasScale(samples);
+  const auto& properties = vulkan_device_->properties();
+  std::array<float, 3> ndc_scale;
+  std::array<float, 3> ndc_offset;
+  std::copy(std::begin(clear.input.viewport.ndc_scale), std::end(clear.input.viewport.ndc_scale),
+            ndc_scale.begin());
+  std::copy(std::begin(clear.input.viewport.ndc_offset), std::end(clear.input.viewport.ndc_offset),
+            ndc_offset.begin());
+
+  DrawInput input = clear.input;
+  input.samples = VkSampleCountFlagBits(1u << uint32_t(samples));
+  constexpr uint32_t kMsaaSamplesFlagMask =
+      ((1u << xenos::kMsaaSamplesBits) - 1u) << Translator::kSysFlag_MsaaSamples_Shift;
+  input.system.flags = (clear.input.system.flags & ~kMsaaSamplesFlagMask) |
+                       (uint32_t(samples) << Translator::kSysFlag_MsaaSamples_Shift);
+  ScaleViewportAndScissor(input.viewport, input.scissor, ndc_scale, ndc_offset, scale.x, scale.y,
+                          properties.maxViewportDimensions[0], properties.maxViewportDimensions[1]);
+  std::copy(ndc_scale.begin(), ndc_scale.end(), input.viewport.ndc_scale);
+  std::copy(ndc_offset.begin(), ndc_offset.end(), input.viewport.ndc_offset);
+  std::copy(ndc_scale.begin(), ndc_scale.end(), input.system.ndc_scale);
+  std::copy(ndc_offset.begin(), ndc_offset.end(), input.system.ndc_offset);
+
+  QueuedDraw draw{};
+  if (!depth_target) {
+    // The clear writes a 32-bit EDRAM depth-stencil word into an aliased color
+    // target; the fragment shader unpacks it for the target format.
+    input.color_count = 1;
+    input.color_formats[0] = image->format();
+    VkPipelineColorBlendAttachmentState blend{};
+    blend.blendEnable = VK_FALSE;
+    blend.colorWriteMask = 0xF;
+    input.blend[0] = blend;
+    input.depth_format = VK_FORMAT_UNDEFINED;
+    input.depth_stencil = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    input.edram_depth_clear_color = true;
+    input.edram_clear_stencil = clear.clear_stencil;
+    input.edram_clear_format = *clear_format;
+    draw.colors[0] = image;
+    draw.color_count = 1;
+  } else {
+    draw.depth = image;
+  }
+  draw.pass = std::make_unique<DrawPass>(*vulkan_device_);
+  const uint32_t shared_count = uint32_t(1) << translator_->GetSharedMemoryStorageBufferCountLog2();
+  if (!draw.pass->Initialize(input, clear.indices, *clear.vertex, nullptr, shared_count,
+                             pipeline_cache_, pipelines_, draw_bindings_, *draw_uploads_,
+                             next_submission_)) {
+    return;
+  }
+  pending_.emplace_back(std::move(draw));
+}
+
+void NativeCommandProcessor::ApplyPendingFastClear(uint32_t tile, uint32_t pitch_tiles,
+                                                   xenos::MsaaSamples samples,
+                                                   const std::shared_ptr<ColorImage>& image) {
+  if (samples >= xenos::MsaaSamples::k4X) {
+    return;
+  }
+  const auto pending = pending_fast_clears_.find({tile, pitch_tiles});
+  if (pending == pending_fast_clears_.end()) {
+    return;
+  }
+  const PendingFastClear& clear = pending->second;
+  const bool depth_target = (image->aspects() & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 &&
+                            image->format() == GetDepthFormat(clear.depth_format);
+  const bool color_target =
+      (image->aspects() & VK_IMAGE_ASPECT_COLOR_BIT) != 0 && clear.color_clear_capable &&
+      GetEdramClearColorFormatMode(image->format()).has_value();
+  if (depth_target || color_target) {
+    ReplayAliasedFastClear(clear, image, samples);
+  }
 }
 
 std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, uint32_t pitch,
@@ -1267,6 +1412,7 @@ std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, ui
   }
   // shortcut: separate host images, share overlapping tiles when ownership tracking is added.
   targets_.emplace(key, CachedImage{image, next_submission_});
+  ApplyPendingFastClear(tile, xenos::GetSurfacePitchTiles(pitch, samples, false), samples, image);
   return image;
 }
 
@@ -1347,6 +1493,16 @@ bool NativeCommandProcessor::IssueCopy() {
                                    color_format, VK_IMAGE_ASPECT_COLOR_BIT);
   if (!source) {
     return false;
+  }
+  const uint32_t copy_pitch_tiles =
+      xenos::GetSurfacePitchTiles(surface_info.surface_pitch, samples, false);
+  if (copy_pitch_tiles) {
+    if (copy.IsClearingDepth() || depth) {
+      pending_fast_clears_.erase({copy.depth_original_base, copy_pitch_tiles});
+    }
+    if (copy.IsClearingColor() || !depth) {
+      pending_fast_clears_.erase({copy.color_original_base, copy_pitch_tiles});
+    }
   }
   const auto source_extent = source->extent();
   const auto rect =

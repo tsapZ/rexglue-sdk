@@ -91,12 +91,18 @@ struct DrawInput {
   std::vector<uint32_t> texture_bindings;
   // Device-lifetime samplers resolved by the command processor's sampler cache.
   std::vector<VkSampler> samplers;
+  // When set, the draw has no pixel shader and instead a fragment shader that
+  // packs the EDRAM depth-stencil word of a fast clear into an aliased color
+  // target; the stencil is written and the format selects the unpacking.
+  bool edram_depth_clear_color = false;
+  uint32_t edram_clear_stencil = 0;
+  uint32_t edram_clear_format = 0;
 };
 
 struct DrawPipelineKey {
   const Shader::Translation* vertex;
   const Shader::Translation* pixel;
-  std::array<uint32_t, 27> state;
+  std::array<uint32_t, 28> state;
   std::array<std::array<uint32_t, 9>, xenos::kMaxColorRenderTargets> colors;
   auto operator<=>(const DrawPipelineKey&) const = default;
 };
@@ -161,6 +167,8 @@ class DrawPass {
   uint32_t index_count_ = 0;
   draw_util::ViewportInfo viewport_{};
   draw_util::Scissor scissor_{};
+  bool edram_depth_clear_color_ = false;
+  std::array<uint32_t, 2> edram_clear_constants_{};
 };
 
 }  // namespace rex::graphics::native

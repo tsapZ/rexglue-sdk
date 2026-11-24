@@ -6,6 +6,8 @@
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
+#include "edram_depth_clear_spirv.h"
+
 namespace rex::graphics::native {
 namespace {
 
@@ -22,6 +24,18 @@ VkShaderModule CreateShaderModule(const ui::vulkan::VulkanDevice& device,
   VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
   info.codeSize = binary.size();
   info.pCode = code.data();
+  VkShaderModule module = VK_NULL_HANDLE;
+  return device.functions().vkCreateShaderModule(device.device(), &info, nullptr, &module) ==
+                 VK_SUCCESS
+             ? module
+             : VK_NULL_HANDLE;
+}
+
+VkShaderModule CreateShaderModule(const ui::vulkan::VulkanDevice& device, const uint32_t* code,
+                                  size_t size) {
+  VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  info.codeSize = size;
+  info.pCode = code;
   VkShaderModule module = VK_NULL_HANDLE;
   return device.functions().vkCreateShaderModule(device.device(), &info, nullptr, &module) ==
                  VK_SUCCESS
@@ -94,6 +108,10 @@ bool DrawBindings::Initialize(uint32_t shared_count, uint32_t image_count, uint3
   info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   info.setLayoutCount = uint32_t(layouts.size());
   info.pSetLayouts = layouts.data();
+  // Only the EDRAM depth-clear fragment shader reads push constants.
+  const VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 2 * sizeof(uint32_t)};
+  info.pushConstantRangeCount = 1;
+  info.pPushConstantRanges = &push;
   return vk.vkCreatePipelineLayout(handle, &info, nullptr, &pipeline_layout) == VK_SUCCESS;
 }
 
@@ -133,6 +151,8 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   viewport_ = input.viewport;
   scissor_ = input.scissor;
   index_count_ = uint32_t(indices.size());
+  edram_depth_clear_color_ = input.edram_depth_clear_color;
+  edram_clear_constants_ = {input.edram_clear_stencil, input.edram_clear_format};
 
   const uint32_t image_count = uint32_t(input.texture_bindings.size());
   const uint32_t sampler_count = uint32_t(input.samplers.size());
@@ -365,7 +385,8 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
                        back.compareMask,
                        back.writeMask,
                        back.reference,
-                       shared_buffer_count},
+                       shared_buffer_count,
+                       input.edram_depth_clear_color},
                       {}};
   for (uint32_t i = 0; i < input.color_count; ++i) {
     const auto& color = input.blend[i];
@@ -385,8 +406,14 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   }
 
   const VkShaderModule vs = CreateShaderModule(device_, vertex);
-  const VkShaderModule ps = pixel ? CreateShaderModule(device_, *pixel) : VK_NULL_HANDLE;
-  if (!vs || (pixel && !ps)) {
+  VkShaderModule ps = VK_NULL_HANDLE;
+  if (input.edram_depth_clear_color) {
+    ps = CreateShaderModule(device_, kEdramDepthClear, sizeof(kEdramDepthClear));
+  } else if (pixel) {
+    ps = CreateShaderModule(device_, *pixel);
+  }
+  const bool has_fragment = ps != VK_NULL_HANDLE;
+  if (!vs || ((pixel || input.edram_depth_clear_color) && !has_fragment)) {
     vk.vkDestroyShaderModule(device, vs, nullptr);
     vk.vkDestroyShaderModule(device, ps, nullptr);
     return false;
@@ -431,7 +458,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   rendering.stencilAttachmentFormat = input.depth_format;
   VkGraphicsPipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
   pipeline.pNext = &rendering;
-  pipeline.stageCount = pixel ? uint32_t(stages.size()) : 1;
+  pipeline.stageCount = has_fragment ? uint32_t(stages.size()) : 1;
   pipeline.pStages = stages.data();
   pipeline.pVertexInputState = &vertex_info;
   pipeline.pInputAssemblyState = &assembly;
@@ -534,6 +561,10 @@ void DrawPass::Record(VkCommandBuffer commands, VkExtent2D extent) {
   vk.vkCmdSetScissor(commands, 0, 1, &scissor);
   vk.vkCmdSetBlendConstants(commands, blend_constants_.data());
   vk.vkCmdBindIndexBuffer(commands, buffer_, index_offset_, VK_INDEX_TYPE_UINT32);
+  if (edram_depth_clear_color_) {
+    vk.vkCmdPushConstants(commands, bindings_->pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                          sizeof(edram_clear_constants_), edram_clear_constants_.data());
+  }
   vk.vkCmdDrawIndexed(commands, index_count_, 1, 0, 0, 0);
 }
 

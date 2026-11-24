@@ -77,6 +77,18 @@ class NativeCommandProcessor : public CommandProcessor {
   };
   using FrameCommand = std::variant<QueuedDraw, QueuedResolve, QueuedDepthClear>;
 
+  // A 4x-MSAA depth-only draw that D3D9 issued to clear an aliased 1x- or
+  // 2x-MSAA EDRAM tile. Kept so a target created later for the same tile is
+  // initialized with the clear before it is drawn to.
+  struct PendingFastClear {
+    DrawInput input;
+    std::vector<uint32_t> indices;
+    const Shader::Translation* vertex = nullptr;
+    xenos::DepthRenderTargetFormat depth_format = xenos::DepthRenderTargetFormat::kD24S8;
+    bool color_clear_capable = false;
+    uint32_t clear_stencil = 0;
+  };
+
   struct CachedImage {
     std::shared_ptr<ColorImage> image;
     uint64_t last_use_submission = 0;
@@ -107,6 +119,14 @@ class NativeCommandProcessor : public CommandProcessor {
 
   std::shared_ptr<ColorImage> FindTarget(uint32_t tile, uint32_t pitch, xenos::MsaaSamples samples,
                                          VkFormat format, VkImageAspectFlags aspects);
+  // Replays an aliased 4x-MSAA fast clear onto a 1x/2x target that already
+  // exists (depth or color), appending the queued draw to pending_.
+  void ReplayAliasedFastClear(const PendingFastClear& clear, const std::shared_ptr<ColorImage>& image,
+                              xenos::MsaaSamples samples);
+  // Finds a pending fast clear for an aliased target tile and replays it if it
+  // is compatible with the newly created image, then drops it.
+  void ApplyPendingFastClear(uint32_t tile, uint32_t pitch_tiles, xenos::MsaaSamples samples,
+                             const std::shared_ptr<ColorImage>& image);
   VkFormat GetDepthFormat(xenos::DepthRenderTargetFormat format) const;
   bool BeginCommands();
   size_t RecordPending();
@@ -143,6 +163,7 @@ class NativeCommandProcessor : public CommandProcessor {
   uint64_t next_submission_ = 1;
   VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
   std::map<std::tuple<uint32_t, uint32_t, xenos::MsaaSamples, VkFormat>, CachedImage> targets_;
+  std::map<std::pair<uint32_t, uint32_t>, PendingFastClear> pending_fast_clears_;
   std::map<uint32_t, CachedResolve> resolved_images_;
   std::map<DrawSampler, CachedSampler> samplers_;
   std::map<GuestTextureKey, CachedTextureEntry> cached_textures_;

@@ -1,6 +1,7 @@
 #include <array>
 #include <map>
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/graphics/pipeline/texture/util.h>
@@ -403,4 +404,125 @@ TEST_CASE("Native sampler cache keys order by sampler state", "[gpu][native]") {
   later.max_lod = 8.0f;
   CHECK(sampler < later);
   CHECK_FALSE(later < sampler);
+}
+
+TEST_CASE("Native texture swizzle handles channel replication and copy_dest_swap", "[gpu][native]") {
+  // 4-channel guest fetch 0x60A = (B, G, R, A), 0xA0A = (B, G, R, 1), 0x688 = (R, G, B, A).
+  const auto bgra_unswapped = native::MakeTextureComponentMapping(0x60A, 4, false);
+  CHECK(bgra_unswapped.r == VK_COMPONENT_SWIZZLE_B);
+  CHECK(bgra_unswapped.g == VK_COMPONENT_SWIZZLE_G);
+  CHECK(bgra_unswapped.b == VK_COMPONENT_SWIZZLE_R);
+  CHECK(bgra_unswapped.a == VK_COMPONENT_SWIZZLE_A);
+
+  // When a resolved image skipped copy_dest_swap, swapping R/B cancels 0x60A -> RGBA.
+  const auto bgra_swapped = native::MakeTextureComponentMapping(0x60A, 4, true);
+  CHECK(bgra_swapped.r == VK_COMPONENT_SWIZZLE_R);
+  CHECK(bgra_swapped.g == VK_COMPONENT_SWIZZLE_G);
+  CHECK(bgra_swapped.b == VK_COMPONENT_SWIZZLE_B);
+  CHECK(bgra_swapped.a == VK_COMPONENT_SWIZZLE_A);
+
+  const auto bgr1_swapped = native::MakeTextureComponentMapping(0xA0A, 4, true);
+  CHECK(bgr1_swapped.r == VK_COMPONENT_SWIZZLE_R);
+  CHECK(bgr1_swapped.g == VK_COMPONENT_SWIZZLE_G);
+  CHECK(bgr1_swapped.b == VK_COMPONENT_SWIZZLE_B);
+  CHECK(bgr1_swapped.a == VK_COMPONENT_SWIZZLE_ONE);
+
+  const auto rgba_swapped = native::MakeTextureComponentMapping(0x688, 4, true);
+  CHECK(rgba_swapped.r == VK_COMPONENT_SWIZZLE_B);
+  CHECK(rgba_swapped.g == VK_COMPONENT_SWIZZLE_G);
+  CHECK(rgba_swapped.b == VK_COMPONENT_SWIZZLE_R);
+  CHECK(rgba_swapped.a == VK_COMPONENT_SWIZZLE_A);
+
+  // 1- and 2-channel formats replicate stored components and ignore copy_dest_swap.
+  const auto single = native::MakeTextureComponentMapping(0x688, 1, true);
+  CHECK(single.r == VK_COMPONENT_SWIZZLE_R);
+  CHECK(single.g == VK_COMPONENT_SWIZZLE_R);
+  CHECK(single.b == VK_COMPONENT_SWIZZLE_R);
+  CHECK(single.a == VK_COMPONENT_SWIZZLE_R);
+
+  const auto two = native::MakeTextureComponentMapping(0x688, 2, true);
+  CHECK(two.r == VK_COMPONENT_SWIZZLE_R);
+  CHECK(two.g == VK_COMPONENT_SWIZZLE_G);
+  CHECK(two.b == VK_COMPONENT_SWIZZLE_G);
+  CHECK(two.a == VK_COMPONENT_SWIZZLE_G);
+}
+
+TEST_CASE("Native 4x-MSAA fast-clear scaling preserves framebuffer coordinates", "[gpu][native]") {
+  CHECK(native::GetMsaa4xAliasScale(xenos::MsaaSamples::k1X).x == 2);
+  CHECK(native::GetMsaa4xAliasScale(xenos::MsaaSamples::k1X).y == 2);
+  CHECK(native::GetMsaa4xAliasScale(xenos::MsaaSamples::k2X).x == 2);
+  CHECK(native::GetMsaa4xAliasScale(xenos::MsaaSamples::k2X).y == 1);
+  CHECK(native::GetMsaa4xAliasScale(xenos::MsaaSamples::k4X).x == 1);
+  CHECK(native::GetMsaa4xAliasScale(xenos::MsaaSamples::k4X).y == 1);
+
+  // Unclamped scaling: 632x352 -> 1264x704 and 8192 -> 16384 within maxViewportDimensions.
+  {
+    draw_util::ViewportInfo viewport{};
+    viewport.xy_offset[0] = 0;
+    viewport.xy_offset[1] = 0;
+    viewport.xy_extent[0] = 8192;
+    viewport.xy_extent[1] = 8192;
+    draw_util::Scissor scissor{};
+    scissor.offset[0] = 0;
+    scissor.offset[1] = 0;
+    scissor.extent[0] = 632;
+    scissor.extent[1] = 352;
+    std::array<float, 3> ndc_scale{2.0f / 8192.0f, 2.0f / 8192.0f, 1.0f};
+    std::array<float, 3> ndc_offset{-1.0f, -1.0f, 0.0f};
+    native::ScaleViewportAndScissor(viewport, scissor, ndc_scale, ndc_offset, 2, 2, 16384, 16384);
+    CHECK(viewport.xy_extent[0] == 16384);
+    CHECK(viewport.xy_extent[1] == 16384);
+    CHECK(scissor.extent[0] == 1264);
+    CHECK(scissor.extent[1] == 704);
+    CHECK(ndc_scale[0] == Catch::Approx(2.0f / 8192.0f));
+    CHECK(ndc_offset[0] == Catch::Approx(-1.0f));
+  }
+
+  // Clamped scaling: when extent * scale exceeds max_viewport, NDC scaling keeps fb coords exact.
+  {
+    draw_util::ViewportInfo viewport{};
+    viewport.xy_offset[0] = 0;
+    viewport.xy_offset[1] = 0;
+    viewport.xy_extent[0] = 8192;
+    viewport.xy_extent[1] = 8192;
+    draw_util::Scissor scissor{};
+    scissor.extent[0] = 640;
+    scissor.extent[1] = 352;
+    std::array<float, 3> ndc_scale{2.0f / 8192.0f, 2.0f / 8192.0f, 1.0f};
+    std::array<float, 3> ndc_offset{-1.0f, -1.0f, 0.0f};
+    native::ScaleViewportAndScissor(viewport, scissor, ndc_scale, ndc_offset, 2, 2, 8192, 8192);
+    CHECK(viewport.xy_extent[0] == 8192);
+    CHECK(viewport.xy_extent[1] == 8192);
+    // Guest vertex x = 600 (4x) must map to fb_x = 1200 (1x).
+    const float ndc_x = 600.0f * ndc_scale[0] + ndc_offset[0];
+    const float fb_x = (ndc_x + 1.0f) * 0.5f * float(viewport.xy_extent[0]) +
+                       float(viewport.xy_offset[0]);
+    CHECK(fb_x == Catch::Approx(1200.0f));
+  }
+}
+
+TEST_CASE("Native EDRAM depth-to-color clear detection and format modes", "[gpu][native]") {
+  reg::RB_DEPTHCONTROL depth{};
+  depth.z_enable = 1;
+  depth.z_write_enable = 1;
+  depth.zfunc = xenos::CompareFunction::kAlways;
+  depth.stencil_enable = 1;
+  depth.stencilfunc = xenos::CompareFunction::kAlways;
+  depth.stencilzpass = xenos::StencilOp::kReplace;
+  CHECK(native::IsEdramDepthClearToColor(xenos::DepthRenderTargetFormat::kD24S8, depth, 0xFF));
+
+  depth.stencilzpass = xenos::StencilOp::kZero;
+  CHECK(native::IsEdramDepthClearToColor(xenos::DepthRenderTargetFormat::kD24S8, depth, 0xFF));
+  CHECK_FALSE(
+      native::IsEdramDepthClearToColor(xenos::DepthRenderTargetFormat::kD24FS8, depth, 0xFF));
+  CHECK_FALSE(native::IsEdramDepthClearToColor(xenos::DepthRenderTargetFormat::kD24S8, depth, 0x0F));
+
+  depth.z_write_enable = 0;
+  CHECK_FALSE(native::IsEdramDepthClearToColor(xenos::DepthRenderTargetFormat::kD24S8, depth, 0xFF));
+
+  CHECK(native::GetEdramClearColorFormatMode(VK_FORMAT_R8G8B8A8_UNORM) == 0u);
+  CHECK(native::GetEdramClearColorFormatMode(VK_FORMAT_A2B10G10R10_UNORM_PACK32) == 1u);
+  CHECK(native::GetEdramClearColorFormatMode(VK_FORMAT_R16G16_SFLOAT) == 2u);
+  CHECK(native::GetEdramClearColorFormatMode(VK_FORMAT_R32_SFLOAT) == 3u);
+  CHECK_FALSE(native::GetEdramClearColorFormatMode(VK_FORMAT_D24_UNORM_S8_UINT).has_value());
 }
