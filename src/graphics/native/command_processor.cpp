@@ -207,7 +207,9 @@ bool NativeCommandProcessor::SetupContext() {
       vulkan_device_, kDrawUploadUsage, kDrawUploadPageSize);
   output_gamma_ = std::make_unique<OutputGamma>(*vulkan_device_);
   depth_resolve_ = std::make_unique<DepthResolve>(*vulkan_device_);
+  color_resolve_ = std::make_unique<ColorResolve>(*vulkan_device_);
   if (!output_gamma_->Initialize() || !depth_resolve_->Initialize() ||
+      !color_resolve_->Initialize() ||
       vk.vkCreatePipelineCache(device, &pipeline_cache, nullptr, &pipeline_cache_) != VK_SUCCESS) {
     ShutdownContext();
     return false;
@@ -251,6 +253,7 @@ void NativeCommandProcessor::ShutdownContext() {
   draw_bindings_.clear();
   vk.vkDestroyPipelineCache(device, pipeline_cache_, nullptr);
   pipeline_cache_ = VK_NULL_HANDLE;
+  color_resolve_.reset();
   depth_resolve_.reset();
   output_gamma_.reset();
   translator_.reset();
@@ -930,11 +933,13 @@ bool NativeCommandProcessor::IssueCopy() {
       ((samples == xenos::MsaaSamples::k2X && selection == xenos::CopySampleSelect::k01) ||
        (samples == xenos::MsaaSamples::k4X && selection == xenos::CopySampleSelect::k0123));
   const bool depth = copy.IsCopyingDepth();
+  const bool single_sample =
+      !depth && samples != xenos::MsaaSamples::k1X && xenos::IsSingleCopySampleSelected(selection);
   const VkFormat color_format =
       ColorTargetFormat(xenos::ColorRenderTargetFormat(copy.color_edram_info.format));
   const VkFormat output_format =
       depth ? VK_FORMAT_R32_SFLOAT : CopyColorFormat(copy.copy_dest_info.copy_dest_format);
-  if ((!depth && ((samples != xenos::MsaaSamples::k1X && !average_all) ||
+  if ((!depth && ((samples != xenos::MsaaSamples::k1X && !average_all && !single_sample) ||
                   color_format == VK_FORMAT_UNDEFINED || color_format != output_format ||
                   copy.copy_dest_info.copy_dest_exp_bias)) ||
       copy.copy_dest_info.copy_dest_array ||
@@ -991,8 +996,9 @@ bool NativeCommandProcessor::IssueCopy() {
       return false;
     }
   }
-  const size_t descriptor = depth ? depth_resolve_->Allocate() : SIZE_MAX;
-  if (depth && descriptor == SIZE_MAX) {
+  const size_t depth_descriptor = depth ? depth_resolve_->Allocate() : SIZE_MAX;
+  const size_t color_descriptor = single_sample ? color_resolve_->Allocate() : SIZE_MAX;
+  if ((depth && depth_descriptor == SIZE_MAX) || (single_sample && color_descriptor == SIZE_MAX)) {
     return false;
   }
   resolved_images_[resolve_address] = CachedImage{destination, next_submission_};
@@ -1003,9 +1009,11 @@ bool NativeCommandProcessor::IssueCopy() {
                     extent,
                     copy.IsClearingColor(),
                     UnpackColor(color_format, copy.rb_color_clear),
-                    descriptor,
+                    depth_descriptor,
                     uint32_t(selection),
-                    depth_format == xenos::DepthRenderTargetFormat::kD24FS8 ? 2.0f : 1.0f});
+                    depth_format == xenos::DepthRenderTargetFormat::kD24FS8 ? 2.0f : 1.0f,
+                    color_descriptor,
+                    single_sample ? GetResolveSampleIndex(samples, selection) : 0});
   if (depth_clear) {
     pending_.emplace_back(std::move(*depth_clear));
   }
@@ -1113,29 +1121,40 @@ void NativeCommandProcessor::RecordResolve(const QueuedResolve& resolve) {
                            resolve.depth_scale);
     return;
   }
-  constexpr auto transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  const auto& vk = vulkan_device_->functions();
   if (!resolve.source->initialized()) {
     resolve.source->Clear(command_buffer_, {});
   }
-  resolve.source->Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, transfer,
-                             VK_ACCESS_TRANSFER_READ_BIT);
-  resolve.destination->Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, transfer,
-                                  VK_ACCESS_TRANSFER_WRITE_BIT);
-  VkImageCopy copy{};
-  copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  copy.srcOffset = {resolve.source_offset.x, resolve.source_offset.y, 0};
-  copy.extent = {resolve.extent.width, resolve.extent.height, 1};
-  const auto& vk = vulkan_device_->functions();
-  if (resolve.source->samples() == VK_SAMPLE_COUNT_1_BIT) {
-    vk.vkCmdCopyImage(command_buffer_, resolve.source->image(),
-                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, resolve.destination->image(),
-                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  if (resolve.color_descriptor != SIZE_MAX) {
+    constexpr auto compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    resolve.source->Transition(command_buffer_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, compute,
+                               VK_ACCESS_SHADER_READ_BIT);
+    resolve.destination->Transition(command_buffer_, VK_IMAGE_LAYOUT_GENERAL, compute,
+                                    VK_ACCESS_SHADER_WRITE_BIT);
+    color_resolve_->Record(command_buffer_, resolve.color_descriptor, resolve.source->view(),
+                           resolve.destination->view(), {resolve.source_offset, resolve.extent},
+                           resolve.color_sample, resolve.destination->format());
   } else {
-    const VkImageResolve region{copy.srcSubresource, copy.srcOffset, copy.dstSubresource,
-                                copy.dstOffset, copy.extent};
-    cmd_resolve_image_(command_buffer_, resolve.source->image(),
-                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, resolve.destination->image(),
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    constexpr auto transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    resolve.source->Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, transfer,
+                               VK_ACCESS_TRANSFER_READ_BIT);
+    resolve.destination->Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, transfer,
+                                    VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageCopy copy{};
+    copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.srcOffset = {resolve.source_offset.x, resolve.source_offset.y, 0};
+    copy.extent = {resolve.extent.width, resolve.extent.height, 1};
+    if (resolve.source->samples() == VK_SAMPLE_COUNT_1_BIT) {
+      vk.vkCmdCopyImage(command_buffer_, resolve.source->image(),
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, resolve.destination->image(),
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    } else {
+      const VkImageResolve region{copy.srcSubresource, copy.srcOffset, copy.dstSubresource,
+                                  copy.dstOffset, copy.extent};
+      cmd_resolve_image_(command_buffer_, resolve.source->image(),
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, resolve.destination->image(),
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    }
   }
   resolve.destination->Transition(
       command_buffer_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -1180,8 +1199,14 @@ bool NativeCommandProcessor::RetireSubmission() {
   }
   for (const auto& command : in_flight_) {
     const auto* resolve = std::get_if<QueuedResolve>(&command);
-    if (resolve && resolve->depth_descriptor != SIZE_MAX) {
+    if (!resolve) {
+      continue;
+    }
+    if (resolve->depth_descriptor != SIZE_MAX) {
       depth_resolve_->Free(resolve->depth_descriptor);
+    }
+    if (resolve->color_descriptor != SIZE_MAX) {
+      color_resolve_->Free(resolve->color_descriptor);
     }
   }
   if (result == VK_SUCCESS) {

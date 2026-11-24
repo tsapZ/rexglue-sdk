@@ -52,6 +52,20 @@ TEST_CASE("Native resolve rectangles account for tile origin and wrap", "[gpu][n
   CHECK_FALSE(native::GetResolveRectangle(copy, EdramLayout{}, 160, 48));
 }
 
+TEST_CASE("Native resolve sample selection maps to host samples", "[gpu][native]") {
+  using xenos::CopySampleSelect;
+  using xenos::MsaaSamples;
+  CHECK(native::GetResolveSampleIndex(MsaaSamples::k1X, CopySampleSelect::k0) == 0);
+  // 2x guest samples are top/bottom, which the standard Vulkan locations swap.
+  CHECK(native::GetResolveSampleIndex(MsaaSamples::k2X, CopySampleSelect::k0) == 1);
+  CHECK(native::GetResolveSampleIndex(MsaaSamples::k2X, CopySampleSelect::k1) == 0);
+  // 4x guest samples match the standard Vulkan sample locations directly.
+  CHECK(native::GetResolveSampleIndex(MsaaSamples::k4X, CopySampleSelect::k0) == 0);
+  CHECK(native::GetResolveSampleIndex(MsaaSamples::k4X, CopySampleSelect::k1) == 1);
+  CHECK(native::GetResolveSampleIndex(MsaaSamples::k4X, CopySampleSelect::k2) == 2);
+  CHECK(native::GetResolveSampleIndex(MsaaSamples::k4X, CopySampleSelect::k3) == 3);
+}
+
 TEST_CASE("Native draw expanded strips preserve guest primitive boundaries", "[gpu][native]") {
   CHECK(native::QuadStripIndices(0).empty());
   CHECK(native::QuadStripIndices(2) == std::vector<uint32_t>{0, 1, 2, 3, UINT32_MAX, 4, 5, 6, 7});

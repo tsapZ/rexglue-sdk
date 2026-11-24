@@ -58,6 +58,20 @@ inline std::vector<uint32_t> QuadStripIndices(uint32_t primitive_count) {
   return indices;
 }
 
+// Converts the sanitized guest copy sample selection (the copy_sample_select of
+// GetResolveInfo's destination coordinate info) to the sample index of the host
+// multisampled image. 4x guest samples match the standard Vulkan sample
+// locations; 2x guest samples are stored top/bottom, which the reference Vulkan
+// resolve path converts through GetD3D10SampleIndexForGuest2xMSAA.
+inline uint32_t GetResolveSampleIndex(xenos::MsaaSamples samples,
+                                      xenos::CopySampleSelect selection) {
+  if (samples == xenos::MsaaSamples::k2X) {
+    return draw_util::GetD3D10SampleIndexForGuest2xMSAA(
+        selection == xenos::CopySampleSelect::k1 ? 1 : 0, true);
+  }
+  return uint32_t(selection);
+}
+
 struct ResolveRectangle {
   uint32_t x;
   uint32_t y;

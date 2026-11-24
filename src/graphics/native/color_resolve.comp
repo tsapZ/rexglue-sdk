@@ -1,0 +1,28 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2DMSArray source_color;
+#if defined(FORMAT_RGB10A2)
+layout(rgb10_a2, set = 0, binding = 1) uniform writeonly image2DArray destination;
+#elif defined(FORMAT_RG16F)
+layout(rg16f, set = 0, binding = 1) uniform writeonly image2DArray destination;
+#elif defined(FORMAT_R32F)
+layout(r32f, set = 0, binding = 1) uniform writeonly image2DArray destination;
+#else
+layout(rgba8, set = 0, binding = 1) uniform writeonly image2DArray destination;
+#endif
+layout(push_constant) uniform Resolve {
+  ivec2 source_offset;
+  ivec2 extent;
+  int sample_index;
+} resolve;
+
+void main() {
+  ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(pixel, resolve.extent))) {
+    return;
+  }
+  ivec3 source = ivec3(resolve.source_offset + pixel, 0);
+  imageStore(destination, ivec3(pixel, 0),
+             texelFetch(source_color, source, resolve.sample_index));
+}

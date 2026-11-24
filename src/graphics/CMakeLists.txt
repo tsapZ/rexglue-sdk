@@ -176,6 +176,7 @@ if(REXGLUE_USE_VULKAN)
         native/graphics_system.cpp
         native/command_processor.cpp
         native/color_image.cpp
+        native/color_resolve.cpp
         native/depth_resolve.cpp
         native/draw_pass.cpp
         native/output_gamma.cpp

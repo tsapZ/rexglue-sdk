@@ -12,6 +12,7 @@
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/ui/presenter.h>
 
+#include "color_resolve.h"
 #include "depth_resolve.h"
 #include "draw_pass.h"
 #include "output_gamma.h"
@@ -56,6 +57,8 @@ class NativeCommandProcessor : public CommandProcessor {
     size_t depth_descriptor = SIZE_MAX;
     uint32_t depth_sample = 0;
     float depth_scale = 1.0f;
+    size_t color_descriptor = SIZE_MAX;
+    uint32_t color_sample = 0;
   };
   struct QueuedDepthClear {
     std::shared_ptr<ColorImage> target;
@@ -107,6 +110,7 @@ class NativeCommandProcessor : public CommandProcessor {
   uint64_t retired_submission_ = 0;
   std::unique_ptr<OutputGamma> output_gamma_;
   std::unique_ptr<DepthResolve> depth_resolve_;
+  std::unique_ptr<ColorResolve> color_resolve_;
   struct FrameTiming {
     uint64_t swap;
     uint32_t address;
