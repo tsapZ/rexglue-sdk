@@ -944,8 +944,6 @@ bool NativeCommandProcessor::IssueCopy() {
                   copy.copy_dest_info.copy_dest_exp_bias)) ||
       copy.copy_dest_info.copy_dest_array ||
       copy.copy_dest_base != regs.values[XE_GPU_REG_RB_COPY_DEST_BASE] ||
-      copy.copy_dest_coordinate_info.offset_x_div_8 ||
-      copy.copy_dest_coordinate_info.offset_y_div_8 ||
       !IsPhysicalRange(copy.copy_dest_extent_start, copy.copy_dest_extent_length)) {
     if (depth_clear) {
       pending_.emplace_back(std::move(*depth_clear));
@@ -969,14 +967,39 @@ bool NativeCommandProcessor::IssueCopy() {
   }
   const VkExtent2D extent{rect->width, rect->height};
 
+  const uint32_t raw_dest_base = regs.values[XE_GPU_REG_RB_COPY_DEST_BASE];
   const uint32_t resolve_address = copy.copy_dest_base & (kPhysicalMemorySize - 1);
   auto existing = resolved_images_.find(resolve_address);
   std::shared_ptr<ColorImage> destination;
-  if (existing != resolved_images_.end() && existing->second.image->format() == output_format &&
-      existing->second.image->extent().width == extent.width &&
-      existing->second.image->extent().height == extent.height) {
-    destination = existing->second.image;
-  } else {
+  VkOffset2D destination_offset{};
+  if (existing != resolved_images_.end() && existing->second.image->format() == output_format) {
+    const auto existing_extent = existing->second.image->extent();
+    const bool has_offset = copy.copy_dest_coordinate_info.offset_x_div_8 ||
+                            copy.copy_dest_coordinate_info.offset_y_div_8;
+    if (!has_offset && existing_extent.width == extent.width &&
+        existing_extent.height == extent.height) {
+      destination = existing->second.image;
+    } else if (has_offset && !depth && existing->second.image->initialized()) {
+      // A sub-rectangle updates the initialized full-surface resolve in place
+      // when it maps into that image, preserving the pixels around it.
+      const auto placed = GetCachedResolveRectangle(copy, raw_dest_base, existing_extent.width,
+                                                    existing_extent.height);
+      if (placed) {
+        destination = existing->second.image;
+        destination_offset = {int32_t(placed->x), int32_t(placed->y)};
+      }
+    }
+  }
+  if (!destination) {
+    if (copy.copy_dest_coordinate_info.offset_x_div_8 ||
+        copy.copy_dest_coordinate_info.offset_y_div_8) {
+      // A sub-rectangle that cannot be placed in an existing resolve would need
+      // guest writeback, which this path does not provide.
+      if (depth_clear) {
+        pending_.emplace_back(std::move(*depth_clear));
+      }
+      return false;
+    }
     if (existing == resolved_images_.end() && resolved_images_.size() >= kMaxResolvedImages) {
       // Drop the least recently used resolve whose GPU work has completed. Only
       // retired submissions are eligible, and the presented image is kept; the
@@ -1006,6 +1029,7 @@ bool NativeCommandProcessor::IssueCopy() {
       QueuedResolve{std::move(source),
                     std::move(destination),
                     {int32_t(rect->x), int32_t(rect->y)},
+                    destination_offset,
                     extent,
                     copy.IsClearingColor(),
                     UnpackColor(color_format, copy.rb_color_clear),
@@ -1133,7 +1157,8 @@ void NativeCommandProcessor::RecordResolve(const QueuedResolve& resolve) {
                                     VK_ACCESS_SHADER_WRITE_BIT);
     color_resolve_->Record(command_buffer_, resolve.color_descriptor, resolve.source->view(),
                            resolve.destination->view(), {resolve.source_offset, resolve.extent},
-                           resolve.color_sample, resolve.destination->format());
+                           resolve.destination_offset, resolve.color_sample,
+                           resolve.destination->format());
   } else {
     constexpr auto transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
     resolve.source->Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, transfer,
@@ -1143,6 +1168,7 @@ void NativeCommandProcessor::RecordResolve(const QueuedResolve& resolve) {
     VkImageCopy copy{};
     copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.srcOffset = {resolve.source_offset.x, resolve.source_offset.y, 0};
+    copy.dstOffset = {resolve.destination_offset.x, resolve.destination_offset.y, 0};
     copy.extent = {resolve.extent.width, resolve.extent.height, 1};
     if (resolve.source->samples() == VK_SAMPLE_COUNT_1_BIT) {
       vk.vkCmdCopyImage(command_buffer_, resolve.source->image(),

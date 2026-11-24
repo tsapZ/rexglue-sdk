@@ -18,7 +18,8 @@ class ColorResolve {
   size_t Allocate() { return descriptors_->Allocate(); }
   void Free(size_t descriptor) { descriptors_->Free(descriptor); }
   void Record(VkCommandBuffer commands, size_t descriptor, VkImageView source,
-              VkImageView destination, VkRect2D rectangle, uint32_t sample, VkFormat format);
+              VkImageView destination, VkRect2D rectangle, VkOffset2D destination_offset,
+              uint32_t sample, VkFormat format);
 
  private:
   const ui::vulkan::VulkanDevice& device_;

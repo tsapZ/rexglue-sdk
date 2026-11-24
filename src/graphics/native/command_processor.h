@@ -51,6 +51,7 @@ class NativeCommandProcessor : public CommandProcessor {
     std::shared_ptr<ColorImage> source;
     std::shared_ptr<ColorImage> destination;
     VkOffset2D source_offset;
+    VkOffset2D destination_offset;
     VkExtent2D extent;
     bool clear_color;
     VkClearColorValue clear;

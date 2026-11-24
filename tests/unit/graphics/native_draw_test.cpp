@@ -52,6 +52,30 @@ TEST_CASE("Native resolve rectangles account for tile origin and wrap", "[gpu][n
   CHECK_FALSE(native::GetResolveRectangle(copy, EdramLayout{}, 160, 48));
 }
 
+TEST_CASE("Native subrect resolves place inside a cached surface", "[gpu][native]") {
+  draw_util::ResolveInfo copy{};
+  copy.coordinate_info.width_div_8 = 4;
+  copy.height_div_8 = 2;
+  copy.copy_dest_coordinate_info.offset_x_div_8 = 1;
+  copy.copy_dest_coordinate_info.offset_y_div_8 = 2;
+  copy.copy_dest_base = 0x1000;
+
+  // The rectangle origin comes from the destination metadata offsets.
+  const auto placed = native::GetCachedResolveRectangle(copy, 0x1000, 256, 256);
+  REQUIRE(placed);
+  CHECK(placed->x == 8);
+  CHECK(placed->y == 16);
+  CHECK(placed->width == 32);
+  CHECK(placed->height == 16);
+
+  // An adjusted base that differs from the raw guest base is not placeable.
+  CHECK_FALSE(native::GetCachedResolveRectangle(copy, 0x2000, 256, 256));
+  // The rectangle must stay inside the cached image on both axes.
+  CHECK_FALSE(native::GetCachedResolveRectangle(copy, 0x1000, 32, 256));
+  CHECK_FALSE(native::GetCachedResolveRectangle(copy, 0x1000, 256, 24));
+  CHECK_FALSE(native::GetCachedResolveRectangle(copy, 0x1000, 7, 256));
+}
+
 TEST_CASE("Native resolve sample selection maps to host samples", "[gpu][native]") {
   using xenos::CopySampleSelect;
   using xenos::MsaaSamples;
