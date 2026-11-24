@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <cstring>
 #include <optional>
 #include <span>
@@ -63,6 +64,42 @@ struct ResolveRectangle {
   uint32_t width;
   uint32_t height;
 };
+
+// Rasterizer face culling for a host pipeline. Guest rectangle, point and line
+// primitives are non-polygonal, so they have no front or back face and must not
+// inherit the cull state left behind by the last polygonal draw.
+struct CullFaces {
+  bool front;
+  bool back;
+};
+
+constexpr CullFaces GetCullFaces(bool primitive_polygonal, bool cull_front, bool cull_back) {
+  return primitive_polygonal ? CullFaces{cull_front, cull_back} : CullFaces{false, false};
+}
+
+// Returns the least recently used cache entry whose GPU work has retired, so it
+// can be dropped when the cache reaches its limit. Entries last used in the
+// protected submissions (the one being recorded and the one still in flight) may
+// still be referenced by queued or submitted commands, so they are skipped -
+// pass first_protected_submission = last_retired_submission + 1 to keep only
+// fences that have already been waited for. The caller's may_evict predicate
+// can preserve the presented image. Nullopt if nothing can be evicted safely.
+template <typename EntryMap, typename Predicate>
+std::optional<typename EntryMap::key_type> SelectRetiredEviction(
+    const EntryMap& entries, uint64_t first_protected_submission, Predicate may_evict) {
+  std::optional<typename EntryMap::key_type> victim;
+  uint64_t victim_use = UINT64_MAX;
+  for (const auto& [key, entry] : entries) {
+    if (entry.last_use_submission >= first_protected_submission || !may_evict(key, entry)) {
+      continue;
+    }
+    if (!victim || entry.last_use_submission < victim_use) {
+      victim = key;
+      victim_use = entry.last_use_submission;
+    }
+  }
+  return victim;
+}
 
 inline std::optional<ResolveRectangle> GetResolveRectangle(const draw_util::ResolveInfo& copy,
                                                            EdramLayout layout, uint32_t width,

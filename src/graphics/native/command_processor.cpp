@@ -241,6 +241,7 @@ void NativeCommandProcessor::ShutdownContext() {
   in_flight_.clear();
   draw_uploads_.reset();
   presented_.reset();
+  presented_resolve_address_.reset();
   resolved_images_.clear();
   targets_.clear();
   for (const auto& entry : pipelines_) {
@@ -448,12 +449,13 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
   const uint32_t address = base_page << 12;
   auto resolved = resolved_images_.find(address);
   if (!mip_max && resolved != resolved_images_.end() &&
-      texture.format == resolved->second->format()) {
-    const auto extent = resolved->second->extent();
+      texture.format == resolved->second.image->format()) {
+    const auto extent = resolved->second.image->extent();
     if (extent.width != texture.width || extent.height != texture.height) {
       return false;
     }
-    texture.resolved_image = resolved->second;
+    resolved->second.last_use_submission = next_submission_;
+    texture.resolved_image = resolved->second.image;
     return true;
   }
 
@@ -667,8 +669,9 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                       back.stencilref}
                    : depth.front;
   const auto raster = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
-  input.cull = (raster.cull_front ? VK_CULL_MODE_FRONT_BIT : 0) |
-               (raster.cull_back ? VK_CULL_MODE_BACK_BIT : 0);
+  const bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
+  const auto cull = GetCullFaces(primitive_polygonal, raster.cull_front, raster.cull_back);
+  input.cull = (cull.front ? VK_CULL_MODE_FRONT_BIT : 0) | (cull.back ? VK_CULL_MODE_BACK_BIT : 0);
   if (point) {
     input.cull = VK_CULL_MODE_NONE;
   }
@@ -686,12 +689,12 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   draw_util::GetScissor(regs, input.scissor);
   if (!input.viewport.xy_extent[0] || !input.viewport.xy_extent[1] || !input.scissor.extent[0] ||
       !input.scissor.extent[1]) {
-    return false;
+    return true;
   }
   const auto transform = regs.Get<reg::PA_CL_VTE_CNTL>();
   const auto color = regs.Get<reg::RB_COLORCONTROL>();
   input.system.flags =
-      (draw_util::IsPrimitivePolygonal(regs) ? Translator::kSysFlag_PrimitivePolygonal : 0) |
+      (primitive_polygonal ? Translator::kSysFlag_PrimitivePolygonal : 0) |
       (draw_util::IsPrimitiveLine(regs) ? Translator::kSysFlag_PrimitiveLine : 0) |
       (uint32_t(color.alpha_test_enable ? color.alpha_func : xenos::CompareFunction::kAlways)
        << Translator::kSysFlag_AlphaPassIfLess_Shift);
@@ -851,10 +854,23 @@ std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, ui
                                                                VkImageAspectFlags aspects) {
   const auto key = std::tuple(tile, pitch, samples, format);
   if (auto existing = targets_.find(key); existing != targets_.end()) {
-    return existing->second;
+    existing->second.last_use_submission = next_submission_;
+    return existing->second.image;
   }
-  if (!pitch || targets_.size() >= 64) {
+  if (!pitch) {
     return {};
+  }
+  if (targets_.size() >= kMaxTargets) {
+    // Evict the least recently used target whose GPU work has completed. Only
+    // submissions up to the last retired fence are eligible, so queued and
+    // in-flight draws keep their images, and the presented image is kept too.
+    const auto victim = SelectRetiredEviction(
+        targets_, retired_submission_ + 1,
+        [this](const auto&, const CachedImage& entry) { return entry.image != presented_; });
+    if (!victim) {
+      return {};
+    }
+    targets_.erase(*victim);
   }
   const uint32_t tiles_per_row = xenos::GetSurfacePitchTiles(pitch, samples, false);
   const uint32_t tile_height =
@@ -866,7 +882,7 @@ std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, ui
     return {};
   }
   // shortcut: separate host images, share overlapping tiles when ownership tracking is added.
-  targets_.emplace(key, image);
+  targets_.emplace(key, CachedImage{image, next_submission_});
   return image;
 }
 
@@ -950,13 +966,24 @@ bool NativeCommandProcessor::IssueCopy() {
 
   auto existing = resolved_images_.find(copy.copy_dest_base);
   std::shared_ptr<ColorImage> destination;
-  if (existing != resolved_images_.end() && existing->second->format() == output_format &&
-      existing->second->extent().width == extent.width &&
-      existing->second->extent().height == extent.height) {
-    destination = existing->second;
+  if (existing != resolved_images_.end() && existing->second.image->format() == output_format &&
+      existing->second.image->extent().width == extent.width &&
+      existing->second.image->extent().height == extent.height) {
+    destination = existing->second.image;
   } else {
-    if (resolved_images_.size() >= 256 && existing == resolved_images_.end()) {
-      return false;
+    if (existing == resolved_images_.end() && resolved_images_.size() >= kMaxResolvedImages) {
+      // Drop the least recently used resolve whose GPU work has completed. Only
+      // retired submissions are eligible, and the presented image is kept; the
+      // shared owners in pending_ / in_flight_ keep surviving images alive.
+      const auto victim = SelectRetiredEviction(resolved_images_, retired_submission_ + 1,
+                                                [this](uint32_t address, const CachedImage& entry) {
+                                                  return entry.image != presented_ &&
+                                                         address != presented_resolve_address_;
+                                                });
+      if (!victim) {
+        return false;
+      }
+      resolved_images_.erase(*victim);
     }
     destination = std::make_shared<ColorImage>(*vulkan_device_);
     if (!destination->Initialize(extent, output_format)) {
@@ -967,7 +994,7 @@ bool NativeCommandProcessor::IssueCopy() {
   if (depth && descriptor == SIZE_MAX) {
     return false;
   }
-  resolved_images_[copy.copy_dest_base] = destination;
+  resolved_images_[copy.copy_dest_base] = CachedImage{destination, next_submission_};
   pending_.emplace_back(
       QueuedResolve{std::move(source),
                     std::move(destination),
@@ -1158,6 +1185,7 @@ bool NativeCommandProcessor::RetireSubmission() {
   }
   if (result == VK_SUCCESS) {
     draw_uploads_->Reclaim(next_submission_ - 1);
+    retired_submission_ = next_submission_ - 1;
   }
   submitted_ = false;
   if (result == VK_ERROR_DEVICE_LOST) {
@@ -1296,11 +1324,13 @@ bool NativeCommandProcessor::RenderGuestOutput(ui::Presenter::GuestOutputRefresh
   const size_t drawn = RecordPending();
 
   const auto resolved = resolved_images_.find(frontbuffer_address & (kPhysicalMemorySize - 1));
-  if (resolved != resolved_images_.end() && resolved->second->initialized() &&
-      resolved->second->format() == ColorImage::kFormat &&
-      resolved->second->extent().width == extent.width &&
-      resolved->second->extent().height == extent.height) {
-    presented_ = resolved->second;
+  if (resolved != resolved_images_.end() && resolved->second.image->initialized() &&
+      resolved->second.image->format() == ColorImage::kFormat &&
+      resolved->second.image->extent().width == extent.width &&
+      resolved->second.image->extent().height == extent.height) {
+    presented_ = resolved->second.image;
+    resolved->second.last_use_submission = next_submission_;
+    presented_resolve_address_ = resolved->first;
   }
 
   VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};

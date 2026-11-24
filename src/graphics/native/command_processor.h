@@ -64,6 +64,13 @@ class NativeCommandProcessor : public CommandProcessor {
   };
   using FrameCommand = std::variant<QueuedDraw, QueuedResolve, QueuedDepthClear>;
 
+  struct CachedImage {
+    std::shared_ptr<ColorImage> image;
+    uint64_t last_use_submission = 0;
+  };
+  static constexpr size_t kMaxTargets = 64;
+  static constexpr size_t kMaxResolvedImages = 256;
+
   std::shared_ptr<ColorImage> FindTarget(uint32_t tile, uint32_t pitch, xenos::MsaaSamples samples,
                                          VkFormat format, VkImageAspectFlags aspects);
   VkFormat GetDepthFormat(xenos::DepthRenderTargetFormat format) const;
@@ -89,13 +96,15 @@ class NativeCommandProcessor : public CommandProcessor {
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> draw_uploads_;
   uint64_t next_submission_ = 1;
   VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
-  std::map<std::tuple<uint32_t, uint32_t, xenos::MsaaSamples, VkFormat>,
-           std::shared_ptr<ColorImage>>
-      targets_;
-  std::map<uint32_t, std::shared_ptr<ColorImage>> resolved_images_;
+  std::map<std::tuple<uint32_t, uint32_t, xenos::MsaaSamples, VkFormat>, CachedImage> targets_;
+  std::map<uint32_t, CachedImage> resolved_images_;
   std::vector<FrameCommand> pending_;
   std::vector<FrameCommand> in_flight_;
   std::shared_ptr<ColorImage> presented_;
+  // Physical front buffer address of the last presented resolve. Kept across
+  // submissions so eviction cannot drop the image the presenter is showing.
+  std::optional<uint32_t> presented_resolve_address_;
+  uint64_t retired_submission_ = 0;
   std::unique_ptr<OutputGamma> output_gamma_;
   std::unique_ptr<DepthResolve> depth_resolve_;
   struct FrameTiming {

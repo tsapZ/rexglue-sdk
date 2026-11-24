@@ -1,4 +1,5 @@
 #include <array>
+#include <map>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -54,6 +55,46 @@ TEST_CASE("Native resolve rectangles account for tile origin and wrap", "[gpu][n
 TEST_CASE("Native draw expanded strips preserve guest primitive boundaries", "[gpu][native]") {
   CHECK(native::QuadStripIndices(0).empty());
   CHECK(native::QuadStripIndices(2) == std::vector<uint32_t>{0, 1, 2, 3, UINT32_MAX, 4, 5, 6, 7});
+}
+
+TEST_CASE("Native non-polygonal primitives ignore inherited cull state", "[gpu][native]") {
+  // Rectangles are non-polygonal, so leftover front/back culling must not hide them.
+  const auto rectangle = native::GetCullFaces(false, true, true);
+  CHECK_FALSE(rectangle.front);
+  CHECK_FALSE(rectangle.back);
+  const auto rectangle_front = native::GetCullFaces(false, true, false);
+  CHECK_FALSE(rectangle_front.front);
+  CHECK_FALSE(rectangle_front.back);
+  // Polygonal primitives keep the guest's per-face culling.
+  const auto triangle = native::GetCullFaces(true, true, false);
+  CHECK(triangle.front);
+  CHECK_FALSE(triangle.back);
+  const auto triangle_back = native::GetCullFaces(true, false, true);
+  CHECK_FALSE(triangle_back.front);
+  CHECK(triangle_back.back);
+}
+
+TEST_CASE("Native cache eviction skips in-flight and protected entries", "[gpu][native]") {
+  struct Entry {
+    uint64_t last_use_submission;
+    int id;
+  };
+  const std::map<int, Entry> entries{{10, {1, 10}}, {20, {2, 20}}, {30, {5, 30}}};
+  const auto evict_any = [](int, const Entry&) { return true; };
+  const auto protect_oldest = [](int, const Entry& entry) { return entry.id != 10; };
+
+  // The second argument is the first submission still protected as in flight or
+  // being recorded. Entries used in an earlier submission are retired.
+  CHECK(native::SelectRetiredEviction(entries, 2, evict_any) == 10);
+  CHECK(native::SelectRetiredEviction(entries, 6, evict_any) == 10);
+  // Submission 1 is protected here, so the last use at 1 is not yet evictable.
+  CHECK_FALSE(native::SelectRetiredEviction(entries, 1, evict_any).has_value());
+  // At boundary 3 the entry used in submission 2 is retired; key 10 is protected.
+  CHECK(native::SelectRetiredEviction(entries, 3, protect_oldest) == 20);
+  // Protecting the presented or still-referenced entries can leave no victim.
+  CHECK_FALSE(native::SelectRetiredEviction(entries, 6, [](int, const Entry&) {
+                return false;
+              }).has_value());
 }
 
 TEST_CASE("Native resolve rectangles use multisample tile dimensions", "[gpu][native]") {
