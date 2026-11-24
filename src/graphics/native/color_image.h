@@ -1,8 +1,11 @@
 #pragma once
 
+#include <map>
 #include <utility>
 
 #include <rex/ui/vulkan/device.h>
+
+#include "draw_input.h"
 
 namespace rex::graphics::native {
 
@@ -28,6 +31,10 @@ class ColorImage {
   VkImage image() const { return image_; }
   VkImageView view() const { return view_; }
   VkImageView depth_view() const { return depth_view_; }
+  // Returns a cached sampler view with the requested component mapping,
+  // creating it on first use. The view is owned by this image and stays valid
+  // until destruction, so callers must not destroy it.
+  VkImageView GetSampledView(VkComponentMapping swizzle);
   VkExtent2D extent() const { return extent_; }
   void MarkResolved() { unpublished_resolve_ = true; }
   bool TakeResolvedOutput() { return std::exchange(unpublished_resolve_, false); }
@@ -45,6 +52,9 @@ class ColorImage {
   VkDeviceMemory memory_ = VK_NULL_HANDLE;
   VkImageView view_ = VK_NULL_HANDLE;
   VkImageView depth_view_ = VK_NULL_HANDLE;
+  // Sampler views keyed by PackTextureComponentMapping, created on demand when
+  // the image is sampled with different component swizzles.
+  std::map<uint32_t, VkImageView> sampled_views_;
   VkImageLayout layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
   VkPipelineStageFlags stage_ = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
   VkAccessFlags access_ = 0;

@@ -512,6 +512,69 @@ TEST_CASE("Native 4x-MSAA fast-clear scaling preserves framebuffer coordinates",
   }
 }
 
+TEST_CASE("Native component mappings pack into unique cache keys", "[gpu][native]") {
+  // The packing is byte-stable, so identical mappings share a cached view.
+  CHECK(native::PackTextureComponentMapping(
+            {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B,
+             VK_COMPONENT_SWIZZLE_A}) == 0x06050403u);
+  CHECK(native::PackTextureComponentMapping(native::MakeTextureComponentMapping(0x688, 4, false)) ==
+        native::PackTextureComponentMapping(native::MakeTextureComponentMapping(0x688, 4, false)));
+  // Different swizzles must not share a view.
+  CHECK(native::PackTextureComponentMapping(native::MakeTextureComponentMapping(0x688, 4, false)) !=
+        native::PackTextureComponentMapping(native::MakeTextureComponentMapping(0x60A, 4, false)));
+  // copy_dest_swap changes the mapping even for the same fetch swizzle.
+  CHECK(native::PackTextureComponentMapping(native::MakeTextureComponentMapping(0x60A, 4, false)) !=
+        native::PackTextureComponentMapping(native::MakeTextureComponentMapping(0x60A, 4, true)));
+}
+
+TEST_CASE("Native cache hashes ignore padding and track key fields", "[gpu][native]") {
+  native::GuestTextureKey key{};
+  key.base_page = 0x12;
+  key.mip_page = 0x34;
+  key.width = 128;
+  key.height = 64;
+  key.array_layers = 1;
+  key.format = xenos::TextureFormat::k_8_8_8_8;
+  key.dimension = xenos::DataDimension::k2DOrStacked;
+  key.tiled = true;
+  key.endianness = xenos::Endian::k8in32;
+  key.pitch = 4;
+  key.mip_max = 3;
+  native::GuestTextureKey same = key;
+  // An identical key built independently must hash into the same bucket.
+  native::GuestTextureKey rebuilt{};
+  rebuilt.base_page = key.base_page;
+  rebuilt.mip_page = key.mip_page;
+  rebuilt.width = key.width;
+  rebuilt.height = key.height;
+  rebuilt.array_layers = key.array_layers;
+  rebuilt.format = key.format;
+  rebuilt.dimension = key.dimension;
+  rebuilt.tiled = key.tiled;
+  rebuilt.packed_mips = key.packed_mips;
+  rebuilt.endianness = key.endianness;
+  rebuilt.pitch = key.pitch;
+  rebuilt.mip_max = key.mip_max;
+  const native::GuestTextureKeyHash texture_hash;
+  CHECK(texture_hash(key) == texture_hash(same));
+  CHECK(texture_hash(key) == texture_hash(rebuilt));
+  rebuilt.pitch = key.pitch + 1;
+  CHECK(texture_hash(key) != texture_hash(rebuilt));
+
+  native::DrawSampler sampler{};
+  sampler.min_filter = VK_FILTER_LINEAR;
+  sampler.mag_filter = VK_FILTER_NEAREST;
+  sampler.mip_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  sampler.max_lod = 4.0f;
+  sampler.address_u = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  sampler.address_v = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+  native::DrawSampler same_sampler = sampler;
+  const native::DrawSamplerHash sampler_hash;
+  CHECK(sampler_hash(sampler) == sampler_hash(same_sampler));
+  same_sampler.max_lod = 5.0f;
+  CHECK(sampler_hash(sampler) != sampler_hash(same_sampler));
+}
+
 TEST_CASE("Native EDRAM depth-to-color clear detection and format modes", "[gpu][native]") {
   reg::RB_DEPTHCONTROL depth{};
   depth.z_enable = 1;

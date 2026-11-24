@@ -6,10 +6,35 @@ namespace rex::graphics::native {
 
 ColorImage::~ColorImage() {
   const auto& vk = device_.functions();
+  for (const auto& entry : sampled_views_) {
+    vk.vkDestroyImageView(device_.device(), entry.second, nullptr);
+  }
   vk.vkDestroyImageView(device_.device(), view_, nullptr);
   vk.vkDestroyImageView(device_.device(), depth_view_, nullptr);
   vk.vkDestroyImage(device_.device(), image_, nullptr);
   vk.vkFreeMemory(device_.device(), memory_, nullptr);
+}
+
+VkImageView ColorImage::GetSampledView(VkComponentMapping swizzle) {
+  const uint32_t key = PackTextureComponentMapping(swizzle);
+  auto found = sampled_views_.find(key);
+  if (found != sampled_views_.end()) {
+    return found->second;
+  }
+  VkImageViewCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  info.image = image_;
+  info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+  info.format = format_;
+  info.components = swizzle;
+  info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkImageView view = VK_NULL_HANDLE;
+  if (device_.functions().vkCreateImageView(device_.device(), &info, nullptr, &view) !=
+      VK_SUCCESS) {
+    return VK_NULL_HANDLE;
+  }
+  sampled_views_.emplace(key, view);
+  return view;
 }
 
 bool ColorImage::Initialize(VkExtent2D extent, VkFormat format, VkSampleCountFlagBits samples,

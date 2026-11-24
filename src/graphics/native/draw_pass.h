@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
@@ -29,6 +30,9 @@ struct CachedTexture {
   uint32_t base_length = 0;
   uint32_t mip_start = 0;
   uint32_t mip_length = 0;
+  // Number of mip levels stored in the image, needed to create a view for a new
+  // component mapping without recomputing the guest texture layout.
+  uint32_t level_count = 1;
   // Set once a draw carrying this entry is accepted, so later draws in the same
   // batch can sample it without uploading again.
   bool uploaded = false;
@@ -110,7 +114,19 @@ struct DrawPipelineKey {
   auto operator<=>(const DrawPipelineKey&) const = default;
 };
 
-using DrawPipelines = std::map<DrawPipelineKey, VkPipeline>;
+// Hashes the explicitly initialized members rather than the raw struct bytes,
+// so the hash never depends on padding between the pointers and the arrays.
+struct DrawPipelineKeyHash {
+  size_t operator()(const DrawPipelineKey& key) const noexcept {
+    uint64_t hash = XXH3_64bits(&key.vertex, sizeof(key.vertex));
+    hash = XXH3_64bits_withSeed(&key.pixel, sizeof(key.pixel), hash);
+    hash = XXH3_64bits_withSeed(key.state.data(), sizeof(key.state), hash);
+    hash = XXH3_64bits_withSeed(key.colors.data(), sizeof(key.colors), hash);
+    return size_t(hash);
+  }
+};
+
+using DrawPipelines = std::unordered_map<DrawPipelineKey, VkPipeline, DrawPipelineKeyHash>;
 constexpr size_t kDrawUploadPageSize = 16 * 1024 * 1024;
 constexpr VkBufferUsageFlags kDrawUploadUsage =
     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |

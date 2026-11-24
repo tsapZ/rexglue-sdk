@@ -124,9 +124,9 @@ DrawPass::~DrawPass() {
     }
   }
   for (const auto& texture : textures_) {
-    // Fallback views, cached views, samplers and cached images are owned by the
-    // command processor, not this pass.
-    if (texture.fallback_view == VK_NULL_HANDLE && !texture.cached) {
+    // Fallback views, cached views, resolved-image views, samplers and cached
+    // images are owned by the command processor, not this pass.
+    if (texture.fallback_view == VK_NULL_HANDLE && !texture.cached && !texture.resolved) {
       vk.vkDestroyImageView(device, texture.view, nullptr);
     }
     vk.vkDestroyImage(device, texture.image, nullptr);
@@ -261,8 +261,21 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   }
 
   // The captured vertex ranges are packed at the beginning of the first segment.
-  std::vector<VkDescriptorBufferInfo> shared_infos(shared_buffer_count,
-                                                   {buffer_, buffer_offset, vertex_size});
+  // The shared memory buffer count is at most four, so keep the bindings on the
+  // stack and only fall back to the heap for an unexpectedly large count.
+  constexpr size_t kInlineSharedBuffers = 8;
+  std::array<VkDescriptorBufferInfo, kInlineSharedBuffers> inline_shared_infos{};
+  std::vector<VkDescriptorBufferInfo> heap_shared_infos;
+  VkDescriptorBufferInfo* shared_infos;
+  if (shared_buffer_count <= kInlineSharedBuffers) {
+    shared_infos = inline_shared_infos.data();
+  } else {
+    heap_shared_infos.resize(shared_buffer_count);
+    shared_infos = heap_shared_infos.data();
+  }
+  for (uint32_t i = 0; i < shared_buffer_count; ++i) {
+    shared_infos[i] = {buffer_, buffer_offset, vertex_size};
+  }
   std::array<VkWriteDescriptorSet, 1 + Translator::kConstantBufferCount> writes{};
   writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                nullptr,
@@ -272,7 +285,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
                shared_buffer_count,
                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                nullptr,
-               shared_infos.data()};
+               shared_infos};
   for (uint32_t i = 0; i < constant_infos.size(); ++i) {
     writes[i + 1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets_[1],          i, 0, 1,
                      VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,      nullptr, &constant_infos[i]};
@@ -301,31 +314,37 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       texture.view = input_texture.cached_view;
       continue;
     }
-    const uint32_t level_count =
-        texture.resolved ? 1 : std::max(1u, uint32_t(texture.uploads.size()));
-    if (!texture.resolved) {
-      VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-      info.imageType = VK_IMAGE_TYPE_2D;
-      info.format = input_texture.format;
-      info.extent = {input_texture.width, input_texture.height, 1};
-      info.mipLevels = level_count;
-      info.arrayLayers = texture.array_layers;
-      info.samples = VK_SAMPLE_COUNT_1_BIT;
-      info.tiling = VK_IMAGE_TILING_OPTIMAL;
-      // A cropped resolve is filled by an image copy during the upload.
-      info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-      if (input_texture.view_type == VK_IMAGE_VIEW_TYPE_CUBE) {
-        info.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-      }
-      if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-              &device_, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, texture.image,
-              texture.memory)) {
+    // Resolved images cache their sampler views by component mapping, so a
+    // draw only borrows one instead of creating and destroying a view.
+    if (texture.resolved) {
+      texture.view = texture.resolved->GetSampledView(input_texture.swizzle);
+      if (texture.view == VK_NULL_HANDLE) {
         return false;
       }
+      continue;
+    }
+    const uint32_t level_count = std::max(1u, uint32_t(texture.uploads.size()));
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = input_texture.format;
+    info.extent = {input_texture.width, input_texture.height, 1};
+    info.mipLevels = level_count;
+    info.arrayLayers = texture.array_layers;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    // A cropped resolve is filled by an image copy during the upload.
+    info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (input_texture.view_type == VK_IMAGE_VIEW_TYPE_CUBE) {
+      info.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    }
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            &device_, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, texture.image,
+            texture.memory)) {
+      return false;
     }
     VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    view.image = texture.resolved ? texture.resolved->image() : texture.image;
-    view.viewType = texture.resolved ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : input_texture.view_type;
+    view.image = texture.image;
+    view.viewType = input_texture.view_type;
     view.format = input_texture.format;
     view.components = input_texture.swizzle;
     view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, level_count, 0, texture.array_layers};
@@ -334,25 +353,40 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     }
   }
   if (has_textures) {
-    std::vector<VkDescriptorImageInfo> image_infos;
-    std::vector<VkWriteDescriptorSet> image_writes;
-    image_infos.reserve(image_count + sampler_count);
-    image_writes.reserve(image_count + sampler_count);
+    // Up to 32 textures and 32 samplers are written per draw; keep the descriptor
+    // data on the stack rather than allocating two vectors for every draw.
+    constexpr size_t kInlineImageInfos = 64;
+    const size_t total = size_t(image_count) + sampler_count;
+    std::array<VkDescriptorImageInfo, kInlineImageInfos> inline_image_infos{};
+    std::array<VkWriteDescriptorSet, kInlineImageInfos> inline_image_writes{};
+    std::vector<VkDescriptorImageInfo> heap_image_infos;
+    std::vector<VkWriteDescriptorSet> heap_image_writes;
+    VkDescriptorImageInfo* image_infos;
+    VkWriteDescriptorSet* image_writes;
+    if (total <= kInlineImageInfos) {
+      image_infos = inline_image_infos.data();
+      image_writes = inline_image_writes.data();
+    } else {
+      heap_image_infos.resize(total);
+      heap_image_writes.resize(total);
+      image_infos = heap_image_infos.data();
+      image_writes = heap_image_writes.data();
+    }
+    uint32_t info_count = 0;
     for (uint32_t texture_index : input.texture_bindings) {
-      image_infos.push_back({VK_NULL_HANDLE, textures_[texture_index].view,
-                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+      image_infos[info_count++] = {VK_NULL_HANDLE, textures_[texture_index].view,
+                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     }
     for (VkSampler sampler : input.samplers) {
-      image_infos.push_back({sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
+      image_infos[info_count++] = {sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     }
-    for (uint32_t i = 0; i < image_infos.size(); ++i) {
-      image_writes.push_back(
-          {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets_[3], i, 0, 1,
-           i < image_count ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER,
-           &image_infos[i]});
+    for (uint32_t i = 0; i < info_count; ++i) {
+      image_writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets_[3], i, 0, 1,
+                         i < image_count ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+                                         : VK_DESCRIPTOR_TYPE_SAMPLER,
+                         &image_infos[i]};
     }
-    vk.vkUpdateDescriptorSets(device, uint32_t(image_writes.size()), image_writes.data(), 0,
-                              nullptr);
+    vk.vkUpdateDescriptorSets(device, info_count, image_writes, 0, nullptr);
   }
 
   const auto& depth = input.depth_stencil;

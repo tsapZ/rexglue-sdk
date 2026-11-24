@@ -712,10 +712,6 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
   }
   texture.swizzle = MakeTextureComponentMapping(fetch.swizzle, channel_count, false);
 
-  const auto layout = texture_util::GetGuestTextureLayout(
-      fetch.dimension, fetch.pitch, texture.width, texture.height, 1, fetch.tiled, fetch.format,
-      fetch.packed_mips, true, mip_max);
-
   GuestTextureKey key;
   key.base_page = base_page;
   key.mip_page = mip_page;
@@ -729,6 +725,43 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
   key.endianness = fetch.endianness;
   key.pitch = fetch.pitch;
   key.mip_max = mip_max;
+
+  // A cached texture whose texels are already uploaded can be sampled straight
+  // away: the guest layout and the physical page checks only matter when the
+  // image is created or decoded for the first time.
+  std::shared_ptr<CachedTexture> entry;
+  auto cached = cached_textures_.find(key);
+  if (cached != cached_textures_.end()) {
+    entry = cached->second.texture;
+    cached->second.last_use_submission = next_submission_;
+    entry->last_use_submission = next_submission_;
+    if (entry->uploaded) {
+      auto view = entry->views.find(fetch.swizzle);
+      if (view == entry->views.end()) {
+        VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        info.image = entry->image;
+        info.viewType = texture.view_type;
+        info.format = texture.format;
+        info.components = texture.swizzle;
+        info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, entry->level_count, 0,
+                                 texture.array_layers};
+        VkImageView image_view = VK_NULL_HANDLE;
+        if (vulkan_device_->functions().vkCreateImageView(vulkan_device_->device(), &info, nullptr,
+                                                          &image_view) != VK_SUCCESS) {
+          return false;
+        }
+        view = entry->views.emplace(fetch.swizzle, image_view).first;
+      }
+      texture.cached_texture = entry;
+      texture.cached_view = view->second;
+      texture.upload_cached = false;
+      return true;
+    }
+  }
+
+  const auto layout = texture_util::GetGuestTextureLayout(
+      fetch.dimension, fetch.pitch, texture.width, texture.height, 1, fetch.tiled, fetch.format,
+      fetch.packed_mips, true, mip_max);
 
   const uint32_t level_count = layout.max_level + 1;
   const uint32_t base_length =
@@ -746,13 +779,7 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
     }
   }
 
-  std::shared_ptr<CachedTexture> entry;
-  auto cached = cached_textures_.find(key);
-  if (cached != cached_textures_.end()) {
-    entry = cached->second.texture;
-    cached->second.last_use_submission = next_submission_;
-    entry->last_use_submission = next_submission_;
-  } else if (cached_textures_.size() >= kMaxCachedTextures) {
+  if (!entry && cached_textures_.size() >= kMaxCachedTextures) {
     // Drop the least recently used texture whose GPU work has retired. If none
     // can be dropped safely, decode without caching for this draw only.
     const auto victim = SelectRetiredEviction(
@@ -769,6 +796,7 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
     entry->base_length = base_length;
     entry->mip_start = mip_start;
     entry->mip_length = mip_length;
+    entry->level_count = level_count;
     entry->last_use_submission = next_submission_;
     VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     image.imageType = VK_IMAGE_TYPE_2D;
@@ -900,8 +928,10 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return false;
   }
   auto& candidate_vs = *static_cast<SpirvShader*>(active_vertex_shader_);
-  string::StringBuffer disassembly;
-  candidate_vs.AnalyzeUcode(disassembly);
+  if (!candidate_vs.is_ucode_analyzed()) {
+    string::StringBuffer disassembly;
+    candidate_vs.AnalyzeUcode(disassembly);
+  }
   const auto dimensions = regs.Get<reg::RB_SURFACE_INFO>();
   const uint32_t color_mask = regs.values[XE_GPU_REG_RB_COLOR_MASK] & 0xFFFF;
   if ((!dimensions.surface_pitch || !color_mask) && !candidate_vs.memexport_eM_written() &&
@@ -932,7 +962,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (!FlushPendingIfFull()) {
     return false;
   }
-  std::vector<uint32_t> indices(index_count);
+  std::vector<uint32_t>& indices = scratch_indices_;
+  indices.resize(index_count);
   if (index_buffer_info) {
     const auto& index = *index_buffer_info;
     const size_t index_bytes =
@@ -949,7 +980,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   auto& vs = *static_cast<SpirvShader*>(active_vertex_shader_);
   auto* ps = mode == xenos::EdramMode::kColorDepth ? static_cast<SpirvShader*>(active_pixel_shader_)
                                                    : nullptr;
-  if (ps) {
+  if (ps && !ps->is_ucode_analyzed()) {
+    string::StringBuffer disassembly;
     ps->AnalyzeUcode(disassembly);
   }
   if (vs.memexport_eM_written() || (ps && ps->memexport_eM_written())) {
@@ -1977,7 +2009,12 @@ bool NativeCommandProcessor::SubmitCommands() {
 }
 
 bool NativeCommandProcessor::FlushPendingIfFull() {
-  if (pending_.size() < 512) {
+  // Grow the batch enough that a whole frame records into a single command
+  // buffer, so no mid-frame vkWaitForFences stall is needed. The largest
+  // observed scene queues about 5.6K draws and resolves, so 8K leaves headroom
+  // while still bounding memory.
+  constexpr size_t kMaxPendingCommands = 8192;
+  if (pending_.size() < kMaxPendingCommands) {
     return true;
   }
   if (!BeginCommands()) {

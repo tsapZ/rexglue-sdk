@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <bit>
 #include <compare>
 #include <cstdint>
 #include <cstring>
@@ -9,6 +10,7 @@
 #include <vector>
 
 #include <vulkan/vulkan_core.h>
+#include <xxhash.h>
 
 #include <rex/graphics/edram_layout.h>
 #include <rex/graphics/registers.h>
@@ -31,6 +33,17 @@ struct DrawSampler {
   auto operator<=>(const DrawSampler&) const = default;
 };
 
+// Hashes only the initialized fields so equal sampler states always map to the
+// same bucket regardless of any padding in the struct.
+struct DrawSamplerHash {
+  size_t operator()(const DrawSampler& key) const noexcept {
+    const std::array<uint32_t, 6> fields{
+        uint32_t(key.min_filter), uint32_t(key.mag_filter), uint32_t(key.mip_mode),
+        std::bit_cast<uint32_t>(key.max_lod), uint32_t(key.address_u), uint32_t(key.address_v)};
+    return size_t(XXH3_64bits(fields.data(), sizeof(fields)));
+  }
+};
+
 // Everything that determines the uploaded host texel data of a guest texture.
 // The view swizzle is deliberately excluded because a single image is sampled
 // with several component mappings.
@@ -48,6 +61,18 @@ struct GuestTextureKey {
   uint32_t pitch = 0;
   uint32_t mip_max = 0;
   auto operator<=>(const GuestTextureKey&) const = default;
+};
+
+// Hashes only the initialized fields, so the padding between the bool flags and
+// the following enum can never make two identical keys hash differently.
+struct GuestTextureKeyHash {
+  size_t operator()(const GuestTextureKey& key) const noexcept {
+    const std::array<uint32_t, 12> fields{
+        key.base_page,      key.mip_page,       key.width,          key.height,
+        key.array_layers,   uint32_t(key.format), uint32_t(key.dimension), key.tiled,
+        key.packed_mips,    uint32_t(key.endianness), key.pitch,     key.mip_max};
+    return size_t(XXH3_64bits(fields.data(), sizeof(fields)));
+  }
 };
 
 // Whether two [start, start + length) physical memory ranges share any byte.
@@ -114,6 +139,13 @@ constexpr VkComponentMapping MakeTextureComponentMapping(uint32_t fetch_swizzle,
       VK_COMPONENT_SWIZZLE_ZERO};
   return {swizzles[fetch_swizzle & 7], swizzles[(fetch_swizzle >> 3) & 7],
           swizzles[(fetch_swizzle >> 6) & 7], swizzles[(fetch_swizzle >> 9) & 7]};
+}
+
+// Packs a component mapping into one 32-bit cache key. Every swizzle value the
+// translator produces fits in a byte, so distinct mappings never collide.
+constexpr uint32_t PackTextureComponentMapping(VkComponentMapping mapping) {
+  return (uint32_t(mapping.r) & 0xFF) | ((uint32_t(mapping.g) & 0xFF) << 8) |
+         ((uint32_t(mapping.b) & 0xFF) << 16) | ((uint32_t(mapping.a) & 0xFF) << 24);
 }
 
 // IEEE floating-point host formats are natively signed, so a signed guest fetch

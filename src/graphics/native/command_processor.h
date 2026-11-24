@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -164,9 +165,9 @@ class NativeCommandProcessor : public CommandProcessor {
   VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
   std::map<std::tuple<uint32_t, uint32_t, xenos::MsaaSamples, VkFormat>, CachedImage> targets_;
   std::map<std::pair<uint32_t, uint32_t>, PendingFastClear> pending_fast_clears_;
-  std::map<uint32_t, CachedResolve> resolved_images_;
-  std::map<DrawSampler, CachedSampler> samplers_;
-  std::map<GuestTextureKey, CachedTextureEntry> cached_textures_;
+  std::unordered_map<uint32_t, CachedResolve> resolved_images_;
+  std::unordered_map<DrawSampler, CachedSampler, DrawSamplerHash> samplers_;
+  std::unordered_map<GuestTextureKey, CachedTextureEntry, GuestTextureKeyHash> cached_textures_;
   // Written from guest threads while the global critical region is held, so it
   // only guards the pending list - never call into memory_ or Vulkan here.
   std::mutex invalidation_mutex_;
@@ -175,6 +176,8 @@ class NativeCommandProcessor : public CommandProcessor {
   void* memory_invalidation_handle_ = nullptr;
   std::vector<FrameCommand> pending_;
   std::vector<FrameCommand> in_flight_;
+  // Reused by IssueDraw so decoding guest indices does not allocate per draw.
+  std::vector<uint32_t> scratch_indices_;
   std::unique_ptr<ImageReadback> in_flight_readback_;
   std::shared_ptr<ColorImage> presented_;
   // Physical front buffer address of the last presented resolve. Kept across
