@@ -225,7 +225,12 @@ bool NativeCommandProcessor::SetupContext() {
     }
     frame_timing_ << "swap,address,width,height,ready_ns,result\n";
   }
-  SetActiveEdramLayout(RequestedEdramLayout());
+  if (RequestedEdramLayout().is_extended()) {
+    REXLOG_WARN(
+        "Native Vulkan does not support edram_tile_count 4096 (a narrow surface image would exceed "
+        "the maximum 2D image dimension); using 2048");
+  }
+  SetActiveEdramLayout(EdramLayout{});
   REXLOG_INFO("Native Vulkan: command processor initialized");
   return true;
 }
