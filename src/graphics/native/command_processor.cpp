@@ -964,7 +964,8 @@ bool NativeCommandProcessor::IssueCopy() {
   }
   const VkExtent2D extent{rect->width, rect->height};
 
-  auto existing = resolved_images_.find(copy.copy_dest_base);
+  const uint32_t resolve_address = copy.copy_dest_base & (kPhysicalMemorySize - 1);
+  auto existing = resolved_images_.find(resolve_address);
   std::shared_ptr<ColorImage> destination;
   if (existing != resolved_images_.end() && existing->second.image->format() == output_format &&
       existing->second.image->extent().width == extent.width &&
@@ -994,7 +995,7 @@ bool NativeCommandProcessor::IssueCopy() {
   if (depth && descriptor == SIZE_MAX) {
     return false;
   }
-  resolved_images_[copy.copy_dest_base] = CachedImage{destination, next_submission_};
+  resolved_images_[resolve_address] = CachedImage{destination, next_submission_};
   pending_.emplace_back(
       QueuedResolve{std::move(source),
                     std::move(destination),
@@ -1324,13 +1325,17 @@ bool NativeCommandProcessor::RenderGuestOutput(ui::Presenter::GuestOutputRefresh
   const size_t drawn = RecordPending();
 
   const auto resolved = resolved_images_.find(frontbuffer_address & (kPhysicalMemorySize - 1));
+  const bool use_pwl = resolved != resolved_images_.end() &&
+                       resolved->second.image->format() == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
   if (resolved != resolved_images_.end() && resolved->second.image->initialized() &&
-      resolved->second.image->format() == ColorImage::kFormat &&
+      (resolved->second.image->format() == ColorImage::kFormat || use_pwl) &&
       resolved->second.image->extent().width == extent.width &&
       resolved->second.image->extent().height == extent.height) {
     presented_ = resolved->second.image;
     resolved->second.last_use_submission = next_submission_;
     presented_resolve_address_ = resolved->first;
+  } else {
+    presented_resolve_address_.reset();
   }
 
   VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -1356,9 +1361,11 @@ bool NativeCommandProcessor::RenderGuestOutput(ui::Presenter::GuestOutputRefresh
   if (presented_) {
     presented_->Transition(command_buffer_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-    const auto ramp = std::as_bytes(std::span(gamma_ramp_256_entry_table(), 256));
+    const auto ramp = use_pwl
+                          ? std::as_bytes(std::span(gamma_ramp_pwl_rgb(), 128 * 3))
+                          : std::as_bytes(std::span(gamma_ramp_256_entry_table(), 256));
     if (!output_gamma_->Record(command_buffer_, presented_->view(), output.image_view(), extent,
-                               ramp, false)) {
+                               ramp, use_pwl)) {
       return false;
     }
   } else {
@@ -1389,7 +1396,7 @@ bool NativeCommandProcessor::RenderGuestOutput(ui::Presenter::GuestOutputRefresh
         "Native Vulkan: presented guest framebuffer {:08X} at {}x{} with {} submitted draws",
         frontbuffer_address, extent.width, extent.height, drawn);
   }
-  output.SetIs8bpc(true);
+  output.SetIs8bpc(!presented_ || !use_pwl);
   return true;
 }
 
