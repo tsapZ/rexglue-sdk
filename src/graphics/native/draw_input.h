@@ -343,6 +343,15 @@ constexpr CullFaces GetCullFaces(bool primitive_polygonal, bool cull_front, bool
   return primitive_polygonal ? CullFaces{cull_front, cull_back} : CullFaces{false, false};
 }
 
+// The guest turns off clipping with PA_CL_CLIP_CNTL.CLIP_DISABLE and expects
+// vertices outside the depth range to be clamped rather than discarded. Vulkan
+// has no "no clipping" mode, so it is mapped to depth clamping where the device
+// supports it. Without this, geometry such as the 4x-MSAA fast-clear quads,
+// which clear with a near-zero Z, is clipped away entirely.
+constexpr bool GetDepthClampEnable(bool device_depth_clamp, bool clip_disable) {
+  return device_depth_clamp && clip_disable;
+}
+
 // Returns the least recently used cache entry whose GPU work has retired, so it
 // can be dropped when the cache reaches its limit. Entries last used in the
 // protected submissions (the one being recorded and the one still in flight) may

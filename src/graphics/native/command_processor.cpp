@@ -1047,6 +1047,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     input.cull = VK_CULL_MODE_NONE;
   }
   input.front_face = raster.face ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  input.depth_clamp_enable = GetDepthClampEnable(
+      vulkan_device_->properties().depthClamp, regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable);
   for (size_t channel = 0; channel < input.blend_constants.size(); ++channel) {
     input.blend_constants[channel] = regs.Get<float>(XE_GPU_REG_RB_BLEND_RED + uint32_t(channel));
   }

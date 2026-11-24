@@ -386,7 +386,8 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
                        back.writeMask,
                        back.reference,
                        shared_buffer_count,
-                       input.edram_depth_clear_color},
+                       input.edram_depth_clear_color,
+                       uint32_t(input.depth_clamp_enable)},
                       {}};
   for (uint32_t i = 0; i < input.color_count; ++i) {
     const auto& color = input.blend[i];
@@ -436,6 +437,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   VkPipelineRasterizationStateCreateInfo raster{
       VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
   raster.polygonMode = VK_POLYGON_MODE_FILL;
+  raster.depthClampEnable = input.depth_clamp_enable ? VK_TRUE : VK_FALSE;
   raster.frontFace = input.front_face;
   raster.cullMode = input.cull;
   raster.lineWidth = 1.0f;

@@ -86,6 +86,9 @@ struct DrawInput {
   std::array<float, 4> blend_constants{};
   VkCullModeFlags cull = VK_CULL_MODE_NONE;
   VkFrontFace front_face = VK_FRONT_FACE_CLOCKWISE;
+  // PA_CL_CLIP_CNTL.CLIP_DISABLE, mapped to depth clamping since Vulkan cannot
+  // disable clipping entirely.
+  bool depth_clamp_enable = false;
   std::vector<uint8_t> vertices;
   std::vector<DrawTexture> textures;
   std::vector<uint32_t> texture_bindings;

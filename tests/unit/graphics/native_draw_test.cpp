@@ -204,6 +204,17 @@ TEST_CASE("Native non-polygonal primitives ignore inherited cull state", "[gpu][
   CHECK(triangle_back.back);
 }
 
+TEST_CASE("Native clip disable maps to depth clamping", "[gpu][native]") {
+  // CLIP_DISABLE makes the guest expect out-of-range depth to clamp instead of
+  // being clipped, which the aliased 4x-MSAA fast clears depend on: their quads
+  // use a near-zero Z that would otherwise be discarded.
+  CHECK(native::GetDepthClampEnable(true, true));
+  CHECK_FALSE(native::GetDepthClampEnable(true, false));
+  // Never request the feature when the device does not support it.
+  CHECK_FALSE(native::GetDepthClampEnable(false, true));
+  CHECK_FALSE(native::GetDepthClampEnable(false, false));
+}
+
 TEST_CASE("Native cache eviction skips in-flight and protected entries", "[gpu][native]") {
   struct Entry {
     uint64_t last_use_submission;
