@@ -100,13 +100,21 @@ TEST_CASE("to_sys converts known FILETIMEs to correct system_clock values", "[ch
 }
 
 TEST_CASE("from_sys then to_sys round-trips for whole-second values", "[chrono]") {
-  // Use values aligned to system_clock precision (whole seconds)
-  for (uint64_t ft : {kFtNtEpoch, kFtUnixEpoch, kFtY2k, kFt2021}) {
+  // Use values aligned to system_clock precision (whole seconds). Not the NT epoch: system_clock counts nanoseconds
+  // on Linux and macOS, and its int64 only reaches back to 1677 (to_sys_time below covers it).
+  for (uint64_t ft : {kFtUnixEpoch, kFtY2k, kFt2021}) {
     auto nt_tp = WinSystemClock::from_file_time(ft);
     auto sys_tp = WinSystemClock::to_sys(nt_tp);
     auto nt_tp2 = WinSystemClock::from_sys(sys_tp);
     auto ft2 = WinSystemClock::to_file_time(nt_tp2);
     CHECK(ft2 == ft);
+  }
+}
+
+TEST_CASE("from_sys_time then to_sys_time round-trips from the NT epoch on", "[chrono]") {
+  for (uint64_t ft : {kFtNtEpoch, kFtUnixEpoch, kFtY2k, kFtSubDay, kFt2021, uint64_t{1}}) {
+    auto sys_tp = WinSystemClock::to_sys_time(WinSystemClock::from_file_time(ft));
+    CHECK(WinSystemClock::to_file_time(WinSystemClock::from_sys_time(sys_tp)) == ft);
   }
 }
 
@@ -128,7 +136,7 @@ struct TimeFields {
 
 // Decompose a FILETIME exactly as RtlTimeToTimeFields_entry does
 static TimeFields decompose(uint64_t filetime) {
-  auto tp = WinSystemClock::to_sys(WinSystemClock::from_file_time(filetime));
+  auto tp = WinSystemClock::to_sys_time(WinSystemClock::from_file_time(filetime));
   auto dp = std::chrono::floor<std::chrono::days>(tp);
   auto ymd = std::chrono::year_month_day{dp};
   auto wd = std::chrono::weekday{dp};
@@ -228,12 +236,24 @@ static uint64_t recompose(int y, unsigned m, unsigned d, int hour, int min, int 
   if (!ymd.ok())
     return 0;
   auto dp = static_cast<std::chrono::sys_days>(ymd);
-  std::chrono::system_clock::time_point time = dp;
+  WinSystemClock::sys_time_type time = dp;
   time += std::chrono::hours{hour};
   time += std::chrono::minutes{min};
   time += std::chrono::seconds{sec};
   time += std::chrono::milliseconds{ms};
-  return WinSystemClock::to_file_time(WinSystemClock::from_sys(time));
+  return WinSystemClock::to_file_time(WinSystemClock::from_sys_time(time));
+}
+
+TEST_CASE("calendar decomposition: a small time (a length of time) is 1601-01-01 plus it", "[chrono]") {
+  // 1 h 2 min 3.456 s in 100 ns steps: what a game gets back when it formats a play time this way.
+  auto tf = decompose(3723456ULL * 10000ULL);
+  CHECK(tf.year == 1601);
+  CHECK(tf.month == 1);
+  CHECK(tf.day == 1);
+  CHECK(tf.hours == 1);
+  CHECK(tf.minutes == 2);
+  CHECK(tf.seconds == 3);
+  CHECK(tf.milliseconds == 456);
 }
 
 TEST_CASE("calendar recomposition: known dates produce correct FILETIMEs", "[chrono]") {

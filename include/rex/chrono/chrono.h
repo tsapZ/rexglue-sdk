@@ -93,6 +93,23 @@ struct NtSystemClock {
     return dp;
   }
 
+  // The same with a system clock time point that counts in 100 ns steps. system_clock's own duration is nanoseconds in
+  // libstdc++ and libc++, and their int64 only reaches back to 1677: FILETIMEs near the NT epoch (1601, or a small
+  // value a game uses as a length of time) overflowed in to_sys on Linux and macOS. These cover every FILETIME.
+  using sys_time_type = std::chrono::sys_time<duration>;
+
+  static constexpr sys_time_type to_sys_time(const time_point& tp)
+    requires(domain_ == Domain::Host)
+  {
+    return sys_time_type{tp.time_since_epoch() + unix_epoch_delta()};
+  }
+
+  static constexpr time_point from_sys_time(const sys_time_type& tp)
+    requires(domain_ == Domain::Host)
+  {
+    return time_point{tp.time_since_epoch() - unix_epoch_delta()};
+  }
+
   [[nodiscard]] static time_point now() noexcept {
     if constexpr (domain_ == Domain::Host) {
       // QueryHostSystemTime() returns windows epoch times even on POSIX

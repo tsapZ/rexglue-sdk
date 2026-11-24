@@ -460,9 +460,10 @@ static_assert_size(X_TIME_FIELDS, 16);
 
 // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-rtltimetotimefields
 void RtlTimeToTimeFields_entry(mapped_u64 time_ptr, ppc_ptr_t<X_TIME_FIELDS> time_fields_ptr) {
-  // Use host clock because we don't want scaling to be applied, just conversion
+  // Use host clock because we don't want scaling to be applied, just conversion. In 100 ns steps (to_sys_time):
+  // system_clock's nanoseconds can't hold dates before 1677 on Linux, and a small time (a length of time) is 1601.
   using rex::chrono::WinSystemClock;
-  auto tp = WinSystemClock::to_sys(WinSystemClock::from_file_time(time_ptr.value()));
+  auto tp = WinSystemClock::to_sys_time(WinSystemClock::from_file_time(time_ptr.value()));
   auto dp = std::chrono::floor<std::chrono::days>(tp);
   auto year_month_day = std::chrono::year_month_day{dp};
   auto weekday = std::chrono::weekday{dp};
@@ -494,12 +495,13 @@ u32 RtlTimeFieldsToTime_entry(ppc_ptr_t<X_TIME_FIELDS> time_fields_ptr, mapped_u
     return 0;
   }
   auto dp = static_cast<std::chrono::sys_days>(year_month_day);
-  std::chrono::system_clock::time_point time = dp;
+  // 100 ns steps, as in RtlTimeToTimeFields: the years from 1601 to 1677 don't fit system_clock on Linux.
+  WinSystemClock::sys_time_type time = dp;
   time += std::chrono::hours{time_fields_ptr->hour};
   time += std::chrono::minutes{time_fields_ptr->minute};
   time += std::chrono::seconds{time_fields_ptr->second};
   time += std::chrono::milliseconds{time_fields_ptr->milliseconds};
-  *time_ptr = WinSystemClock::to_file_time(WinSystemClock::from_sys(time));
+  *time_ptr = WinSystemClock::to_file_time(WinSystemClock::from_sys_time(time));
   return 1;
 }
 
