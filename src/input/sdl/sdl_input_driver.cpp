@@ -152,6 +152,7 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
           [this]() { attached_window_->app_context().ExecutePendingFunctionsFromUIThread(); });
     }
     for (auto& controller : controllers_) {
+      LogStickReach(controller, true);
       SDL_CloseGamepad(controller.sdl);
     }
     controllers_.clear();
@@ -541,6 +542,10 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
       const int32_t reach = v < 0 ? -v : v;
       if (reach > controller.stick_reach[way]) {
         controller.stick_reach[way] = reach;
+      }
+      // On every move while a reach is newer than the last line, not only when it grows: a growth inside the 20 s
+      // gap would otherwise never reach the log once the stick has found its edges (most do in the first seconds).
+      if (controller.stick_reach != controller.stick_reach_logged) {
         LogStickReach(controller, false);
       }
       break;
@@ -567,21 +572,23 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
 // How far the left stick has gone each way, as a percentage of full tilt (Core of Light #145: a Switch Pro controller
 // on Linux walked slowly in some directions, likely a stick that falls short of full tilt there, and nothing in the
 // log could say). A line once the stick has been pushed hard one way, then again when a way has grown by 5 % or more,
-// at most every 20 s and 12 times per controller; and once more when the controller goes away. Reads nothing extra.
+// at most every 20 s and 12 times per controller (a growth held back by the 20 s is logged on a later move); and once
+// more, with whatever is new, when the controller goes away or the game closes. Reads nothing extra.
 void SDLInputDriver::LogStickReach(ControllerState& controller, bool force) {
   constexpr int32_t kFull = 32767, kHard = 26000, kStep = 1638;
   const auto& r = controller.stick_reach;
+  if (!force && controller.stick_reach_lines >= 12) return;
   const int32_t most = std::max(std::max(r[0], r[1]), std::max(r[2], r[3]));
   if (most < kHard) return;
-  bool grown = false;
-  for (size_t i = 0; i < r.size(); ++i) grown |= r[i] >= controller.stick_reach_logged[i] + kStep;
-  const uint64_t now = SDL_GetTicks();
-  if (!force) {
-    if (!grown || controller.stick_reach_lines >= 12) return;
-    if (controller.stick_reach_lines > 0 && now - controller.stick_reach_logged_ms < 20000) return;
-  } else if (r == controller.stick_reach_logged) {
-    return;
+  if (force) {
+    if (r == controller.stick_reach_logged) return;
+  } else {
+    bool grown = false;
+    for (size_t i = 0; i < r.size(); ++i) grown |= r[i] >= controller.stick_reach_logged[i] + kStep;
+    if (!grown) return;
   }
+  const uint64_t now = SDL_GetTicks();
+  if (!force && controller.stick_reach_lines > 0 && now - controller.stick_reach_logged_ms < 20000) return;
   auto pct = [](int32_t v) { return std::min(100, int((int64_t(v) * 100 + kFull / 2) / kFull)); };
   const char* name = controller.sdl ? SDL_GetGamepadName(controller.sdl) : nullptr;
   REXLOG_INFO("SDL \"{}\": left stick reaches right {} %, left {} %, up {} %, down {} %", name ? name : "?",
