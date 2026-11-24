@@ -61,6 +61,7 @@ class NativeCommandProcessor : public CommandProcessor {
     float depth_scale = 1.0f;
     size_t color_descriptor = SIZE_MAX;
     uint32_t color_sample = 0;
+    bool format_convert = false;
   };
   struct QueuedDepthClear {
     std::shared_ptr<ColorImage> target;
@@ -97,6 +98,9 @@ class NativeCommandProcessor : public CommandProcessor {
 
   ui::vulkan::VulkanDevice* vulkan_device_ = nullptr;
   PFN_vkCmdResolveImage cmd_resolve_image_ = nullptr;
+  PFN_vkCmdBlitImage cmd_blit_image_ = nullptr;
+  bool r8_resolve_blit_ = false;
+  bool rg8_resolve_blit_ = false;
   VkCommandPool command_pool_ = VK_NULL_HANDLE;
   VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
   VkFence fence_ = VK_NULL_HANDLE;

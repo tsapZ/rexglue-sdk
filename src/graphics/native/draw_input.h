@@ -79,6 +79,21 @@ struct ResolveRectangle {
   uint32_t height;
 };
 
+// shortcut: blit unbiased, unswapped 1x UNORM copies until native packing supports other modes.
+inline bool IsResolveFormatConvertSupported(const draw_util::ResolveInfo& copy,
+                                            xenos::MsaaSamples samples,
+                                            xenos::ColorRenderTargetFormat source_format,
+                                            xenos::ColorFormat destination_format) {
+  return samples == xenos::MsaaSamples::k1X &&
+         source_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+         (destination_format == xenos::ColorFormat::k_8 ||
+          destination_format == xenos::ColorFormat::k_8_8) &&
+         copy.copy_dest_info.copy_dest_number ==
+             xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction &&
+         !copy.copy_dest_info.copy_dest_swap && !copy.copy_dest_info.copy_dest_exp_bias &&
+         !copy.copy_dest_info.copy_dest_array;
+}
+
 // Rasterizer face culling for a host pipeline. Guest rectangle, point and line
 // primitives are non-polygonal, so they have no front or back face and must not
 // inherit the cull state left behind by the last polygonal draw.

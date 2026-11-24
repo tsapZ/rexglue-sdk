@@ -134,6 +134,10 @@ VkFormat CopyColorFormat(xenos::ColorFormat format) {
     case xenos::ColorFormat::k_8_8_8_8:
     case xenos::ColorFormat::k_8_8_8_8_A:
       return ColorImage::kFormat;
+    case xenos::ColorFormat::k_8:
+      return VK_FORMAT_R8_UNORM;
+    case xenos::ColorFormat::k_8_8:
+      return VK_FORMAT_R8G8_UNORM;
     case xenos::ColorFormat::k_2_10_10_10:
       return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case xenos::ColorFormat::k_16_16_FLOAT:
@@ -143,6 +147,18 @@ VkFormat CopyColorFormat(xenos::ColorFormat format) {
     default:
       return VK_FORMAT_UNDEFINED;
   }
+}
+
+bool SupportsResolveFormatBlit(const ui::vulkan::VulkanDevice& device, VkFormat source,
+                               VkFormat destination) {
+  const auto& ifn = device.vulkan_instance()->functions();
+  VkFormatProperties source_properties{};
+  VkFormatProperties destination_properties{};
+  ifn.vkGetPhysicalDeviceFormatProperties(device.physical_device(), source, &source_properties);
+  ifn.vkGetPhysicalDeviceFormatProperties(device.physical_device(), destination,
+                                          &destination_properties);
+  return (source_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0 &&
+         (destination_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0;
 }
 
 VkClearColorValue UnpackColor(VkFormat format, uint32_t packed) {
@@ -183,6 +199,14 @@ bool NativeCommandProcessor::SetupContext() {
   const auto& instance = vulkan_device_->vulkan_instance()->functions();
   cmd_resolve_image_ = reinterpret_cast<PFN_vkCmdResolveImage>(
       instance.vkGetDeviceProcAddr(device, "vkCmdResolveImage"));
+  cmd_blit_image_ =
+      reinterpret_cast<PFN_vkCmdBlitImage>(instance.vkGetDeviceProcAddr(device, "vkCmdBlitImage"));
+  if (cmd_blit_image_) {
+    r8_resolve_blit_ =
+        SupportsResolveFormatBlit(*vulkan_device_, ColorImage::kFormat, VK_FORMAT_R8_UNORM);
+    rg8_resolve_blit_ =
+        SupportsResolveFormatBlit(*vulkan_device_, ColorImage::kFormat, VK_FORMAT_R8G8_UNORM);
+  }
   VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   pool.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
   pool.queueFamilyIndex = vulkan_device_->queue_family_graphics_compute();
@@ -950,9 +974,16 @@ bool NativeCommandProcessor::IssueCopy() {
   const VkFormat output_format =
       depth ? VK_FORMAT_R32_SFLOAT : CopyColorFormat(copy.copy_dest_info.copy_dest_format);
   const uint32_t resolve_address = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
-  if ((!depth && ((samples != xenos::MsaaSamples::k1X && !average_all && !single_sample) ||
-                  color_format == VK_FORMAT_UNDEFINED || color_format != output_format ||
-                  copy.copy_dest_info.copy_dest_exp_bias)) ||
+  const bool format_convert =
+      !depth &&
+      IsResolveFormatConvertSupported(copy, samples,
+                                      xenos::ColorRenderTargetFormat(copy.color_edram_info.format),
+                                      copy.copy_dest_info.copy_dest_format) &&
+      (output_format == VK_FORMAT_R8_UNORM ? r8_resolve_blit_ : rg8_resolve_blit_);
+  if ((!depth &&
+       ((samples != xenos::MsaaSamples::k1X && !average_all && !single_sample) ||
+        color_format == VK_FORMAT_UNDEFINED || (color_format != output_format && !format_convert) ||
+        copy.copy_dest_info.copy_dest_exp_bias)) ||
       copy.copy_dest_info.copy_dest_array || !IsPhysicalRange(resolve_address, 1) ||
       copy.copy_dest_extent_start < resolve_address ||
       !IsPhysicalRange(copy.copy_dest_extent_start, copy.copy_dest_extent_length)) {
@@ -990,7 +1021,8 @@ bool NativeCommandProcessor::IssueCopy() {
         existing_extent.height == extent.height) {
       destination = existing->second.image;
     } else if (has_offset && !depth && existing->second.image->initialized() &&
-               existing->second.dest_info == dest_info && existing->second.dest_pitch == dest_pitch) {
+               existing->second.dest_info == dest_info &&
+               existing->second.dest_pitch == dest_pitch) {
       const auto placed =
           GetCachedResolveRectangle(copy, existing_extent.width, existing_extent.height);
       if (placed) {
@@ -1047,7 +1079,8 @@ bool NativeCommandProcessor::IssueCopy() {
                     uint32_t(selection),
                     depth_format == xenos::DepthRenderTargetFormat::kD24FS8 ? 2.0f : 1.0f,
                     color_descriptor,
-                    single_sample ? GetResolveSampleIndex(samples, selection) : 0});
+                    single_sample ? GetResolveSampleIndex(samples, selection) : 0,
+                    format_convert});
   if (depth_clear) {
     pending_.emplace_back(std::move(*depth_clear));
   }
@@ -1056,9 +1089,11 @@ bool NativeCommandProcessor::IssueCopy() {
       IsResolveReadbackWanted(copy.copy_dest_extent_start, copy.copy_dest_extent_length) &&
       !depth && output_format == ColorImage::kFormat &&
       copy.copy_dest_info.copy_dest_format == xenos::ColorFormat::k_8_8_8_8 &&
-      copy.copy_dest_info.copy_dest_number == xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction &&
+      copy.copy_dest_info.copy_dest_number ==
+          xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction &&
       !copy.copy_dest_info.copy_dest_swap && uint32_t(copy.copy_dest_info.copy_dest_endian) <= 3) {
-    return ReadBackResolve(copy, resolve_address, regs.Get<reg::RB_COPY_DEST_PITCH>().copy_dest_pitch,
+    return ReadBackResolve(copy, resolve_address,
+                           regs.Get<reg::RB_COPY_DEST_PITCH>().copy_dest_pitch,
                            std::get<QueuedResolve>(pending_[resolve_index]));
   }
   return true;
@@ -1093,9 +1128,10 @@ bool NativeCommandProcessor::ReadBackResolve(const draw_util::ResolveInfo& copy,
   }
   const ResolveRectangle rect{copy.copy_dest_x, copy.copy_dest_y, resolve.extent.width,
                               resolve.extent.height};
-  const bool stored = recorded && StoreTiledResolveRgba8(
-      {memory_->TranslatePhysical(address), end - address}, pitch, rect,
-      copy.copy_dest_info.copy_dest_endian, in_flight_readback_->Map(fence_));
+  const bool stored =
+      recorded && StoreTiledResolveRgba8({memory_->TranslatePhysical(address), end - address},
+                                         pitch, rect, copy.copy_dest_info.copy_dest_endian,
+                                         in_flight_readback_->Map(fence_));
   in_flight_readback_.reset();
   return stored;
 }
@@ -1226,7 +1262,20 @@ void NativeCommandProcessor::RecordResolve(const QueuedResolve& resolve) {
     copy.srcOffset = {resolve.source_offset.x, resolve.source_offset.y, 0};
     copy.dstOffset = {resolve.destination_offset.x, resolve.destination_offset.y, 0};
     copy.extent = {resolve.extent.width, resolve.extent.height, 1};
-    if (resolve.source->samples() == VK_SAMPLE_COUNT_1_BIT) {
+    if (resolve.format_convert) {
+      VkImageBlit blit{};
+      blit.srcSubresource = copy.srcSubresource;
+      blit.dstSubresource = copy.dstSubresource;
+      blit.srcOffsets[0] = copy.srcOffset;
+      blit.srcOffsets[1] = {copy.srcOffset.x + int32_t(copy.extent.width),
+                            copy.srcOffset.y + int32_t(copy.extent.height), 1};
+      blit.dstOffsets[0] = copy.dstOffset;
+      blit.dstOffsets[1] = {copy.dstOffset.x + int32_t(copy.extent.width),
+                            copy.dstOffset.y + int32_t(copy.extent.height), 1};
+      cmd_blit_image_(command_buffer_, resolve.source->image(),
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, resolve.destination->image(),
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    } else if (resolve.source->samples() == VK_SAMPLE_COUNT_1_BIT) {
       vk.vkCmdCopyImage(command_buffer_, resolve.source->image(),
                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, resolve.destination->image(),
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
@@ -1472,9 +1521,8 @@ bool NativeCommandProcessor::RenderGuestOutput(ui::Presenter::GuestOutputRefresh
   if (presented_) {
     presented_->Transition(command_buffer_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-    const auto ramp = use_pwl
-                          ? std::as_bytes(std::span(gamma_ramp_pwl_rgb(), 128 * 3))
-                          : std::as_bytes(std::span(gamma_ramp_256_entry_table(), 256));
+    const auto ramp = use_pwl ? std::as_bytes(std::span(gamma_ramp_pwl_rgb(), 128 * 3))
+                              : std::as_bytes(std::span(gamma_ramp_256_entry_table(), 256));
     if (!output_gamma_->Record(command_buffer_, presented_->view(), output.image_view(), extent,
                                ramp, use_pwl)) {
       return false;

@@ -52,6 +52,50 @@ TEST_CASE("Native resolve rectangles account for tile origin and wrap", "[gpu][n
   CHECK_FALSE(native::GetResolveRectangle(copy, EdramLayout{}, 160, 48));
 }
 
+TEST_CASE("Native resolve format conversion is bounded", "[gpu][native]") {
+  draw_util::ResolveInfo copy{};
+  copy.copy_dest_info.copy_dest_number = xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction;
+
+  CHECK(native::IsResolveFormatConvertSupported(copy, xenos::MsaaSamples::k1X,
+                                                xenos::ColorRenderTargetFormat::k_8_8_8_8,
+                                                xenos::ColorFormat::k_8));
+  CHECK(native::IsResolveFormatConvertSupported(copy, xenos::MsaaSamples::k1X,
+                                                xenos::ColorRenderTargetFormat::k_8_8_8_8,
+                                                xenos::ColorFormat::k_8_8));
+  CHECK_FALSE(native::IsResolveFormatConvertSupported(copy, xenos::MsaaSamples::k1X,
+                                                      xenos::ColorRenderTargetFormat::k_8_8_8_8,
+                                                      xenos::ColorFormat::k_8_8_8_8));
+  CHECK_FALSE(native::IsResolveFormatConvertSupported(copy, xenos::MsaaSamples::k2X,
+                                                      xenos::ColorRenderTargetFormat::k_8_8_8_8,
+                                                      xenos::ColorFormat::k_8));
+  CHECK_FALSE(native::IsResolveFormatConvertSupported(copy, xenos::MsaaSamples::k1X,
+                                                      xenos::ColorRenderTargetFormat::k_2_10_10_10,
+                                                      xenos::ColorFormat::k_8));
+
+  copy.copy_dest_info.copy_dest_swap = 1;
+  CHECK_FALSE(native::IsResolveFormatConvertSupported(copy, xenos::MsaaSamples::k1X,
+                                                      xenos::ColorRenderTargetFormat::k_8_8_8_8,
+                                                      xenos::ColorFormat::k_8));
+  copy.copy_dest_info.copy_dest_swap = 0;
+
+  copy.copy_dest_info.copy_dest_number = xenos::SurfaceNumberFormat::kUnsignedInteger;
+  CHECK_FALSE(native::IsResolveFormatConvertSupported(copy, xenos::MsaaSamples::k1X,
+                                                      xenos::ColorRenderTargetFormat::k_8_8_8_8,
+                                                      xenos::ColorFormat::k_8));
+  copy.copy_dest_info.copy_dest_number = xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction;
+
+  copy.copy_dest_info.copy_dest_exp_bias = 1;
+  CHECK_FALSE(native::IsResolveFormatConvertSupported(copy, xenos::MsaaSamples::k1X,
+                                                      xenos::ColorRenderTargetFormat::k_8_8_8_8,
+                                                      xenos::ColorFormat::k_8));
+  copy.copy_dest_info.copy_dest_exp_bias = 0;
+
+  copy.copy_dest_info.copy_dest_array = 1;
+  CHECK_FALSE(native::IsResolveFormatConvertSupported(copy, xenos::MsaaSamples::k1X,
+                                                      xenos::ColorRenderTargetFormat::k_8_8_8_8,
+                                                      xenos::ColorFormat::k_8));
+}
+
 TEST_CASE("Native subrect resolves place inside a cached surface", "[gpu][native]") {
   draw_util::ResolveInfo copy{};
   copy.coordinate_info.width_div_8 = 4;
