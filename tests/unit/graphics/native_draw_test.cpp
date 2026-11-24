@@ -56,24 +56,27 @@ TEST_CASE("Native subrect resolves place inside a cached surface", "[gpu][native
   draw_util::ResolveInfo copy{};
   copy.coordinate_info.width_div_8 = 4;
   copy.height_div_8 = 2;
-  copy.copy_dest_coordinate_info.offset_x_div_8 = 1;
-  copy.copy_dest_coordinate_info.offset_y_div_8 = 2;
-  copy.copy_dest_base = 0x1000;
+  copy.copy_dest_x = 8;
+  copy.copy_dest_y = 16;
 
-  // The rectangle origin comes from the destination metadata offsets.
-  const auto placed = native::GetCachedResolveRectangle(copy, 0x1000, 256, 256);
+  const auto placed = native::GetCachedResolveRectangle(copy, 256, 256);
   REQUIRE(placed);
   CHECK(placed->x == 8);
   CHECK(placed->y == 16);
   CHECK(placed->width == 32);
   CHECK(placed->height == 16);
 
-  // An adjusted base that differs from the raw guest base is not placeable.
-  CHECK_FALSE(native::GetCachedResolveRectangle(copy, 0x2000, 256, 256));
-  // The rectangle must stay inside the cached image on both axes.
-  CHECK_FALSE(native::GetCachedResolveRectangle(copy, 0x1000, 32, 256));
-  CHECK_FALSE(native::GetCachedResolveRectangle(copy, 0x1000, 256, 24));
-  CHECK_FALSE(native::GetCachedResolveRectangle(copy, 0x1000, 7, 256));
+  copy.copy_dest_x = 40;
+  copy.copy_dest_y = 64;
+  const auto later_tile = native::GetCachedResolveRectangle(copy, 72, 80);
+  REQUIRE(later_tile);
+  CHECK(later_tile->x == 40);
+  CHECK(later_tile->y == 64);
+  CHECK(later_tile->width == 32);
+  CHECK(later_tile->height == 16);
+  CHECK_FALSE(native::GetCachedResolveRectangle(copy, 71, 80));
+  CHECK_FALSE(native::GetCachedResolveRectangle(copy, 72, 79));
+  CHECK_FALSE(native::GetCachedResolveRectangle(copy, 39, 80));
 }
 
 TEST_CASE("Native resolve sample selection maps to host samples", "[gpu][native]") {

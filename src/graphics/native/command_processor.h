@@ -72,6 +72,10 @@ class NativeCommandProcessor : public CommandProcessor {
     std::shared_ptr<ColorImage> image;
     uint64_t last_use_submission = 0;
   };
+  struct CachedResolve : CachedImage {
+    uint32_t dest_info;
+    uint32_t dest_pitch;
+  };
   static constexpr size_t kMaxTargets = 64;
   static constexpr size_t kMaxResolvedImages = 256;
 
@@ -101,7 +105,7 @@ class NativeCommandProcessor : public CommandProcessor {
   uint64_t next_submission_ = 1;
   VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
   std::map<std::tuple<uint32_t, uint32_t, xenos::MsaaSamples, VkFormat>, CachedImage> targets_;
-  std::map<uint32_t, CachedImage> resolved_images_;
+  std::map<uint32_t, CachedResolve> resolved_images_;
   std::vector<FrameCommand> pending_;
   std::vector<FrameCommand> in_flight_;
   std::shared_ptr<ColorImage> presented_;

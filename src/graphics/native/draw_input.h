@@ -115,27 +115,15 @@ std::optional<typename EntryMap::key_type> SelectRetiredEviction(
   return victim;
 }
 
-// Places a color resolve rectangle inside an existing cached resolve image that
-// shares the raw guest destination base. copy_dest_base is adjusted to the
-// first destination tile, so it only matches the raw base while the rectangle
-// starts in that tile - the same subset the caller already accepts. The
-// destination offset is then the metadata offset within that tile, and the
-// rectangle must fit inside the cached image so untouched pixels survive.
-// Nullopt when the rectangle cannot be placed in the image.
+// Place a resolve in the cached image at its absolute guest texture coordinates.
 inline std::optional<ResolveRectangle> GetCachedResolveRectangle(const draw_util::ResolveInfo& copy,
-                                                                 uint32_t raw_dest_base,
                                                                  uint32_t image_width,
                                                                  uint32_t image_height) {
-  if (copy.copy_dest_base != raw_dest_base) {
-    return std::nullopt;
-  }
   const uint32_t width = uint32_t(copy.coordinate_info.width_div_8)
                          << xenos::kResolveAlignmentPixelsLog2;
   const uint32_t height = copy.height_div_8 << xenos::kResolveAlignmentPixelsLog2;
-  const uint32_t x = uint32_t(copy.copy_dest_coordinate_info.offset_x_div_8)
-                     << xenos::kResolveAlignmentPixelsLog2;
-  const uint32_t y = uint32_t(copy.copy_dest_coordinate_info.offset_y_div_8)
-                     << xenos::kResolveAlignmentPixelsLog2;
+  const uint32_t x = copy.copy_dest_x;
+  const uint32_t y = copy.copy_dest_y;
   if (!width || !height || x > image_width || y > image_height || width > image_width - x ||
       height > image_height - y) {
     return std::nullopt;

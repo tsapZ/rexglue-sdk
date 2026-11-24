@@ -939,11 +939,12 @@ bool NativeCommandProcessor::IssueCopy() {
       ColorTargetFormat(xenos::ColorRenderTargetFormat(copy.color_edram_info.format));
   const VkFormat output_format =
       depth ? VK_FORMAT_R32_SFLOAT : CopyColorFormat(copy.copy_dest_info.copy_dest_format);
+  const uint32_t resolve_address = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
   if ((!depth && ((samples != xenos::MsaaSamples::k1X && !average_all && !single_sample) ||
                   color_format == VK_FORMAT_UNDEFINED || color_format != output_format ||
                   copy.copy_dest_info.copy_dest_exp_bias)) ||
-      copy.copy_dest_info.copy_dest_array ||
-      copy.copy_dest_base != regs.values[XE_GPU_REG_RB_COPY_DEST_BASE] ||
+      copy.copy_dest_info.copy_dest_array || !IsPhysicalRange(resolve_address, 1) ||
+      copy.copy_dest_extent_start < resolve_address ||
       !IsPhysicalRange(copy.copy_dest_extent_start, copy.copy_dest_extent_length)) {
     if (depth_clear) {
       pending_.emplace_back(std::move(*depth_clear));
@@ -967,23 +968,21 @@ bool NativeCommandProcessor::IssueCopy() {
   }
   const VkExtent2D extent{rect->width, rect->height};
 
-  const uint32_t raw_dest_base = regs.values[XE_GPU_REG_RB_COPY_DEST_BASE];
-  const uint32_t resolve_address = copy.copy_dest_base & (kPhysicalMemorySize - 1);
+  const uint32_t dest_info = copy.copy_dest_info.value;
+  const uint32_t dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>().value;
+  const bool has_offset = copy.copy_dest_x || copy.copy_dest_y;
   auto existing = resolved_images_.find(resolve_address);
   std::shared_ptr<ColorImage> destination;
   VkOffset2D destination_offset{};
   if (existing != resolved_images_.end() && existing->second.image->format() == output_format) {
     const auto existing_extent = existing->second.image->extent();
-    const bool has_offset = copy.copy_dest_coordinate_info.offset_x_div_8 ||
-                            copy.copy_dest_coordinate_info.offset_y_div_8;
     if (!has_offset && existing_extent.width == extent.width &&
         existing_extent.height == extent.height) {
       destination = existing->second.image;
-    } else if (has_offset && !depth && existing->second.image->initialized()) {
-      // A sub-rectangle updates the initialized full-surface resolve in place
-      // when it maps into that image, preserving the pixels around it.
-      const auto placed = GetCachedResolveRectangle(copy, raw_dest_base, existing_extent.width,
-                                                    existing_extent.height);
+    } else if (has_offset && !depth && existing->second.image->initialized() &&
+               existing->second.dest_info == dest_info && existing->second.dest_pitch == dest_pitch) {
+      const auto placed =
+          GetCachedResolveRectangle(copy, existing_extent.width, existing_extent.height);
       if (placed) {
         destination = existing->second.image;
         destination_offset = {int32_t(placed->x), int32_t(placed->y)};
@@ -991,8 +990,7 @@ bool NativeCommandProcessor::IssueCopy() {
     }
   }
   if (!destination) {
-    if (copy.copy_dest_coordinate_info.offset_x_div_8 ||
-        copy.copy_dest_coordinate_info.offset_y_div_8) {
+    if (has_offset) {
       // A sub-rectangle that cannot be placed in an existing resolve would need
       // guest writeback, which this path does not provide.
       if (depth_clear) {
@@ -1024,7 +1022,8 @@ bool NativeCommandProcessor::IssueCopy() {
   if ((depth && depth_descriptor == SIZE_MAX) || (single_sample && color_descriptor == SIZE_MAX)) {
     return false;
   }
-  resolved_images_[resolve_address] = CachedImage{destination, next_submission_};
+  resolved_images_.insert_or_assign(
+      resolve_address, CachedResolve{{destination, next_submission_}, dest_info, dest_pitch});
   pending_.emplace_back(
       QueuedResolve{std::move(source),
                     std::move(destination),
