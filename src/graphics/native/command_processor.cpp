@@ -254,6 +254,12 @@ bool NativeCommandProcessor::SetupContext() {
     ShutdownContext();
     return false;
   }
+  memory_invalidation_handle_ =
+      memory_->RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
+  if (!memory_invalidation_handle_) {
+    ShutdownContext();
+    return false;
+  }
   SetActiveEdramLayout(RequestedEdramLayout());
   REXLOG_INFO("Native Vulkan: command processor initialized");
   return true;
@@ -332,6 +338,15 @@ void NativeCommandProcessor::RecordNullTextureInitialization() {
 }
 
 void NativeCommandProcessor::ShutdownContext() {
+  if (memory_invalidation_handle_) {
+    memory_->UnregisterPhysicalMemoryInvalidationCallback(memory_invalidation_handle_);
+    memory_invalidation_handle_ = nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> lock(invalidation_mutex_);
+    pending_invalidations_.clear();
+    has_pending_invalidations_.store(false, std::memory_order_relaxed);
+  }
   if (!vulkan_device_) {
     return;
   }
@@ -347,6 +362,12 @@ void NativeCommandProcessor::ShutdownContext() {
   pending_.clear();
   in_flight_.clear();
   in_flight_readback_.reset();
+  // Draws in pending_ / in_flight_ have released their shared textures by now.
+  cached_textures_.clear();
+  for (const auto& entry : samplers_) {
+    vk.vkDestroySampler(device, entry.second.sampler, nullptr);
+  }
+  samplers_.clear();
   draw_uploads_.reset();
   presented_.reset();
   presented_resolve_address_.reset();
@@ -410,6 +431,17 @@ std::span<const uint8_t> NativeCommandProcessor::ReadPhysical(uint32_t address, 
 }
 
 bool NativeCommandProcessor::ReadTextures(const SpirvShader& shader, DrawInput& input) {
+  if (has_pending_invalidations_.load(std::memory_order_acquire)) {
+    std::vector<std::pair<uint32_t, uint32_t>> invalidations;
+    {
+      std::lock_guard<std::mutex> lock(invalidation_mutex_);
+      invalidations.swap(pending_invalidations_);
+      has_pending_invalidations_.store(false, std::memory_order_release);
+    }
+    for (const auto& [start, length] : invalidations) {
+      InvalidateTextures(start, length);
+    }
+  }
   const auto& textures = shader.GetTextureBindingsAfterTranslation();
   const auto& samplers = shader.GetSamplerBindingsAfterTranslation();
   const auto& properties = vulkan_device_->properties();
@@ -456,7 +488,7 @@ bool NativeCommandProcessor::ReadTextures(const SpirvShader& shader, DrawInput& 
   }
   for (const auto& sampler : samplers) {
     const auto fetch = register_file_->GetTextureFetch(sampler.fetch_constant);
-    auto& out = input.samplers.emplace_back();
+    DrawSampler out;
     out.min_filter =
         ToFilter(sampler.min_filter == xenos::TextureFilter::kUseFetchConst ? fetch.min_filter
                                                                             : sampler.min_filter);
@@ -471,8 +503,82 @@ bool NativeCommandProcessor::ReadTextures(const SpirvShader& shader, DrawInput& 
     out.max_lod = mip_filter == xenos::TextureFilter::kBaseMap ? 0.0f : float(fetch.mip_max_level);
     out.address_u = ToAddressMode(fetch.clamp_x);
     out.address_v = ToAddressMode(fetch.clamp_y);
+    const VkSampler handle = GetSampler(out);
+    if (handle == VK_NULL_HANDLE) {
+      return false;
+    }
+    input.samplers.push_back(handle);
   }
   return true;
+}
+
+VkSampler NativeCommandProcessor::GetSampler(const DrawSampler& key) {
+  auto existing = samplers_.find(key);
+  if (existing != samplers_.end()) {
+    existing->second.last_use_submission = next_submission_;
+    return existing->second.sampler;
+  }
+  if (samplers_.size() >= kMaxSamplers) {
+    const auto victim = SelectRetiredEviction(
+        samplers_, retired_submission_ + 1,
+        [](const DrawSampler&, const CachedSampler&) { return true; });
+    if (!victim) {
+      return VK_NULL_HANDLE;
+    }
+    auto victim_it = samplers_.find(*victim);
+    vulkan_device_->functions().vkDestroySampler(vulkan_device_->device(),
+                                                 victim_it->second.sampler, nullptr);
+    samplers_.erase(victim_it);
+  }
+  VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  info.minFilter = key.min_filter;
+  info.magFilter = key.mag_filter;
+  info.mipmapMode = key.mip_mode;
+  info.maxLod = key.max_lod;
+  info.addressModeU = key.address_u;
+  info.addressModeV = key.address_v;
+  info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  VkSampler sampler = VK_NULL_HANDLE;
+  if (vulkan_device_->functions().vkCreateSampler(vulkan_device_->device(), &info, nullptr,
+                                                  &sampler) != VK_SUCCESS) {
+    return VK_NULL_HANDLE;
+  }
+  samplers_.emplace(key, CachedSampler{sampler, next_submission_});
+  return sampler;
+}
+
+void NativeCommandProcessor::InvalidateTextures(uint32_t start, uint32_t length) {
+  for (auto it = cached_textures_.begin(); it != cached_textures_.end();) {
+    const CachedTexture& texture = *it->second.texture;
+    if (RangesOverlap(start, length, texture.base_start, texture.base_length) ||
+        RangesOverlap(start, length, texture.mip_start, texture.mip_length)) {
+      it = cached_textures_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+std::pair<uint32_t, uint32_t> NativeCommandProcessor::MemoryInvalidationCallbackThunk(
+    void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range) {
+  return reinterpret_cast<NativeCommandProcessor*>(context_ptr)
+      ->MemoryInvalidationCallback(physical_address_start, length, exact_range);
+}
+
+std::pair<uint32_t, uint32_t> NativeCommandProcessor::MemoryInvalidationCallback(
+    uint32_t physical_address_start, uint32_t length, bool /*exact_range*/) {
+  if (!length || physical_address_start >= kPhysicalMemorySize) {
+    return {0, UINT32_MAX};
+  }
+  length = std::min(length, kPhysicalMemorySize - physical_address_start);
+  {
+    // Only the tiny pending list is touched here; this runs on a guest thread
+    // while the global critical region is held.
+    std::lock_guard<std::mutex> lock(invalidation_mutex_);
+    pending_invalidations_.emplace_back(physical_address_start, length);
+    has_pending_invalidations_.store(true, std::memory_order_release);
+  }
+  return {physical_address_start, length};
 }
 
 bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
@@ -614,70 +720,176 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
   const auto layout = texture_util::GetGuestTextureLayout(
       fetch.dimension, fetch.pitch, texture.width, texture.height, 1, fetch.tiled, fetch.format,
       fetch.packed_mips, true, mip_max);
-  constexpr std::array<size_t, 4> byte_xor{0, 1, 3, 2};
-  const size_t swap = byte_xor[uint32_t(fetch.endianness)];
-  for (uint32_t level = 0; level <= layout.max_level; ++level) {
-    const uint32_t level_storage = std::min(level, layout.packed_level);
-    const auto& level_layout = level ? layout.mips[level_storage] : layout.base;
-    const uint64_t level_address =
-        level ? (uint64_t(mip_page) << 12) + layout.mip_offsets_bytes[level_storage] : address;
-    if (level_address >= kPhysicalMemorySize) {
+
+  GuestTextureKey key;
+  key.base_page = base_page;
+  key.mip_page = mip_page;
+  key.width = texture.width;
+  key.height = texture.height;
+  key.array_layers = texture.array_layers;
+  key.format = fetch.format;
+  key.dimension = fetch.dimension;
+  key.tiled = fetch.tiled != 0;
+  key.packed_mips = fetch.packed_mips != 0;
+  key.endianness = fetch.endianness;
+  key.pitch = fetch.pitch;
+  key.mip_max = mip_max;
+
+  const uint32_t level_count = layout.max_level + 1;
+  const uint32_t base_length =
+      uint32_t(rex::align(layout.base.level_data_extent_bytes, uint32_t(4)));
+  if (!IsPhysicalRange(address, base_length)) {
+    return false;
+  }
+  uint32_t mip_start = 0;
+  uint32_t mip_length = 0;
+  if (layout.max_level > 0) {
+    mip_start = mip_page << 12;
+    mip_length = uint32_t(rex::align(layout.mips_total_extent_bytes, uint32_t(4)));
+    if (!IsPhysicalRange(mip_start, mip_length)) {
       return false;
     }
-    // Array slices are stored within the level, each `array_slice_stride_bytes`
-    // apart, so the last slice's data must be readable as well.
-    const size_t level_read_size =
-        GetTextureLevelReadSize(level_layout.array_slice_stride_bytes,
-                                level_layout.array_slice_data_extent_bytes, texture.array_layers);
-    const auto source =
-        ReadPhysical(uint32_t(level_address), rex::align(level_read_size, size_t(4)));
-    if (source.empty()) {
+  }
+
+  std::shared_ptr<CachedTexture> entry;
+  auto cached = cached_textures_.find(key);
+  if (cached != cached_textures_.end()) {
+    entry = cached->second.texture;
+    cached->second.last_use_submission = next_submission_;
+    entry->last_use_submission = next_submission_;
+  } else if (cached_textures_.size() >= kMaxCachedTextures) {
+    // Drop the least recently used texture whose GPU work has retired. If none
+    // can be dropped safely, decode without caching for this draw only.
+    const auto victim = SelectRetiredEviction(
+        cached_textures_, retired_submission_ + 1,
+        [](const GuestTextureKey&, const CachedTextureEntry&) { return true; });
+    if (victim) {
+      cached_textures_.erase(*victim);
+    }
+  }
+  if (!entry && cached_textures_.size() < kMaxCachedTextures) {
+    entry = std::make_shared<CachedTexture>();
+    entry->device = vulkan_device_;
+    entry->base_start = address;
+    entry->base_length = base_length;
+    entry->mip_start = mip_start;
+    entry->mip_length = mip_length;
+    entry->last_use_submission = next_submission_;
+    VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    image.imageType = VK_IMAGE_TYPE_2D;
+    image.format = texture.format;
+    image.extent = {texture.width, texture.height, 1};
+    image.mipLevels = level_count;
+    image.arrayLayers = texture.array_layers;
+    image.samples = VK_SAMPLE_COUNT_1_BIT;
+    image.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (texture.view_type == VK_IMAGE_VIEW_TYPE_CUBE) {
+      image.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    }
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device_, image, ui::vulkan::util::MemoryPurpose::kDeviceLocal, entry->image,
+            entry->memory)) {
       return false;
     }
-    uint32_t start_x = 0, start_y = 0, start_z = 0;
-    if (level >= layout.packed_level) {
-      texture_util::GetPackedMipOffset(texture.width, texture.height, 1, fetch.format, level,
-                                       start_x, start_y, start_z);
+    // Watch the guest pages before reading them, so a write between the read and
+    // the next frame invalidates this entry.
+    memory_->EnablePhysicalMemoryAccessCallbacks(address, base_length, true, false);
+    if (mip_length) {
+      memory_->EnablePhysicalMemoryAccessCallbacks(mip_start, mip_length, true, false);
     }
-    const uint32_t level_width = std::max(1u, texture.width >> level);
-    const uint32_t level_height = std::max(1u, texture.height >> level);
-    const uint32_t blocks_x = (level_width + block_width - 1) / block_width;
-    const uint32_t blocks_y = (level_height + block_width - 1) / block_width;
-    auto& data = texture.levels.emplace_back(size_t(blocks_x) * blocks_y * block_size *
-                                             texture.array_layers);
-    for (uint32_t slice = 0; slice < texture.array_layers; ++slice) {
-      const size_t slice_base = size_t(slice) * level_layout.array_slice_stride_bytes;
-      // Each face is tiled independently from the origin of its own data.
-      for (uint32_t y = 0; y < blocks_y; ++y) {
-        for (uint32_t x = 0; x < blocks_x; ++x) {
-          const size_t offset =
-              slice_base +
-              (fetch.tiled ? size_t(texture_util::GetTiledOffset2D(
-                                 int32_t(x + start_x), int32_t(y + start_y),
-                                 level_layout.row_pitch_bytes / block_size,
-                                 std::countr_zero(block_size)))
-                           : size_t(y + start_y) * level_layout.row_pitch_bytes +
-                                 size_t(x + start_x) * block_size);
-          if (offset > source.size() || block_size > source.size() - offset) {
-            return false;
-          }
-          uint8_t* dst = data.data() +
-                         ((size_t(slice) * blocks_y + y) * blocks_x + x) * block_size;
-          for (uint32_t i = 0; i < block_size; ++i) {
-            dst[i] = source[(offset + i) ^ swap];
-          }
-          if (depth_texture) {
-            uint32_t packed;
-            std::memcpy(&packed, dst, sizeof(packed));
-            const float depth = fetch.format == xenos::TextureFormat::k_24_8_FLOAT
-                                    ? xenos::Float20e4To32(packed >> 8)
-                                    : float(packed >> 8) / 16777215.0f;
-            std::memcpy(dst, &depth, sizeof(depth));
+    cached_textures_.emplace(key, CachedTextureEntry{entry, next_submission_});
+  }
+
+  const bool upload = !entry || !entry->uploaded;
+  if (upload) {
+    constexpr std::array<size_t, 4> byte_xor{0, 1, 3, 2};
+    const size_t swap = byte_xor[uint32_t(fetch.endianness)];
+    for (uint32_t level = 0; level <= layout.max_level; ++level) {
+      const uint32_t level_storage = std::min(level, layout.packed_level);
+      const auto& level_layout = level ? layout.mips[level_storage] : layout.base;
+      const uint64_t level_address =
+          level ? (uint64_t(mip_page) << 12) + layout.mip_offsets_bytes[level_storage] : address;
+      if (level_address >= kPhysicalMemorySize) {
+        return false;
+      }
+      // Array slices are stored within the level, each `array_slice_stride_bytes`
+      // apart, so the last slice's data must be readable as well.
+      const size_t level_read_size =
+          GetTextureLevelReadSize(level_layout.array_slice_stride_bytes,
+                                  level_layout.array_slice_data_extent_bytes, texture.array_layers);
+      const auto source =
+          ReadPhysical(uint32_t(level_address), rex::align(level_read_size, size_t(4)));
+      if (source.empty()) {
+        return false;
+      }
+      uint32_t start_x = 0, start_y = 0, start_z = 0;
+      if (level >= layout.packed_level) {
+        texture_util::GetPackedMipOffset(texture.width, texture.height, 1, fetch.format, level,
+                                         start_x, start_y, start_z);
+      }
+      const uint32_t level_width = std::max(1u, texture.width >> level);
+      const uint32_t level_height = std::max(1u, texture.height >> level);
+      const uint32_t blocks_x = (level_width + block_width - 1) / block_width;
+      const uint32_t blocks_y = (level_height + block_width - 1) / block_width;
+      auto& data = texture.levels.emplace_back(size_t(blocks_x) * blocks_y * block_size *
+                                               texture.array_layers);
+      for (uint32_t slice = 0; slice < texture.array_layers; ++slice) {
+        const size_t slice_base = size_t(slice) * level_layout.array_slice_stride_bytes;
+        // Each face is tiled independently from the origin of its own data.
+        for (uint32_t y = 0; y < blocks_y; ++y) {
+          for (uint32_t x = 0; x < blocks_x; ++x) {
+            const size_t offset =
+                slice_base +
+                (fetch.tiled ? size_t(texture_util::GetTiledOffset2D(
+                                   int32_t(x + start_x), int32_t(y + start_y),
+                                   level_layout.row_pitch_bytes / block_size,
+                                   std::countr_zero(block_size)))
+                             : size_t(y + start_y) * level_layout.row_pitch_bytes +
+                                   size_t(x + start_x) * block_size);
+            if (offset > source.size() || block_size > source.size() - offset) {
+              return false;
+            }
+            uint8_t* dst = data.data() +
+                           ((size_t(slice) * blocks_y + y) * blocks_x + x) * block_size;
+            for (uint32_t i = 0; i < block_size; ++i) {
+              dst[i] = source[(offset + i) ^ swap];
+            }
+            if (depth_texture) {
+              uint32_t packed;
+              std::memcpy(&packed, dst, sizeof(packed));
+              const float depth = fetch.format == xenos::TextureFormat::k_24_8_FLOAT
+                                      ? xenos::Float20e4To32(packed >> 8)
+                                      : float(packed >> 8) / 16777215.0f;
+              std::memcpy(dst, &depth, sizeof(depth));
+            }
           }
         }
       }
     }
   }
+
+  if (!entry) {
+    return true;
+  }
+  auto view = entry->views.find(fetch.swizzle);
+  if (view == entry->views.end()) {
+    VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    info.image = entry->image;
+    info.viewType = texture.view_type;
+    info.format = texture.format;
+    info.components = texture.swizzle;
+    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, level_count, 0, texture.array_layers};
+    VkImageView image_view = VK_NULL_HANDLE;
+    if (vulkan_device_->functions().vkCreateImageView(vulkan_device_->device(), &info, nullptr,
+                                                      &image_view) != VK_SUCCESS) {
+      return false;
+    }
+    view = entry->views.emplace(fetch.swizzle, image_view).first;
+  }
+  texture.cached_texture = entry;
+  texture.cached_view = view->second;
+  texture.upload_cached = upload;
   return true;
 }
 
@@ -1002,6 +1214,13 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return false;
   }
   pending_.emplace_back(std::move(draw));
+  // The draw, including its texture uploads, will be recorded, so later draws in
+  // the same batch can sample these cached images without copying them again.
+  for (const auto& texture : input.textures) {
+    if (texture.upload_cached && texture.cached_texture) {
+      texture.cached_texture->uploaded = true;
+    }
+  }
   return true;
 }
 
@@ -1261,6 +1480,11 @@ bool NativeCommandProcessor::ReadBackResolve(const draw_util::ResolveInfo& copy,
                                          pitch, rect, copy.copy_dest_info.copy_dest_endian,
                                          in_flight_readback_->Map(fence_));
   in_flight_readback_.reset();
+  if (stored) {
+    // The CPU wrote guest memory directly, bypassing the access-violation watch,
+    // so anything cached from the written range is stale now.
+    InvalidateTextures(address, end - address);
+  }
   return stored;
 }
 

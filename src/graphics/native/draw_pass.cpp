@@ -31,6 +31,19 @@ VkShaderModule CreateShaderModule(const ui::vulkan::VulkanDevice& device,
 
 }  // namespace
 
+CachedTexture::~CachedTexture() {
+  if (!device) {
+    return;
+  }
+  const auto& vk = device->functions();
+  const VkDevice handle = device->device();
+  for (const auto& entry : views) {
+    vk.vkDestroyImageView(handle, entry.second, nullptr);
+  }
+  vk.vkDestroyImage(handle, image, nullptr);
+  vk.vkFreeMemory(handle, memory, nullptr);
+}
+
 DrawBindings::~DrawBindings() {
   const auto& vk = device.functions();
   for (size_t i = 0; i < layouts.size(); ++i) {
@@ -92,12 +105,10 @@ DrawPass::~DrawPass() {
       bindings_->pools[i]->Free(set_indices_[i]);
     }
   }
-  for (auto sampler : samplers_) {
-    vk.vkDestroySampler(device, sampler, nullptr);
-  }
   for (const auto& texture : textures_) {
-    // Fallback views are owned by the command processor, not this pass.
-    if (texture.fallback_view == VK_NULL_HANDLE) {
+    // Fallback views, cached views, samplers and cached images are owned by the
+    // command processor, not this pass.
+    if (texture.fallback_view == VK_NULL_HANDLE && !texture.cached) {
       vk.vkDestroyImageView(device, texture.view, nullptr);
     }
     vk.vkDestroyImage(device, texture.image, nullptr);
@@ -118,7 +129,6 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   const VkDevice device = device_.device();
   const bool has_textures = !input.texture_bindings.empty() || !input.samplers.empty();
   textures_.resize(input.textures.size());
-  samplers_.resize(input.samplers.size(), VK_NULL_HANDLE);
   blend_constants_ = input.blend_constants;
   viewport_ = input.viewport;
   scissor_ = input.scissor;
@@ -254,6 +264,8 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     auto& texture = textures_[i];
     texture.resolved = input_texture.resolved_image;
     texture.crop_source = input_texture.crop_source;
+    texture.cached = input_texture.cached_texture;
+    texture.upload_cached = input_texture.upload_cached;
     texture.fallback_view = input_texture.fallback_view;
     texture.array_layers = texture.resolved ? 1 : input_texture.array_layers;
     texture.extent = {input_texture.width, input_texture.height};
@@ -261,6 +273,12 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     // processor, so this pass neither allocates nor destroys anything for it.
     if (texture.fallback_view != VK_NULL_HANDLE) {
       texture.view = texture.fallback_view;
+      continue;
+    }
+    // Cached images, their views and their upload state are owned by the command
+    // processor; only an entry that has not been uploaded yet records a copy.
+    if (texture.cached) {
+      texture.view = input_texture.cached_view;
       continue;
     }
     const uint32_t level_count =
@@ -295,20 +313,6 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       return false;
     }
   }
-  for (size_t i = 0; i < samplers_.size(); ++i) {
-    const auto& input_sampler = input.samplers[i];
-    VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    info.minFilter = input_sampler.min_filter;
-    info.magFilter = input_sampler.mag_filter;
-    info.mipmapMode = input_sampler.mip_mode;
-    info.maxLod = input_sampler.max_lod;
-    info.addressModeU = input_sampler.address_u;
-    info.addressModeV = input_sampler.address_v;
-    info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    if (vk.vkCreateSampler(device, &info, nullptr, &samplers_[i]) != VK_SUCCESS) {
-      return false;
-    }
-  }
   if (has_textures) {
     std::vector<VkDescriptorImageInfo> image_infos;
     std::vector<VkWriteDescriptorSet> image_writes;
@@ -318,7 +322,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       image_infos.push_back({VK_NULL_HANDLE, textures_[texture_index].view,
                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
     }
-    for (VkSampler sampler : samplers_) {
+    for (VkSampler sampler : input.samplers) {
       image_infos.push_back({sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
     }
     for (uint32_t i = 0; i < image_infos.size(); ++i) {
@@ -462,11 +466,17 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
                                    VK_ACCESS_SHADER_READ_BIT);
       continue;
     }
+    // A cached image uploaded by an earlier draw in this batch is already in the
+    // shader-read layout, so it needs no copy at all.
+    if (texture.cached && !texture.upload_cached) {
+      continue;
+    }
+    const VkImage image = texture.cached ? texture.cached->image : texture.image;
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = texture.image;
+    barrier.image = image;
     barrier.subresourceRange = {
         VK_IMAGE_ASPECT_COLOR_BIT, 0,
         texture.crop_source ? 1u : uint32_t(texture.uploads.size()), 0, texture.array_layers};
@@ -489,7 +499,7 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
                                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                       VK_ACCESS_SHADER_READ_BIT);
     } else {
-      vk.vkCmdCopyBufferToImage(commands, buffer_, texture.image, barrier.newLayout,
+      vk.vkCmdCopyBufferToImage(commands, buffer_, image, barrier.newLayout,
                                 uint32_t(texture.uploads.size()), texture.uploads.data());
     }
     barrier.oldLayout = barrier.newLayout;

@@ -13,8 +13,32 @@
 #include <rex/ui/vulkan/upload_buffer_pool.h>
 
 #include "color_image.h"
+#include "draw_input.h"
 
 namespace rex::graphics::native {
+
+// Decoded guest texture uploaded to a device-local image that survives across
+// draws and frames. Owned through shared_ptr so draws keep it alive while their
+// GPU work is still queued after the cache evicts or invalidates the entry.
+struct CachedTexture {
+  const ui::vulkan::VulkanDevice* device = nullptr;
+  VkImage image = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  // Guest physical byte ranges covered by the decoded texels.
+  uint32_t base_start = 0;
+  uint32_t base_length = 0;
+  uint32_t mip_start = 0;
+  uint32_t mip_length = 0;
+  // Set once a draw carrying this entry is accepted, so later draws in the same
+  // batch can sample it without uploading again.
+  bool uploaded = false;
+  uint64_t last_use_submission = 0;
+  std::map<uint32_t, VkImageView> views;
+  CachedTexture() = default;
+  ~CachedTexture();
+  CachedTexture(const CachedTexture&) = delete;
+  CachedTexture& operator=(const CachedTexture&) = delete;
+};
 
 struct DrawTexture {
   uint32_t width = 0;
@@ -34,15 +58,13 @@ struct DrawTexture {
   // Device-lifetime zero-cleared view bound when the fetch constant cannot
   // produce texels. Non-owning; the host image is allocated once.
   VkImageView fallback_view = VK_NULL_HANDLE;
-};
-
-struct DrawSampler {
-  VkFilter min_filter = VK_FILTER_NEAREST;
-  VkFilter mag_filter = VK_FILTER_NEAREST;
-  VkSamplerMipmapMode mip_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-  float max_lod = 0.0f;
-  VkSamplerAddressMode address_u = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  VkSamplerAddressMode address_v = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  // Device-lifetime texture from the command processor cache. Non-owning when
+  // null; the shared pointer keeps the image alive for this draw's GPU work.
+  std::shared_ptr<CachedTexture> cached_texture;
+  VkImageView cached_view = VK_NULL_HANDLE;
+  // Whether this draw must copy `levels` into the cached image. False when the
+  // image was already uploaded by an earlier draw in the same batch.
+  bool upload_cached = false;
 };
 
 struct DrawInput {
@@ -67,7 +89,8 @@ struct DrawInput {
   std::vector<uint8_t> vertices;
   std::vector<DrawTexture> textures;
   std::vector<uint32_t> texture_bindings;
-  std::vector<DrawSampler> samplers;
+  // Device-lifetime samplers resolved by the command processor's sampler cache.
+  std::vector<VkSampler> samplers;
 };
 
 struct DrawPipelineKey {
@@ -123,16 +146,17 @@ class DrawPass {
   struct Texture {
     std::shared_ptr<ColorImage> resolved;
     std::shared_ptr<ColorImage> crop_source;
+    std::shared_ptr<CachedTexture> cached;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkImageView fallback_view = VK_NULL_HANDLE;
     VkExtent2D extent{};
     uint32_t array_layers = 1;
+    bool upload_cached = false;
     std::vector<VkBufferImageCopy> uploads;
   };
   std::vector<Texture> textures_;
-  std::vector<VkSampler> samplers_;
   VkDeviceSize index_offset_ = 0;
   uint32_t index_count_ = 0;
   draw_util::ViewportInfo viewport_{};

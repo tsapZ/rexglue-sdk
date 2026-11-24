@@ -303,3 +303,104 @@ TEST_CASE("Native resolve rectangles use multisample tile dimensions", "[gpu][na
   CHECK(rect->y == 8);
   CHECK(rect->width == 24);
 }
+
+TEST_CASE("Native guest texture cache keys cover the uploaded texels", "[gpu][native]") {
+  native::GuestTextureKey key{};
+  key.base_page = 0x12;
+  key.mip_page = 0x34;
+  key.width = 128;
+  key.height = 64;
+  key.array_layers = 1;
+  key.format = xenos::TextureFormat::k_8_8_8_8;
+  key.dimension = xenos::DataDimension::k2DOrStacked;
+  key.tiled = true;
+  key.packed_mips = false;
+  key.endianness = xenos::Endian::k8in32;
+  key.pitch = 4;
+  key.mip_max = 3;
+
+  native::GuestTextureKey same = key;
+  CHECK(same == key);
+  CHECK_FALSE(same < key);
+  CHECK_FALSE(key < same);
+
+  // Each field that changes the decoded bytes must split the cache.
+  const auto differs = [&key](auto mutate) {
+    native::GuestTextureKey other = key;
+    mutate(other);
+    return other != key;
+  };
+  CHECK(differs([](auto& k) { ++k.base_page; }));
+  CHECK(differs([](auto& k) { ++k.mip_page; }));
+  CHECK(differs([](auto& k) { ++k.width; }));
+  CHECK(differs([](auto& k) { ++k.height; }));
+  CHECK(differs([](auto& k) { ++k.array_layers; }));
+  CHECK(differs([](auto& k) { k.format = xenos::TextureFormat::k_8_8; }));
+  CHECK(differs([](auto& k) { k.dimension = xenos::DataDimension::kCube; }));
+  CHECK(differs([](auto& k) { k.tiled = false; }));
+  CHECK(differs([](auto& k) { k.packed_mips = true; }));
+  CHECK(differs([](auto& k) { k.endianness = xenos::Endian::k16in32; }));
+  CHECK(differs([](auto& k) { ++k.pitch; }));
+  CHECK(differs([](auto& k) { ++k.mip_max; }));
+
+  // Ordering is total over the key, which a std::map requires.
+  native::GuestTextureKey larger = key;
+  ++larger.base_page;
+  CHECK(key < larger);
+  CHECK_FALSE(larger < key);
+}
+
+TEST_CASE("Native physical range overlap is inclusive of shared bytes only", "[gpu][native]") {
+  // Disjoint ranges never overlap.
+  CHECK_FALSE(native::RangesOverlap(0x1000, 0x100, 0x2000, 0x100));
+  // Touching at a boundary is not an overlap.
+  CHECK_FALSE(native::RangesOverlap(0x1000, 0x100, 0x1100, 0x100));
+  CHECK_FALSE(native::RangesOverlap(0x1100, 0x100, 0x1000, 0x100));
+  // Partial overlaps in either direction.
+  CHECK(native::RangesOverlap(0x1000, 0x200, 0x1100, 0x200));
+  CHECK(native::RangesOverlap(0x1100, 0x200, 0x1000, 0x200));
+  // Containment, including an identical range.
+  CHECK(native::RangesOverlap(0x1000, 0x1000, 0x1800, 0x10));
+  CHECK(native::RangesOverlap(0x1800, 0x10, 0x1000, 0x1000));
+  CHECK(native::RangesOverlap(0x1000, 0x100, 0x1000, 0x100));
+  // Empty ranges never overlap anything.
+  CHECK_FALSE(native::RangesOverlap(0x1000, 0, 0x1000, 0x100));
+  CHECK_FALSE(native::RangesOverlap(0x1000, 0x100, 0x1000, 0));
+  CHECK_FALSE(native::RangesOverlap(0, 0, 0, 0));
+  // A range ending at the top of the 512 MB space must not wrap around.
+  CHECK_FALSE(native::RangesOverlap(0xFFFFFFF0u, 0x20u, 0, 0x10u));
+  CHECK(native::RangesOverlap(0x1FFFFFF0u, 0x10u, 0x1FFFFFF8u, 0x8u));
+  CHECK_FALSE(native::RangesOverlap(0x1FFFFFF8u, 0x8u, 0x20000000u, 0x10u));
+}
+
+TEST_CASE("Native sampler cache keys order by sampler state", "[gpu][native]") {
+  native::DrawSampler sampler{};
+  sampler.min_filter = VK_FILTER_LINEAR;
+  sampler.mag_filter = VK_FILTER_NEAREST;
+  sampler.mip_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  sampler.max_lod = 4.0f;
+  sampler.address_u = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  sampler.address_v = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+
+  native::DrawSampler same = sampler;
+  CHECK(same == sampler);
+  CHECK_FALSE(same < sampler);
+  CHECK_FALSE(sampler < same);
+
+  const auto differs = [&sampler](auto mutate) {
+    native::DrawSampler other = sampler;
+    mutate(other);
+    return other != sampler;
+  };
+  CHECK(differs([](auto& s) { s.min_filter = VK_FILTER_NEAREST; }));
+  CHECK(differs([](auto& s) { s.mag_filter = VK_FILTER_LINEAR; }));
+  CHECK(differs([](auto& s) { s.mip_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST; }));
+  CHECK(differs([](auto& s) { s.max_lod = 5.0f; }));
+  CHECK(differs([](auto& s) { s.address_u = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE; }));
+  CHECK(differs([](auto& s) { s.address_v = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE; }));
+
+  native::DrawSampler later = sampler;
+  later.max_lod = 8.0f;
+  CHECK(sampler < later);
+  CHECK_FALSE(later < sampler);
+}

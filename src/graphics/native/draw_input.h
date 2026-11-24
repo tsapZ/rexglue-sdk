@@ -1,10 +1,13 @@
 #pragma once
 
+#include <compare>
 #include <cstdint>
 #include <cstring>
 #include <optional>
 #include <span>
 #include <vector>
+
+#include <vulkan/vulkan_core.h>
 
 #include <rex/graphics/edram_layout.h>
 #include <rex/graphics/util/draw.h>
@@ -13,6 +16,50 @@
 namespace rex::graphics::native {
 
 constexpr uint32_t kPhysicalMemorySize = 512 * 1024 * 1024;
+
+// Host sampler state derived from a guest sampler binding. Also the device-lifetime
+// cache key, so it must order identically to how it compares.
+struct DrawSampler {
+  VkFilter min_filter = VK_FILTER_NEAREST;
+  VkFilter mag_filter = VK_FILTER_NEAREST;
+  VkSamplerMipmapMode mip_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  float max_lod = 0.0f;
+  VkSamplerAddressMode address_u = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  VkSamplerAddressMode address_v = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  auto operator<=>(const DrawSampler&) const = default;
+};
+
+// Everything that determines the uploaded host texel data of a guest texture.
+// The view swizzle is deliberately excluded because a single image is sampled
+// with several component mappings.
+struct GuestTextureKey {
+  uint32_t base_page = 0;
+  uint32_t mip_page = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t array_layers = 1;
+  xenos::TextureFormat format = xenos::TextureFormat::k_8_8_8_8;
+  xenos::DataDimension dimension = xenos::DataDimension::k2DOrStacked;
+  bool tiled = false;
+  bool packed_mips = false;
+  xenos::Endian endianness = xenos::Endian::kNone;
+  uint32_t pitch = 0;
+  uint32_t mip_max = 0;
+  auto operator<=>(const GuestTextureKey&) const = default;
+};
+
+// Whether two [start, start + length) physical memory ranges share any byte.
+// Empty ranges never overlap. Arithmetic is done in 64 bits so a range ending at
+// the top of the 512 MB guest address space does not wrap.
+constexpr bool RangesOverlap(uint32_t a_start, uint32_t a_length, uint32_t b_start,
+                             uint32_t b_length) {
+  if (!a_length || !b_length) {
+    return false;
+  }
+  const uint64_t a_end = uint64_t(a_start) + a_length;
+  const uint64_t b_end = uint64_t(b_start) + b_length;
+  return a_start < b_end && b_start < a_end;
+}
 
 constexpr bool IsPhysicalRange(uint32_t address, size_t size) {
   return address < kPhysicalMemorySize && size && size <= kPhysicalMemorySize - address;

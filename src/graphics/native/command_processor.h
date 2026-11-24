@@ -1,10 +1,13 @@
 #pragma once
 
+#include <atomic>
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <tuple>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -14,6 +17,7 @@
 
 #include "color_resolve.h"
 #include "depth_resolve.h"
+#include "draw_input.h"
 #include "draw_pass.h"
 #include "image_readback.h"
 #include "output_gamma.h"
@@ -81,8 +85,25 @@ class NativeCommandProcessor : public CommandProcessor {
     uint32_t dest_info;
     uint32_t dest_pitch;
   };
+  struct CachedSampler {
+    VkSampler sampler = VK_NULL_HANDLE;
+    uint64_t last_use_submission = 0;
+  };
+  struct CachedTextureEntry {
+    std::shared_ptr<CachedTexture> texture;
+    uint64_t last_use_submission = 0;
+  };
   static constexpr size_t kMaxTargets = 64;
   static constexpr size_t kMaxResolvedImages = 256;
+  static constexpr size_t kMaxSamplers = 256;
+  static constexpr size_t kMaxCachedTextures = 1024;
+
+  VkSampler GetSampler(const DrawSampler& key);
+  void InvalidateTextures(uint32_t start, uint32_t length);
+  static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
+      void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);
+  std::pair<uint32_t, uint32_t> MemoryInvalidationCallback(uint32_t physical_address_start,
+                                                           uint32_t length, bool exact_range);
 
   std::shared_ptr<ColorImage> FindTarget(uint32_t tile, uint32_t pitch, xenos::MsaaSamples samples,
                                          VkFormat format, VkImageAspectFlags aspects);
@@ -123,6 +144,14 @@ class NativeCommandProcessor : public CommandProcessor {
   VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
   std::map<std::tuple<uint32_t, uint32_t, xenos::MsaaSamples, VkFormat>, CachedImage> targets_;
   std::map<uint32_t, CachedResolve> resolved_images_;
+  std::map<DrawSampler, CachedSampler> samplers_;
+  std::map<GuestTextureKey, CachedTextureEntry> cached_textures_;
+  // Written from guest threads while the global critical region is held, so it
+  // only guards the pending list - never call into memory_ or Vulkan here.
+  std::mutex invalidation_mutex_;
+  std::vector<std::pair<uint32_t, uint32_t>> pending_invalidations_;
+  std::atomic<bool> has_pending_invalidations_{false};
+  void* memory_invalidation_handle_ = nullptr;
   std::vector<FrameCommand> pending_;
   std::vector<FrameCommand> in_flight_;
   std::unique_ptr<ImageReadback> in_flight_readback_;
