@@ -8,8 +8,16 @@
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
  *
- * @remarks     One plugin exists today (rexgpu-xenos). The factory carries an
- *              ABI version so this can grow into a general plugin API later.
+ * @remarks     Two plugins exist: rexgpu-xenos (the default) and the
+ *              experimental rexgpu-native Vulkan renderer. The factory carries
+ *              an ABI version so this can grow into a general plugin API later.
+ *              Plugins are runtime-loaded from the executable's directory and
+ *              are never linked, so a host must stage the one it wants beside
+ *              itself. rexgpu-native is opt-in: stage it with
+ *              rexglue_configure_target(<target> GPU_PLUGINS native) and select
+ *              it with the gpu_plugin=native cvar. The installed SDK exports
+ *              rex::gpu-native when built with REXGLUE_USE_VULKAN, but nothing
+ *              stages it by default.
  */
 
 #pragma once

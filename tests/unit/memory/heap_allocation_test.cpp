@@ -788,4 +788,23 @@ TEST_CASE("Guest memory backing survives through views without a shared name", "
   }
   CloseFileMappingHandle(handle, name);
 }
+
+TEST_CASE("Guest backing rejects a name another owner already holds", "[memory]") {
+  using namespace rex::memory;
+  const std::string name = "rex-guest-memory-collision-" + std::to_string(getpid());
+  const std::string shm_name = "/" + name;
+  const size_t length = page_size();
+
+  // Stand in for a backing left behind by another owner: create the object but
+  // keep it named so the exclusive open below sees the collision.
+  const int existing = shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+  REQUIRE(existing >= 0);
+  REQUIRE(ftruncate(existing, static_cast<off_t>(length)) == 0);
+
+  const auto handle = CreateFileMappingHandle(name, length, PageAccess::kReadWrite, false);
+  CHECK(handle == kFileMappingHandleInvalid);
+
+  shm_unlink(shm_name.c_str());
+  close(existing);
+}
 #endif

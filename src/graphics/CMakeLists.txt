@@ -165,7 +165,11 @@ if(REXGLUE_USE_D3D12)
     )
 endif()
 
-# rexgpu-native: native Vulkan renderer plugin (work in progress).
+# rexgpu-native: experimental from-scratch Vulkan renderer plugin.
+# Opt-in only. Consumers stage it next to the host with
+# rexglue_configure_target(<target> GPU_PLUGINS native) and select it with
+# gpu_plugin=native; it is installed/exported with the SDK when Vulkan is
+# enabled, but nothing links or stages it by default.
 if(REXGLUE_USE_VULKAN)
     set(REXGPU_NATIVE_SOURCES
         native/plugin_main.cpp

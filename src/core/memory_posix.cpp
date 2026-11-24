@@ -472,6 +472,10 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
       assert_always();
       return kFileMappingHandleInvalid;
   }
+  // Single owner: exclusive creation refuses to attach to an object another
+  // holder already created under this name, so a stale or concurrent backing is
+  // an error instead of silently sharing it. The caller owns the returned
+  // descriptor and closes it once; the name is removed below.
   oflag |= O_CREAT | O_EXCL;
   auto full_path = MakeShmName(path);
   int ret = shm_open(full_path.c_str(), oflag, 0777);
