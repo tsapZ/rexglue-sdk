@@ -110,6 +110,20 @@ inline bool IsResolveFormatConvertSupported(const draw_util::ResolveInfo& copy,
          !copy.copy_dest_info.copy_dest_array;
 }
 
+// shortcut: cap attachments to full tile rows until native EDRAM supports split images.
+constexpr uint32_t GetTargetHeight(uint32_t pitch, xenos::MsaaSamples samples,
+                                   uint32_t tile_count, uint32_t max_height) {
+  const uint32_t tiles_per_row = xenos::GetSurfacePitchTiles(pitch, samples, false);
+  if (!tiles_per_row) {
+    return 0;
+  }
+  const uint32_t tile_height =
+      xenos::kEdramTileHeightSamples >> (samples >= xenos::MsaaSamples::k2X);
+  const uint32_t height = tile_count / tiles_per_row * tile_height;
+  const uint32_t aligned_max = max_height / tile_height * tile_height;
+  return height < aligned_max ? height : aligned_max;
+}
+
 // Rasterizer face culling for a host pipeline. Guest rectangle, point and line
 // primitives are non-polygonal, so they have no front or back face and must not
 // inherit the cull state left behind by the last polygonal draw.

@@ -143,6 +143,30 @@ TEST_CASE("Native subrect resolves place inside a cached surface", "[gpu][native
   CHECK_FALSE(native::GetCachedResolveRectangle(copy, 39, 80));
 }
 
+TEST_CASE("Native target height fits Vulkan limits without moving guest tiles", "[gpu][native]") {
+  // SSA pitch80 at 1x is one tile wide: the whole 2048-tile EDRAM spans 32768
+  // rows, which Steam Frame Turnip caps at 16384. Capping keeps every tile row
+  // at its guest coordinate, so the image is exactly 16384 rows tall.
+  CHECK(native::GetTargetHeight(80, xenos::MsaaSamples::k1X, xenos::kEdramTileCount, 16384) ==
+        16384);
+  // A device whose limit already fits the whole guest span keeps it unchanged,
+  // so desktop behaviour is identical to before.
+  CHECK(native::GetTargetHeight(80, xenos::MsaaSamples::k1X, xenos::kEdramTileCount, 32768) ==
+        32768);
+  CHECK(native::GetTargetHeight(80, xenos::MsaaSamples::k1X, xenos::kEdramTileCount, 65536) ==
+        32768);
+  // Extended 4096-tile EDRAM would need 65536 rows, still capped at the limit.
+  CHECK(native::GetTargetHeight(80, xenos::MsaaSamples::k1X, xenos::kEdramTileCountMax, 16384) ==
+        16384);
+  // The cap is rounded down to whole tile rows, never past the limit.
+  CHECK(native::GetTargetHeight(80, xenos::MsaaSamples::k1X, xenos::kEdramTileCount, 16380) ==
+        16368);
+  // Wider surfaces are shorter and stay below the cap.
+  CHECK(native::GetTargetHeight(1280, xenos::MsaaSamples::k1X, xenos::kEdramTileCount, 16384) ==
+        2048);
+  CHECK(native::GetTargetHeight(0, xenos::MsaaSamples::k1X, xenos::kEdramTileCount, 16384) == 0);
+}
+
 TEST_CASE("Native resolve sample selection maps to host samples", "[gpu][native]") {
   using xenos::CopySampleSelect;
   using xenos::MsaaSamples;

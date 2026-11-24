@@ -933,10 +933,11 @@ std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, ui
     }
     targets_.erase(*victim);
   }
-  const uint32_t tiles_per_row = xenos::GetSurfacePitchTiles(pitch, samples, false);
-  const uint32_t tile_height =
-      xenos::kEdramTileHeightSamples >> (samples >= xenos::MsaaSamples::k2X);
-  const uint32_t height = ActiveEdramLayout().tile_count / tiles_per_row * tile_height;
+  const auto& properties = vulkan_device_->properties();
+  const uint32_t max_height = std::min(properties.maxImageDimension2D,
+                                       properties.maxFramebufferHeight);
+  const uint32_t height =
+      GetTargetHeight(pitch, samples, ActiveEdramLayout().tile_count, max_height);
   auto image = std::make_shared<ColorImage>(*vulkan_device_);
   if (!image->Initialize({pitch, height}, format, VkSampleCountFlagBits(1u << uint32_t(samples)),
                          aspects)) {
