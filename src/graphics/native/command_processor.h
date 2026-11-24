@@ -15,6 +15,7 @@
 #include "color_resolve.h"
 #include "depth_resolve.h"
 #include "draw_pass.h"
+#include "image_readback.h"
 #include "output_gamma.h"
 
 namespace rex::graphics::native {
@@ -89,6 +90,8 @@ class NativeCommandProcessor : public CommandProcessor {
   void RecordDraws(std::span<const FrameCommand> commands);
   void RecordResolve(const QueuedResolve& resolve);
   void RecordDepthClear(const QueuedDepthClear& clear);
+  bool ReadBackResolve(const draw_util::ResolveInfo& copy, uint32_t address, uint32_t pitch,
+                       const QueuedResolve& resolve);
   bool RenderGuestOutput(ui::Presenter::GuestOutputRefreshContext& context, VkExtent2D extent,
                          uint32_t frontbuffer_address);
 
@@ -108,6 +111,7 @@ class NativeCommandProcessor : public CommandProcessor {
   std::map<uint32_t, CachedResolve> resolved_images_;
   std::vector<FrameCommand> pending_;
   std::vector<FrameCommand> in_flight_;
+  std::unique_ptr<ImageReadback> in_flight_readback_;
   std::shared_ptr<ColorImage> presented_;
   // Physical front buffer address of the last presented resolve. Kept across
   // submissions so eviction cannot drop the image the presenter is showing.

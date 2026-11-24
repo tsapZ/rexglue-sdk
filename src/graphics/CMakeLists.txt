@@ -180,6 +180,7 @@ if(REXGLUE_USE_VULKAN)
         native/depth_resolve.cpp
         native/draw_pass.cpp
         native/output_gamma.cpp
+        native/image_readback.cpp
         ${REXGPU_NATIVE_BASE_SOURCES}
         ${REXGPU_XENOS_SPIRV_SOURCES}
     )

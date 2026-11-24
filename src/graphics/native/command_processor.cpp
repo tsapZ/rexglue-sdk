@@ -22,6 +22,7 @@
 
 #include "draw_input.h"
 #include "graphics_system.h"
+#include "resolve_guest_memory.h"
 
 REXCVAR_DEFINE_STRING(native_frame_timing_path, "", "GPU/Native",
                       "Optional CSV for native Vulkan guest-output frame timing");
@@ -235,12 +236,16 @@ void NativeCommandProcessor::ShutdownContext() {
   }
   const auto& vk = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
-  RetireSubmission();
+  if (!RetireSubmission() && submitted_) {
+    auto queue = vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+    vk.vkQueueWaitIdle(queue.queue());
+  }
   if (frame_timing_.is_open()) {
     frame_timing_.close();
   }
   pending_.clear();
   in_flight_.clear();
+  in_flight_readback_.reset();
   draw_uploads_.reset();
   presented_.reset();
   presented_resolve_address_.reset();
@@ -1024,6 +1029,7 @@ bool NativeCommandProcessor::IssueCopy() {
   }
   resolved_images_.insert_or_assign(
       resolve_address, CachedResolve{{destination, next_submission_}, dest_info, dest_pitch});
+  const size_t resolve_index = pending_.size();
   pending_.emplace_back(
       QueuedResolve{std::move(source),
                     std::move(destination),
@@ -1040,7 +1046,53 @@ bool NativeCommandProcessor::IssueCopy() {
   if (depth_clear) {
     pending_.emplace_back(std::move(*depth_clear));
   }
+  // shortcut: immediate RGBA8 copies only, add delayed modes and other layouts with native packing.
+  if (GetReadbackResolveMode(false) == ReadbackResolveMode::kFull &&
+      IsResolveReadbackWanted(copy.copy_dest_extent_start, copy.copy_dest_extent_length) &&
+      !depth && output_format == ColorImage::kFormat &&
+      copy.copy_dest_info.copy_dest_format == xenos::ColorFormat::k_8_8_8_8 &&
+      copy.copy_dest_info.copy_dest_number == xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction &&
+      !copy.copy_dest_info.copy_dest_swap && uint32_t(copy.copy_dest_info.copy_dest_endian) <= 3) {
+    return ReadBackResolve(copy, resolve_address, regs.Get<reg::RB_COPY_DEST_PITCH>().copy_dest_pitch,
+                           std::get<QueuedResolve>(pending_[resolve_index]));
+  }
   return true;
+}
+
+bool NativeCommandProcessor::ReadBackResolve(const draw_util::ResolveInfo& copy, uint32_t address,
+                                             uint32_t pitch, const QueuedResolve& resolve) {
+  const uint32_t end = copy.copy_dest_extent_start + copy.copy_dest_extent_length;
+  const auto access = memory_->GetPhysicalHeap()->QueryRangeAccess(address, end - 1);
+  if (access != memory::PageAccess::kReadWrite && access != memory::PageAccess::kExecuteReadWrite) {
+    return true;
+  }
+
+  auto readback = std::make_unique<ImageReadback>(*vulkan_device_);
+  if (!readback->Initialize({resolve.destination_offset, resolve.extent}) || !BeginCommands()) {
+    return false;
+  }
+  RecordPending();
+  auto& image = *resolve.destination;
+  image.Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+  const bool recorded = readback->Record(command_buffer_, image.image(), image.extent());
+  image.Transition(command_buffer_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                   VK_ACCESS_SHADER_READ_BIT);
+  if (!SubmitCommands()) {
+    return false;
+  }
+  in_flight_readback_ = std::move(readback);
+  if (!RetireSubmission()) {
+    return false;
+  }
+  const ResolveRectangle rect{copy.copy_dest_x, copy.copy_dest_y, resolve.extent.width,
+                              resolve.extent.height};
+  const bool stored = recorded && StoreTiledResolveRgba8(
+      {memory_->TranslatePhysical(address), end - address}, pitch, rect,
+      copy.copy_dest_info.copy_dest_endian, in_flight_readback_->Map(fence_));
+  in_flight_readback_.reset();
+  return stored;
 }
 
 void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands) {
@@ -1218,6 +1270,9 @@ bool NativeCommandProcessor::RetireSubmission() {
   }
   const auto& vk = vulkan_device_->functions();
   const auto result = vk.vkWaitForFences(vulkan_device_->device(), 1, &fence_, VK_TRUE, UINT64_MAX);
+  if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
+    return false;
+  }
   if (submitted_frame_) {
     LogFrameTiming(*submitted_frame_, result == VK_SUCCESS ? "rendered" : "gpu_failed");
     submitted_frame_.reset();
@@ -1291,6 +1346,7 @@ bool NativeCommandProcessor::BeginCommands() {
     return false;
   }
   in_flight_.clear();
+  in_flight_readback_.reset();
   presented_.reset();
   return true;
 }
