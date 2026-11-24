@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <optional>
@@ -67,7 +68,14 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     DeviceId id;
     // Per pad rather than per guest user, so it survives reassignment.
     KeystrokeState keystroke;
+    // How far the left stick has gone each way (right, left, up, down as SDL reports them, 0..32768), logged when it
+    // grows (LogStickReach): a stick that falls short of full tilt one way shows in the log (Core of Light #145).
+    std::array<int32_t, 4> stick_reach{};
+    std::array<int32_t, 4> stick_reach_logged{};
+    uint64_t stick_reach_logged_ms = 0;
+    int stick_reach_lines = 0;
   };
+  void LogStickReach(ControllerState& controller, bool force);
 
   // WindowListener
   void OnClosing(rex::ui::UIEvent& e) override;

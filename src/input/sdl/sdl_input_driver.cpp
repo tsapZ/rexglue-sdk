@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <filesystem>
@@ -506,6 +507,7 @@ void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
     REXLOG_WARN("SDL OnControllerDeviceRemoved: Ignored. Unknown device.");
     return;
   }
+  LogStickReach(controllers_.at(*idx), true);
   SDL_CloseGamepad(controllers_.at(*idx).sdl);
   controllers_.erase(controllers_.begin() + static_cast<ptrdiff_t>(*idx));
 
@@ -523,14 +525,26 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
     // The pad can be removed between the event being posted and drained.
     return;
   }
-  auto& pad = controllers_.at(*idx).state.gamepad;
+  auto& controller = controllers_.at(*idx);
+  auto& pad = controller.state.gamepad;
   switch (event.gaxis.axis) {
     case SDL_GAMEPAD_AXIS_LEFTX:
-      pad.thumb_lx = event.gaxis.value;
+    case SDL_GAMEPAD_AXIS_LEFTY: {
+      if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX) {
+        pad.thumb_lx = event.gaxis.value;
+      } else {
+        pad.thumb_ly = ~event.gaxis.value;
+      }
+      // The reach each way: right/left from x, up/down from y (SDL: negative y is up).
+      const int32_t v = event.gaxis.value;
+      const size_t way = event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX ? (v >= 0 ? 0 : 1) : (v < 0 ? 2 : 3);
+      const int32_t reach = v < 0 ? -v : v;
+      if (reach > controller.stick_reach[way]) {
+        controller.stick_reach[way] = reach;
+        LogStickReach(controller, false);
+      }
       break;
-    case SDL_GAMEPAD_AXIS_LEFTY:
-      pad.thumb_ly = ~event.gaxis.value;
-      break;
+    }
     case SDL_GAMEPAD_AXIS_RIGHTX:
       pad.thumb_rx = event.gaxis.value;
       break;
@@ -548,6 +562,33 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
       break;
   }
   controllers_.at(*idx).state_changed = true;
+}
+
+// How far the left stick has gone each way, as a percentage of full tilt (Core of Light #145: a Switch Pro controller
+// on Linux walked slowly in some directions, likely a stick that falls short of full tilt there, and nothing in the
+// log could say). A line once the stick has been pushed hard one way, then again when a way has grown by 5 % or more,
+// at most every 20 s and 12 times per controller; and once more when the controller goes away. Reads nothing extra.
+void SDLInputDriver::LogStickReach(ControllerState& controller, bool force) {
+  constexpr int32_t kFull = 32767, kHard = 26000, kStep = 1638;
+  const auto& r = controller.stick_reach;
+  const int32_t most = std::max(std::max(r[0], r[1]), std::max(r[2], r[3]));
+  if (most < kHard) return;
+  bool grown = false;
+  for (size_t i = 0; i < r.size(); ++i) grown |= r[i] >= controller.stick_reach_logged[i] + kStep;
+  const uint64_t now = SDL_GetTicks();
+  if (!force) {
+    if (!grown || controller.stick_reach_lines >= 12) return;
+    if (controller.stick_reach_lines > 0 && now - controller.stick_reach_logged_ms < 20000) return;
+  } else if (r == controller.stick_reach_logged) {
+    return;
+  }
+  auto pct = [](int32_t v) { return std::min(100, int((int64_t(v) * 100 + kFull / 2) / kFull)); };
+  const char* name = controller.sdl ? SDL_GetGamepadName(controller.sdl) : nullptr;
+  REXLOG_INFO("SDL \"{}\": left stick reaches right {} %, left {} %, up {} %, down {} %", name ? name : "?",
+              pct(r[0]), pct(r[1]), pct(r[2]), pct(r[3]));
+  controller.stick_reach_logged = r;
+  controller.stick_reach_logged_ms = now;
+  ++controller.stick_reach_lines;
 }
 
 void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& event) {
