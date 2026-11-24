@@ -348,12 +348,18 @@ bool NativeCommandProcessor::ReadTextures(const SpirvShader& shader, DrawInput& 
   std::array<int, 32> indices;
   indices.fill(-1);
   for (const auto& binding : textures) {
-    if (binding.dimension != xenos::FetchOpDimension::k2D) {
+    const bool cube = binding.dimension == xenos::FetchOpDimension::kCube;
+    if (!cube && binding.dimension != xenos::FetchOpDimension::k2D) {
       return false;
     }
     const uint32_t slot = binding.fetch_constant;
+    const auto fetch = register_file_->GetTextureFetch(slot);
+    if (fetch.dimension != (cube ? xenos::DataDimension::kCube
+                                 : xenos::DataDimension::k2DOrStacked) ||
+        fetch.stacked) {
+      return false;
+    }
     if (indices[slot] < 0) {
-      const auto fetch = register_file_->GetTextureFetch(slot);
       auto& texture = input.textures.emplace_back();
       if (!ReadTexture(fetch, texture)) {
         REXGPU_DEBUG(
@@ -390,8 +396,9 @@ bool NativeCommandProcessor::ReadTextures(const SpirvShader& shader, DrawInput& 
 
 bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
                                          DrawTexture& texture) {
+  const bool cube = fetch.dimension == xenos::DataDimension::kCube;
   if (fetch.type != xenos::FetchConstantType::kTexture ||
-      fetch.dimension != xenos::DataDimension::k2DOrStacked || fetch.stacked ||
+      (!cube && fetch.dimension != xenos::DataDimension::k2DOrStacked) || fetch.stacked ||
 
       fetch.sign_x == xenos::TextureSign::kSigned || fetch.sign_y == xenos::TextureSign::kSigned ||
       fetch.sign_z == xenos::TextureSign::kSigned || fetch.sign_w == xenos::TextureSign::kSigned) {
@@ -400,6 +407,11 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
 
   texture.width = fetch.size_2d.width + 1;
   texture.height = fetch.size_2d.height + 1;
+  if (cube && texture.width != texture.height) {
+    return false;
+  }
+  texture.array_layers = GetTextureArrayLayers(fetch.dimension);
+  texture.view_type = cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
   uint32_t block_size;
   uint32_t block_width = 1;
   bool depth_texture = false;
@@ -485,7 +497,7 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
   }
   const uint32_t address = base_page << 12;
   auto resolved = resolved_images_.find(address);
-  if (!mip_max && resolved != resolved_images_.end() &&
+  if (!cube && !mip_max && resolved != resolved_images_.end() &&
       texture.format == resolved->second.image->format()) {
     const auto extent = resolved->second.image->extent();
     if (extent.width != texture.width || extent.height != texture.height) {
@@ -509,9 +521,13 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
     if (level_address >= kPhysicalMemorySize) {
       return false;
     }
+    // Array slices are stored within the level, each `array_slice_stride_bytes`
+    // apart, so the last slice's data must be readable as well.
+    const size_t level_read_size =
+        GetTextureLevelReadSize(level_layout.array_slice_stride_bytes,
+                                level_layout.array_slice_data_extent_bytes, texture.array_layers);
     const auto source =
-        ReadPhysical(uint32_t(level_address),
-                     rex::align(size_t(level_layout.array_slice_data_extent_bytes), size_t(4)));
+        ReadPhysical(uint32_t(level_address), rex::align(level_read_size, size_t(4)));
     if (source.empty()) {
       return false;
     }
@@ -524,29 +540,37 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
     const uint32_t level_height = std::max(1u, texture.height >> level);
     const uint32_t blocks_x = (level_width + block_width - 1) / block_width;
     const uint32_t blocks_y = (level_height + block_width - 1) / block_width;
-    auto& data = texture.levels.emplace_back(size_t(blocks_x) * blocks_y * block_size);
-    for (uint32_t y = 0; y < blocks_y; ++y) {
-      for (uint32_t x = 0; x < blocks_x; ++x) {
-        const size_t offset =
-            fetch.tiled
-                ? size_t(texture_util::GetTiledOffset2D(int32_t(x + start_x), int32_t(y + start_y),
-                                                        level_layout.row_pitch_bytes / block_size,
-                                                        std::countr_zero(block_size)))
-                : size_t(y + start_y) * level_layout.row_pitch_bytes + (x + start_x) * block_size;
-        if (offset > source.size() || block_size > source.size() - offset) {
-          return false;
-        }
-        uint8_t* dst = data.data() + (size_t(y) * blocks_x + x) * block_size;
-        for (uint32_t i = 0; i < block_size; ++i) {
-          dst[i] = source[(offset + i) ^ swap];
-        }
-        if (depth_texture) {
-          uint32_t packed;
-          std::memcpy(&packed, dst, sizeof(packed));
-          const float depth = fetch.format == xenos::TextureFormat::k_24_8_FLOAT
-                                  ? xenos::Float20e4To32(packed >> 8)
-                                  : float(packed >> 8) / 16777215.0f;
-          std::memcpy(dst, &depth, sizeof(depth));
+    auto& data = texture.levels.emplace_back(size_t(blocks_x) * blocks_y * block_size *
+                                             texture.array_layers);
+    for (uint32_t slice = 0; slice < texture.array_layers; ++slice) {
+      const size_t slice_base = size_t(slice) * level_layout.array_slice_stride_bytes;
+      // Each face is tiled independently from the origin of its own data.
+      for (uint32_t y = 0; y < blocks_y; ++y) {
+        for (uint32_t x = 0; x < blocks_x; ++x) {
+          const size_t offset =
+              slice_base +
+              (fetch.tiled ? size_t(texture_util::GetTiledOffset2D(
+                                 int32_t(x + start_x), int32_t(y + start_y),
+                                 level_layout.row_pitch_bytes / block_size,
+                                 std::countr_zero(block_size)))
+                           : size_t(y + start_y) * level_layout.row_pitch_bytes +
+                                 size_t(x + start_x) * block_size);
+          if (offset > source.size() || block_size > source.size() - offset) {
+            return false;
+          }
+          uint8_t* dst = data.data() +
+                         ((size_t(slice) * blocks_y + y) * blocks_x + x) * block_size;
+          for (uint32_t i = 0; i < block_size; ++i) {
+            dst[i] = source[(offset + i) ^ swap];
+          }
+          if (depth_texture) {
+            uint32_t packed;
+            std::memcpy(&packed, dst, sizeof(packed));
+            const float depth = fetch.format == xenos::TextureFormat::k_24_8_FLOAT
+                                    ? xenos::Float20e4To32(packed >> 8)
+                                    : float(packed >> 8) / 16777215.0f;
+            std::memcpy(dst, &depth, sizeof(depth));
+          }
         }
       }
     }

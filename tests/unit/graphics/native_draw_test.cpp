@@ -3,9 +3,29 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <rex/graphics/pipeline/texture/util.h>
+
 #include "../../../src/graphics/native/draw_input.h"
 
 using namespace rex::graphics;
+
+TEST_CASE("Native cube textures upload all six faces", "[gpu][native]") {
+  CHECK(native::GetTextureArrayLayers(xenos::DataDimension::kCube) == 6);
+  CHECK(native::GetTextureArrayLayers(xenos::DataDimension::k2DOrStacked) == 1);
+
+  // A 32x32 tiled k_8_8_8_8 cube: the base level holds six 4 KB faces, each
+  // addressed relative to its own origin, so the upload has to reach into the
+  // last face rather than stopping after the first.
+  const auto layout = texture_util::GetGuestTextureLayout(
+      xenos::DataDimension::kCube, 1, 32, 32, 1, true, xenos::TextureFormat::k_8_8_8_8, false,
+      true, 0);
+  REQUIRE(layout.array_size == 6);
+  CHECK(layout.base.array_slice_stride_bytes >= xenos::kTextureSubresourceAlignmentBytes);
+  CHECK(native::GetTextureLevelReadSize(layout.base.array_slice_stride_bytes,
+                                        layout.base.array_slice_data_extent_bytes,
+                                        layout.array_size) >=
+        layout.base.array_slice_stride_bytes * 5);
+}
 
 TEST_CASE("Native DMA draws decode guest indices", "[gpu][native]") {
   const std::array<uint8_t, 4> index_bytes{0, 6, 0, 7};

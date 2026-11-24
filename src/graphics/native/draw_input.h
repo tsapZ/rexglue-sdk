@@ -18,6 +18,22 @@ constexpr bool IsPhysicalRange(uint32_t address, size_t size) {
   return address < kPhysicalMemorySize && size && size <= kPhysicalMemorySize - address;
 }
 
+// Cube textures are hosted as a cube-compatible image with all six faces as
+// array layers of a single level; everything else is a single layer.
+constexpr uint32_t kTextureCubeArrayLayers = 6;
+
+constexpr uint32_t GetTextureArrayLayers(xenos::DataDimension dimension) {
+  return dimension == xenos::DataDimension::kCube ? kTextureCubeArrayLayers : 1;
+}
+
+// Array slices of a level are stored in guest memory `array_slice_stride_bytes`
+// apart within the level, so the last slice's data has to be readable as well.
+constexpr size_t GetTextureLevelReadSize(uint32_t array_slice_stride_bytes,
+                                         uint32_t array_slice_data_extent_bytes,
+                                         uint32_t array_layers) {
+  return size_t(array_slice_stride_bytes) * (array_layers - 1) + array_slice_data_extent_bytes;
+}
+
 inline bool DecodeDmaIndices(std::span<const uint8_t> source, xenos::IndexFormat format,
                              xenos::Endian endian, std::span<uint32_t> indices) {
   const bool wide = format == xenos::IndexFormat::kInt32;

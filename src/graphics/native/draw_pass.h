@@ -19,7 +19,12 @@ namespace rex::graphics::native {
 struct DrawTexture {
   uint32_t width = 0;
   uint32_t height = 0;
+  // Array layers per level (6 for cube textures, 1 otherwise). Each level in
+  // `levels` stores all layers tightly packed.
+  uint32_t array_layers = 1;
   VkFormat format = VK_FORMAT_UNDEFINED;
+  // VK_IMAGE_VIEW_TYPE_2D_ARRAY, or VK_IMAGE_VIEW_TYPE_CUBE for cubes.
+  VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
   VkComponentMapping swizzle{};
   std::vector<std::vector<uint8_t>> levels;
   std::shared_ptr<ColorImage> resolved_image;
@@ -114,6 +119,7 @@ class DrawPass {
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    uint32_t array_layers = 1;
     std::vector<VkBufferImageCopy> uploads;
   };
   std::vector<Texture> textures_;

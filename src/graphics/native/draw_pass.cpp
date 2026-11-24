@@ -169,7 +169,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     for (uint32_t level = 0; level < input_texture.levels.size(); ++level) {
       auto& copy = textures_[i].uploads.emplace_back();
       copy.bufferOffset = rex::align(size, VkDeviceSize(16));
-      copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+      copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, input_texture.array_layers};
       copy.imageExtent = {std::max(1u, input_texture.width >> level),
                           std::max(1u, input_texture.height >> level), 1};
       size = copy.bufferOffset + input_texture.levels[level].size();
@@ -250,6 +250,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     const auto& input_texture = input.textures[i];
     auto& texture = textures_[i];
     texture.resolved = input_texture.resolved_image;
+    texture.array_layers = texture.resolved ? 1 : input_texture.array_layers;
     const uint32_t level_count = texture.resolved ? 1 : uint32_t(texture.uploads.size());
     if (!texture.resolved) {
       VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -257,10 +258,13 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       info.format = input_texture.format;
       info.extent = {input_texture.width, input_texture.height, 1};
       info.mipLevels = level_count;
-      info.arrayLayers = 1;
+      info.arrayLayers = texture.array_layers;
       info.samples = VK_SAMPLE_COUNT_1_BIT;
       info.tiling = VK_IMAGE_TILING_OPTIMAL;
       info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+      if (input_texture.view_type == VK_IMAGE_VIEW_TYPE_CUBE) {
+        info.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+      }
       if (!ui::vulkan::util::CreateDedicatedAllocationImage(
               &device_, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, texture.image,
               texture.memory)) {
@@ -269,10 +273,10 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     }
     VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     view.image = texture.resolved ? texture.resolved->image() : texture.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    view.viewType = texture.resolved ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : input_texture.view_type;
     view.format = input_texture.format;
     view.components = input_texture.swizzle;
-    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, level_count, 0, 1};
+    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, level_count, 0, texture.array_layers};
     if (vk.vkCreateImageView(device, &view, nullptr, &texture.view) != VK_SUCCESS) {
       return false;
     }
@@ -446,7 +450,7 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
     barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = texture.image;
     barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, uint32_t(texture.uploads.size()), 0,
-                                1};
+                                texture.array_layers};
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     vk.vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
