@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -5001,9 +5002,13 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
+    const auto wait_start = std::chrono::steady_clock::now();
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    gpu_wait_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                          wait_start)
+                        .count();
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
@@ -5118,6 +5123,34 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   }
 }
 
+// The frames that began and the CPU's blocking waits for the GPU over a window, logged 30 s and 2 min after the first
+// frame, then every 10 min, 8 lines at most (Core of Light #136: Spyro's Adventure at ~30 FPS on Linux / RADV and the
+// Steam Deck while Windows ran it at over 200; the log couldn't say whether the GPU was the limit). A wait near the
+// whole frame time means the GPU is the limit; a small one, something on the CPU side.
+void VulkanCommandProcessor::LogGpuWait() {
+  const int64_t now_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (gpu_wait_since_us_ == 0) {
+    gpu_wait_since_us_ = now_us;
+    gpu_wait_us_ = 0;
+    gpu_wait_frames_ = 0;
+    return;
+  }
+  if (gpu_wait_reports_ >= 8) return;
+  const int64_t window_us = gpu_wait_reports_ == 0 ? 30000000 : gpu_wait_reports_ == 1 ? 90000000 : 600000000;
+  const int64_t span_us = now_us - gpu_wait_since_us_;
+  if (span_us < window_us || gpu_wait_frames_ == 0) return;
+  const double frame_ms = span_us / 1000.0 / double(gpu_wait_frames_);
+  const double wait_ms = gpu_wait_us_ / 1000.0 / double(gpu_wait_frames_);
+  REXGPU_INFO("Vulkan: {:.1f} FPS over {:.0f} s, {:.2f} ms per frame, of it {:.2f} ms waiting for the GPU ({:.0f} %)",
+              gpu_wait_frames_ * 1000000.0 / double(span_us), span_us / 1000000.0, frame_ms, wait_ms,
+              frame_ms > 0 ? 100.0 * wait_ms / frame_ms : 0.0);
+  ++gpu_wait_reports_;
+  gpu_wait_since_us_ = now_us;
+  gpu_wait_us_ = 0;
+  gpu_wait_frames_ = 0;
+}
+
 bool VulkanCommandProcessor::CanEndSubmissionImmediately() const {
   return !submission_open_ || (!scratch_buffer_used_ && !pipeline_cache_->IsCreatingPipelines());
 }
@@ -5148,6 +5181,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   }
 
   if (is_opening_frame) {
+    ++gpu_wait_frames_;
+    LogGpuWait();
     // Update the completed frame index, also obtaining the actual completed
     // frame number (since the CPU may be actually less than 3 frames behind)
     // before reclaiming resources tracked with the frame number.
