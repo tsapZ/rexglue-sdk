@@ -364,6 +364,18 @@ constexpr std::optional<uint32_t> GetEdramClearColorFormatMode(VkFormat format) 
   }
 }
 
+// Picks the host depth-stencil format for a guest depth render target. D24S8
+// maps to D24_UNORM_S8_UINT only when the device supports it as both a sampled
+// image and a depth/stencil attachment for optimal-tiling images; some drivers
+// (notably AMD RADV) expose no such support, so it falls back to
+// D32_SFLOAT_S8_UINT. D24FS8 always uses D32_SFLOAT_S8_UINT.
+constexpr VkFormat SelectDepthFormat(xenos::DepthRenderTargetFormat format,
+                                     bool depth_unorm24_supported) {
+  return format == xenos::DepthRenderTargetFormat::kD24S8 && depth_unorm24_supported
+             ? VK_FORMAT_D24_UNORM_S8_UINT
+             : VK_FORMAT_D32_SFLOAT_S8_UINT;
+}
+
 // Rasterizer face culling for a host pipeline. Guest rectangle, point and line
 // primitives are non-polygonal, so they have no front or back face and must not
 // inherit the cull state left behind by the last polygonal draw.

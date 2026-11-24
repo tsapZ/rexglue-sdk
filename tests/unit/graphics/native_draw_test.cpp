@@ -600,3 +600,15 @@ TEST_CASE("Native EDRAM depth-to-color clear detection and format modes", "[gpu]
   CHECK(native::GetEdramClearColorFormatMode(VK_FORMAT_R32_SFLOAT) == 3u);
   CHECK_FALSE(native::GetEdramClearColorFormatMode(VK_FORMAT_D24_UNORM_S8_UINT).has_value());
 }
+
+TEST_CASE("Native depth format falls back when D24_UNORM_S8_UINT is unsupported",
+          "[gpu][native]") {
+  CHECK(native::SelectDepthFormat(xenos::DepthRenderTargetFormat::kD24S8, true) ==
+        VK_FORMAT_D24_UNORM_S8_UINT);
+  CHECK(native::SelectDepthFormat(xenos::DepthRenderTargetFormat::kD24S8, false) ==
+        VK_FORMAT_D32_SFLOAT_S8_UINT);
+  CHECK(native::SelectDepthFormat(xenos::DepthRenderTargetFormat::kD24FS8, true) ==
+        VK_FORMAT_D32_SFLOAT_S8_UINT);
+  CHECK(native::SelectDepthFormat(xenos::DepthRenderTargetFormat::kD24FS8, false) ==
+        VK_FORMAT_D32_SFLOAT_S8_UINT);
+}

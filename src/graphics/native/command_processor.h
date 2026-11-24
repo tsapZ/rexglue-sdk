@@ -146,6 +146,9 @@ class NativeCommandProcessor : public CommandProcessor {
   PFN_vkCmdBlitImage cmd_blit_image_ = nullptr;
   bool r8_resolve_blit_ = false;
   bool rg8_resolve_blit_ = false;
+  // Whether VK_FORMAT_D24_UNORM_S8_UINT supports optimal-tiling sampled image
+  // and depth/stencil attachment usage on this device.
+  bool depth_unorm24_supported_ = false;
   VkCommandPool command_pool_ = VK_NULL_HANDLE;
   VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
   VkFence fence_ = VK_NULL_HANDLE;

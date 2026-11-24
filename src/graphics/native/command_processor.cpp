@@ -208,6 +208,14 @@ bool NativeCommandProcessor::SetupContext() {
     rg8_resolve_blit_ =
         SupportsResolveFormatBlit(*vulkan_device_, ColorImage::kFormat, VK_FORMAT_R8G8_UNORM);
   }
+  constexpr VkFormatFeatureFlags kUsedDepthFormatFeatures =
+      VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+  VkFormatProperties depth_unorm24_properties{};
+  instance.vkGetPhysicalDeviceFormatProperties(vulkan_device_->physical_device(),
+                                               VK_FORMAT_D24_UNORM_S8_UINT,
+                                               &depth_unorm24_properties);
+  depth_unorm24_supported_ = (depth_unorm24_properties.optimalTilingFeatures &
+                              kUsedDepthFormatFeatures) == kUsedDepthFormatFeatures;
   VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   pool.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
   pool.queueFamilyIndex = vulkan_device_->queue_family_graphics_compute();
@@ -338,6 +346,7 @@ void NativeCommandProcessor::RecordNullTextureInitialization() {
 }
 
 void NativeCommandProcessor::ShutdownContext() {
+  depth_unorm24_supported_ = false;
   if (memory_invalidation_handle_) {
     memory_->UnregisterPhysicalMemoryInvalidationCallback(memory_invalidation_handle_);
     memory_invalidation_handle_ = nullptr;
@@ -1318,10 +1327,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 }
 
 VkFormat NativeCommandProcessor::GetDepthFormat(xenos::DepthRenderTargetFormat format) const {
-  if (format == xenos::DepthRenderTargetFormat::kD24S8) {
-    return VK_FORMAT_D24_UNORM_S8_UINT;
-  }
-  return VK_FORMAT_D32_SFLOAT_S8_UINT;
+  return SelectDepthFormat(format, depth_unorm24_supported_);
 }
 
 void NativeCommandProcessor::ReplayAliasedFastClear(const PendingFastClear& clear,
