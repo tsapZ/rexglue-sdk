@@ -373,6 +373,7 @@ void NativeCommandProcessor::ShutdownContext() {
   in_flight_readback_.reset();
   // Draws in pending_ / in_flight_ have released their shared textures by now.
   cached_textures_.clear();
+  resolved_cubes_.clear();
   for (const auto& entry : samplers_) {
     vk.vkDestroySampler(device, entry.second.sampler, nullptr);
   }
@@ -694,6 +695,116 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
   }
   const uint32_t address = base_page << 12;
   auto resolved = resolved_images_.find(address);
+  if (cube && !mip_max && resolved != resolved_images_.end()) {
+    // Some titles render each cube face as a separate small color target and
+    // resolve it to its own slice of the guest layout, leaving guest memory
+    // zero. Assemble and cache a cube image from those six resolved faces,
+    // re-copying only when a face resolve version advances.
+    const auto cube_layout = texture_util::GetGuestTextureLayout(
+        fetch.dimension, fetch.pitch, texture.width, texture.height, 1, fetch.tiled,
+        fetch.format, fetch.packed_mips, true, mip_max);
+    const uint32_t face_stride = cube_layout.base.array_slice_stride_bytes;
+    std::array<std::shared_ptr<ColorImage>, kTextureCubeArrayLayers> faces{};
+    std::array<uint64_t, kTextureCubeArrayLayers> face_versions{};
+    std::optional<bool> face_swap;
+    bool faces_usable = face_stride != 0;
+    for (uint32_t face = 0; faces_usable && face < kTextureCubeArrayLayers; ++face) {
+      auto face_resolved =
+          resolved_images_.find(GetResolvedCubeFaceAddress(address, face_stride, face));
+      if (face_resolved == resolved_images_.end()) {
+        faces_usable = false;
+        break;
+      }
+      auto& entry = face_resolved->second;
+      const auto face_extent = entry.image->extent();
+      if (!CanUseResolvedCubeFace(texture.format == entry.image->format(), face_extent.width,
+                                  face_extent.height, texture.width, texture.height)) {
+        faces_usable = false;
+        break;
+      }
+      const bool swap_red_blue =
+          !depth_texture && reg::RB_COPY_DEST_INFO{entry.dest_info}.copy_dest_swap != 0;
+      if (face_swap && *face_swap != swap_red_blue) {
+        faces_usable = false;
+        break;
+      }
+      face_swap = swap_red_blue;
+      faces[face] = entry.image;
+      face_versions[face] = entry.version;
+      entry.last_use_submission = next_submission_;
+    }
+    if (faces_usable) {
+      texture.swizzle = MakeTextureComponentMapping(fetch.swizzle, channel_count, *face_swap);
+      const ResolvedCubeKey cube_key{address, texture.width, texture.height, texture.format};
+      std::shared_ptr<CachedTexture> entry;
+      if (auto found = resolved_cubes_.find(cube_key); found != resolved_cubes_.end()) {
+        entry = found->second.texture;
+        found->second.last_use_submission = next_submission_;
+        entry->last_use_submission = next_submission_;
+      } else {
+        if (resolved_cubes_.size() >= kMaxResolvedCubes) {
+          const auto victim = SelectRetiredEviction(
+              resolved_cubes_, retired_submission_ + 1,
+              [](const ResolvedCubeKey&, const CachedTextureEntry&) { return true; });
+          if (victim) {
+            resolved_cubes_.erase(*victim);
+          }
+        }
+        if (resolved_cubes_.size() < kMaxResolvedCubes) {
+          entry = std::make_shared<CachedTexture>();
+          entry->device = vulkan_device_;
+          entry->level_count = 1;
+          entry->last_use_submission = next_submission_;
+          VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+          image.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+          image.imageType = VK_IMAGE_TYPE_2D;
+          image.format = texture.format;
+          image.extent = {texture.width, texture.height, 1};
+          image.mipLevels = 1;
+          image.arrayLayers = kTextureCubeArrayLayers;
+          image.samples = VK_SAMPLE_COUNT_1_BIT;
+          image.tiling = VK_IMAGE_TILING_OPTIMAL;
+          image.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+          if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+                  vulkan_device_, image, ui::vulkan::util::MemoryPurpose::kDeviceLocal, entry->image,
+                  entry->memory)) {
+            return false;
+          }
+          resolved_cubes_.emplace(cube_key, CachedTextureEntry{entry, next_submission_});
+        }
+      }
+      if (entry) {
+        const uint32_t view_key = PackTextureComponentMapping(texture.swizzle);
+        auto view = entry->views.find(view_key);
+        if (view == entry->views.end()) {
+          VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+          info.image = entry->image;
+          info.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+          info.format = texture.format;
+          info.components = texture.swizzle;
+          info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, kTextureCubeArrayLayers};
+          VkImageView image_view = VK_NULL_HANDLE;
+          if (vulkan_device_->functions().vkCreateImageView(vulkan_device_->device(), &info,
+                                                            nullptr, &image_view) != VK_SUCCESS) {
+            return false;
+          }
+          view = entry->views.emplace(view_key, image_view).first;
+        }
+        const bool needs_upload =
+            ShouldUploadResolvedCube(entry->uploaded, entry->resolved_face_versions, face_versions);
+        texture.cached_texture = entry;
+        texture.cached_view = view->second;
+        texture.upload_cached = needs_upload;
+        if (needs_upload) {
+          texture.resolved_cube_faces = std::move(faces);
+          texture.resolved_cube_face_versions = face_versions;
+        }
+        return true;
+      }
+      texture.resolved_cube_faces = std::move(faces);
+      return true;
+    }
+  }
   if (!cube && !mip_max && resolved != resolved_images_.end() &&
       texture.format == resolved->second.image->format()) {
     // A 32bpp 3/4-channel resolve copied with copy_dest_swap keeps the EDRAM
@@ -1257,6 +1368,9 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   for (const auto& texture : input.textures) {
     if (texture.upload_cached && texture.cached_texture) {
       texture.cached_texture->uploaded = true;
+      if (texture.resolved_cube_face_versions[0] != 0) {
+        texture.cached_texture->resolved_face_versions = texture.resolved_cube_face_versions;
+      }
     }
   }
 
@@ -1608,7 +1722,10 @@ bool NativeCommandProcessor::IssueCopy() {
     return false;
   }
   resolved_images_.insert_or_assign(
-      resolve_address, CachedResolve{{destination, next_submission_}, dest_info, dest_pitch});
+      resolve_address, CachedResolve{{destination, next_submission_},
+                                     dest_info,
+                                     dest_pitch,
+                                     next_resolve_version_++});
   const size_t resolve_index = pending_.size();
   pending_.emplace_back(
       QueuedResolve{std::move(source),

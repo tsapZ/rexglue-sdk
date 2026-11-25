@@ -36,6 +36,8 @@ struct CachedTexture {
   // Set once a draw carrying this entry is accepted, so later draws in the same
   // batch can sample it without uploading again.
   bool uploaded = false;
+  // Per-face resolve versions last copied into a cached GPU-resolved cube.
+  std::array<uint64_t, kTextureCubeArrayLayers> resolved_face_versions{};
   uint64_t last_use_submission = 0;
   std::map<uint32_t, VkImageView> views;
   CachedTexture() = default;
@@ -59,6 +61,11 @@ struct DrawTexture {
   // Cached resolve of the same format but up to 8x8 larger than this texture;
   // its top-left corner is copied into a host image during the upload.
   std::shared_ptr<ColorImage> crop_source;
+  // Resolved host image of each cube face, in face order, when the whole cube
+  // was rendered on the GPU instead of being stored in guest memory. Each face
+  // is copied into its array layer of the uploaded cube during the upload.
+  std::array<std::shared_ptr<ColorImage>, kTextureCubeArrayLayers> resolved_cube_faces;
+  std::array<uint64_t, kTextureCubeArrayLayers> resolved_cube_face_versions{};
   // Device-lifetime zero-cleared view bound when the fetch constant cannot
   // produce texels. Non-owning; the host image is allocated once.
   VkImageView fallback_view = VK_NULL_HANDLE;
@@ -171,6 +178,7 @@ class DrawPass {
   struct Texture {
     std::shared_ptr<ColorImage> resolved;
     std::shared_ptr<ColorImage> crop_source;
+    std::array<std::shared_ptr<ColorImage>, kTextureCubeArrayLayers> resolved_cube_faces;
     std::shared_ptr<CachedTexture> cached;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;

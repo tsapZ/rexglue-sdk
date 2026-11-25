@@ -297,6 +297,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     auto& texture = textures_[i];
     texture.resolved = input_texture.resolved_image;
     texture.crop_source = input_texture.crop_source;
+    texture.resolved_cube_faces = input_texture.resolved_cube_faces;
     texture.cached = input_texture.cached_texture;
     texture.upload_cached = input_texture.upload_cached;
     texture.fallback_view = input_texture.fallback_view;
@@ -534,18 +535,33 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
     if (texture.cached && !texture.upload_cached) {
       continue;
     }
+    bool resolved_faces = false;
+    for (const auto& face : texture.resolved_cube_faces) {
+      resolved_faces |= face != nullptr;
+    }
     const VkImage image = texture.cached ? texture.cached->image : texture.image;
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
-    barrier.subresourceRange = {
-        VK_IMAGE_ASPECT_COLOR_BIT, 0,
-        texture.crop_source ? 1u : uint32_t(texture.uploads.size()), 0, texture.array_layers};
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                texture.crop_source || resolved_faces
+                                    ? 1u
+                                    : uint32_t(texture.uploads.size()),
+                                0, texture.array_layers};
+    // A cached GPU-resolved cube may have been sampled or written earlier in
+    // the same command buffer, so wait for prior shader reads and transfers
+    // before overwriting all six layers.
+    const VkPipelineStageFlags src_stage =
+        (resolved_faces && texture.cached)
+            ? (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT)
+            : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    barrier.srcAccessMask =
+        (resolved_faces && texture.cached) ? VK_ACCESS_TRANSFER_WRITE_BIT : 0;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vk.vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    vk.vkCmdPipelineBarrier(commands, src_stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                            nullptr, 1, &barrier);
     if (texture.crop_source) {
       // The resolved image may have been written earlier in this command
       // buffer, so transition and copy it here, right before the draw.
@@ -561,6 +577,26 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
       texture.crop_source->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                       VK_ACCESS_SHADER_READ_BIT);
+    } else if (resolved_faces) {
+      // Each face lives in its own resolve image at up to one resolve-alignment
+      // unit larger than the face, so crop its top-left corner into the matching
+      // array layer of the uploaded cube.
+      for (uint32_t face = 0; face < kTextureCubeArrayLayers; ++face) {
+        const auto& face_image = texture.resolved_cube_faces[face];
+        if (!face_image) {
+          continue;
+        }
+        face_image->Transition(commands, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkImageCopy copy{};
+        copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, face, 1};
+        copy.extent = {texture.extent.width, texture.extent.height, 1};
+        vk.vkCmdCopyImage(commands, face_image->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        face_image->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+      }
     } else {
       vk.vkCmdCopyBufferToImage(commands, buffer_, image, barrier.newLayout,
                                 uint32_t(texture.uploads.size()), texture.uploads.data());

@@ -179,6 +179,51 @@ constexpr bool CanCropAlignedResolve(uint32_t cached_width, uint32_t cached_heig
 // array layers of a single level; everything else is a single layer.
 constexpr uint32_t kTextureCubeArrayLayers = 6;
 
+// Cache key for a cube texture assembled from six GPU-resolved face images.
+// The view swizzle is excluded because one cached cube image can be sampled
+// with different component mappings.
+struct ResolvedCubeKey {
+  uint32_t address = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  auto operator<=>(const ResolvedCubeKey&) const = default;
+};
+
+struct ResolvedCubeKeyHash {
+  size_t operator()(const ResolvedCubeKey& key) const noexcept {
+    const std::array<uint32_t, 4> fields{key.address, key.width, key.height,
+                                         uint32_t(key.format)};
+    return size_t(XXH3_64bits(fields.data(), sizeof(fields)));
+  }
+};
+
+// Each cube face is stored like its own 2D texture, `array_slice_stride_bytes`
+// apart within the level. A face rendered on the GPU keeps its resolve at that
+// same address, so a cube fetch has to look for the face images there.
+constexpr uint32_t GetResolvedCubeFaceAddress(uint32_t base, uint32_t array_slice_stride_bytes,
+                                              uint32_t face) {
+  return base + array_slice_stride_bytes * face;
+}
+
+// A resolved cube face can stand in for guest memory only when its host image
+// matches the texture format and covers the face within the resolve alignment,
+// exactly like a 2D resolve crop.
+constexpr bool CanUseResolvedCubeFace(bool format_matches, uint32_t face_width,
+                                      uint32_t face_height, uint32_t texture_width,
+                                      uint32_t texture_height) {
+  return format_matches &&
+         CanCropAlignedResolve(face_width, face_height, texture_width, texture_height);
+}
+
+// A cached GPU-resolved cube only needs to re-copy its six faces when it has
+// never been uploaded or at least one face resolve version changed.
+constexpr bool ShouldUploadResolvedCube(
+    bool uploaded, const std::array<uint64_t, kTextureCubeArrayLayers>& cached_versions,
+    const std::array<uint64_t, kTextureCubeArrayLayers>& current_versions) {
+  return !uploaded || cached_versions != current_versions;
+}
+
 constexpr uint32_t GetTextureArrayLayers(xenos::DataDimension dimension) {
   return dimension == xenos::DataDimension::kCube ? kTextureCubeArrayLayers : 1;
 }

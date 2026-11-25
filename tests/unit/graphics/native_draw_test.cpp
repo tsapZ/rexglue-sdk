@@ -300,6 +300,66 @@ TEST_CASE("Native aligned resolve crop stays within one alignment unit", "[gpu][
   CHECK_FALSE(native::CanCropAlignedResolve(500, 308, 500, 300));
 }
 
+TEST_CASE("Native resolved cube faces map to per-face resolve addresses", "[gpu][native]") {
+  // Skylanders SSA renders each ambient cube face as a 32x32 color target and
+  // resolves it to its own slice of a tiled k_8_8_8_8 cube, leaving guest
+  // memory zero, so the fetch has to find the face images at these addresses.
+  const auto layout = texture_util::GetGuestTextureLayout(
+      xenos::DataDimension::kCube, 1, 32, 32, 1, true, xenos::TextureFormat::k_8_8_8_8, false,
+      true, 0);
+  const uint32_t base = 0x1C2B8000u;
+  CHECK(layout.base.array_slice_stride_bytes == 0x1000u);
+  for (uint32_t face = 0; face < native::kTextureCubeArrayLayers; ++face) {
+    CHECK(native::GetResolvedCubeFaceAddress(base, layout.base.array_slice_stride_bytes, face) ==
+          base + face * 0x1000u);
+  }
+  // A resolved face is usable when its format matches and it covers the face
+  // within one 8x8 resolve alignment unit.
+  CHECK(native::CanUseResolvedCubeFace(true, 32, 32, 32, 32));
+  CHECK(native::CanUseResolvedCubeFace(true, 39, 39, 32, 32));
+  CHECK_FALSE(native::CanUseResolvedCubeFace(true, 40, 32, 32, 32));
+  CHECK_FALSE(native::CanUseResolvedCubeFace(false, 32, 32, 32, 32));
+  CHECK_FALSE(native::CanUseResolvedCubeFace(true, 48, 32, 32, 32));
+  CHECK_FALSE(native::CanUseResolvedCubeFace(true, 24, 32, 32, 32));
+}
+
+TEST_CASE("Native resolved cube cache keys and face versions control re-uploads",
+          "[gpu][native]") {
+  native::ResolvedCubeKey key{0x1C2B8000u, 32, 32, VK_FORMAT_R8G8B8A8_UNORM};
+  native::ResolvedCubeKey same = key;
+  CHECK(same == key);
+  CHECK_FALSE(same < key);
+  CHECK_FALSE(key < same);
+
+  native::ResolvedCubeKeyHash hasher;
+  CHECK(hasher(key) == hasher(same));
+
+  native::ResolvedCubeKey diff_addr = key;
+  diff_addr.address = 0x1C2C0000u;
+  CHECK_FALSE(diff_addr == key);
+  CHECK(hasher(diff_addr) != hasher(key));
+
+  native::ResolvedCubeKey diff_size = key;
+  diff_size.width = 64;
+  CHECK_FALSE(diff_size == key);
+  CHECK(hasher(diff_size) != hasher(key));
+
+  native::ResolvedCubeKey diff_fmt = key;
+  diff_fmt.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+  CHECK_FALSE(diff_fmt == key);
+  CHECK(hasher(diff_fmt) != hasher(key));
+
+  const std::array<uint64_t, 6> v1{1, 2, 3, 4, 5, 6};
+  // First draw before any upload must copy the six faces.
+  CHECK(native::ShouldUploadResolvedCube(false, {}, v1));
+  // Subsequent draws with unchanged face versions reuse the cached cube.
+  CHECK_FALSE(native::ShouldUploadResolvedCube(true, v1, v1));
+  // Updating any single face version invalidates the cached cube.
+  std::array<uint64_t, 6> v2 = v1;
+  v2[4] = 7;
+  CHECK(native::ShouldUploadResolvedCube(true, v1, v2));
+}
+
 TEST_CASE("Native resolve rectangles use multisample tile dimensions", "[gpu][native]") {
   draw_util::ResolveInfo copy{};
   copy.depth_edram_info.pitch_tiles = 4;

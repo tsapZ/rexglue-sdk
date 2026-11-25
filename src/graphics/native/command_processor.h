@@ -97,6 +97,7 @@ class NativeCommandProcessor : public CommandProcessor {
   struct CachedResolve : CachedImage {
     uint32_t dest_info;
     uint32_t dest_pitch;
+    uint64_t version = 0;
   };
   struct CachedSampler {
     VkSampler sampler = VK_NULL_HANDLE;
@@ -110,6 +111,7 @@ class NativeCommandProcessor : public CommandProcessor {
   static constexpr size_t kMaxResolvedImages = 256;
   static constexpr size_t kMaxSamplers = 256;
   static constexpr size_t kMaxCachedTextures = 1024;
+  static constexpr size_t kMaxResolvedCubes = 64;
 
   VkSampler GetSampler(const DrawSampler& key);
   void InvalidateTextures(uint32_t start, uint32_t length);
@@ -165,12 +167,14 @@ class NativeCommandProcessor : public CommandProcessor {
   DrawBindingCache draw_bindings_;
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> draw_uploads_;
   uint64_t next_submission_ = 1;
+  uint64_t next_resolve_version_ = 1;
   VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
   std::map<std::tuple<uint32_t, uint32_t, xenos::MsaaSamples, VkFormat>, CachedImage> targets_;
   std::map<std::pair<uint32_t, uint32_t>, PendingFastClear> pending_fast_clears_;
   std::unordered_map<uint32_t, CachedResolve> resolved_images_;
   std::unordered_map<DrawSampler, CachedSampler, DrawSamplerHash> samplers_;
   std::unordered_map<GuestTextureKey, CachedTextureEntry, GuestTextureKeyHash> cached_textures_;
+  std::unordered_map<ResolvedCubeKey, CachedTextureEntry, ResolvedCubeKeyHash> resolved_cubes_;
   // Written from guest threads while the global critical region is held, so it
   // only guards the pending list - never call into memory_ or Vulkan here.
   std::mutex invalidation_mutex_;
