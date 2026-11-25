@@ -383,6 +383,7 @@ void NativeCommandProcessor::ShutdownContext() {
   // Draws in pending_ / in_flight_ have released their shared textures by now.
   cached_textures_.clear();
   resolved_cubes_.clear();
+  resolved_crops_.clear();
   for (const auto& entry : samplers_) {
     vk.vkDestroySampler(device, entry.second.sampler, nullptr);
   }
@@ -845,6 +846,71 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
     }
     resolved->second.last_use_submission = next_submission_;
     texture.swizzle = MakeTextureComponentMapping(fetch.swizzle, channel_count, swap_red_blue);
+    const ResolvedCropKey crop_key{address, texture.width, texture.height, texture.format};
+    std::shared_ptr<CachedTexture> entry;
+    if (auto found = resolved_crops_.find(crop_key); found != resolved_crops_.end()) {
+      entry = found->second.texture;
+      found->second.last_use_submission = next_submission_;
+      entry->last_use_submission = next_submission_;
+    } else {
+      if (resolved_crops_.size() >= kMaxResolvedCrops) {
+        const auto victim = SelectRetiredEviction(
+            resolved_crops_, retired_submission_ + 1,
+            [](const ResolvedCropKey&, const CachedTextureEntry&) { return true; });
+        if (victim) {
+          resolved_crops_.erase(*victim);
+        }
+      }
+      if (resolved_crops_.size() < kMaxResolvedCrops) {
+        entry = std::make_shared<CachedTexture>();
+        entry->device = vulkan_device_;
+        entry->level_count = 1;
+        entry->last_use_submission = next_submission_;
+        VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        image.imageType = VK_IMAGE_TYPE_2D;
+        image.format = texture.format;
+        image.extent = {texture.width, texture.height, 1};
+        image.mipLevels = 1;
+        image.arrayLayers = 1;
+        image.samples = VK_SAMPLE_COUNT_1_BIT;
+        image.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+                vulkan_device_, image, ui::vulkan::util::MemoryPurpose::kDeviceLocal, entry->image,
+                entry->memory)) {
+          return false;
+        }
+        resolved_crops_.emplace(crop_key, CachedTextureEntry{entry, next_submission_});
+      }
+    }
+    if (entry) {
+      const uint32_t view_key = PackTextureComponentMapping(texture.swizzle);
+      auto view = entry->views.find(view_key);
+      if (view == entry->views.end()) {
+        VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        info.image = entry->image;
+        info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        info.format = texture.format;
+        info.components = texture.swizzle;
+        info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageView image_view = VK_NULL_HANDLE;
+        if (vulkan_device_->functions().vkCreateImageView(vulkan_device_->device(), &info, nullptr,
+                                                          &image_view) != VK_SUCCESS) {
+          return false;
+        }
+        view = entry->views.emplace(view_key, image_view).first;
+      }
+      const bool needs_upload = ShouldUploadResolvedCrop(
+          entry->uploaded, entry->resolved_crop_version, resolved->second.version);
+      texture.cached_texture = entry;
+      texture.cached_view = view->second;
+      texture.upload_cached = needs_upload;
+      if (needs_upload) {
+        texture.crop_source = resolved->second.image;
+        texture.resolved_crop_version = resolved->second.version;
+      }
+      return true;
+    }
     texture.crop_source = resolved->second.image;
     return true;
   }
@@ -1399,6 +1465,9 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       texture.cached_texture->uploaded = true;
       if (texture.resolved_cube_face_versions[0] != 0) {
         texture.cached_texture->resolved_face_versions = texture.resolved_cube_face_versions;
+      }
+      if (texture.resolved_crop_version != 0) {
+        texture.cached_texture->resolved_crop_version = texture.resolved_crop_version;
       }
     }
   }

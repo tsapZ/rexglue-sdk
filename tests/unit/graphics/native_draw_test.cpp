@@ -759,3 +759,16 @@ TEST_CASE("Native 4x-MSAA kColorDepth fast-clear detection and 64bpp pitch alias
   CHECK(scale_1x.x == 2);
   CHECK(scale_1x.y == 2);
 }
+
+TEST_CASE("Native cached cropped resolve key and version gating", "[gpu][native]") {
+  const native::ResolvedCropKey key{0x141EC000u, 64, 2, VK_FORMAT_R8G8B8A8_UNORM};
+  native::ResolvedCropKey same = key;
+  const native::ResolvedCropKeyHash hasher;
+  CHECK(hasher(key) == hasher(same));
+  same.height = 4;
+  CHECK(hasher(key) != hasher(same));
+
+  CHECK(native::ShouldUploadResolvedCrop(false, 0, 1));
+  CHECK_FALSE(native::ShouldUploadResolvedCrop(true, 42, 42));
+  CHECK(native::ShouldUploadResolvedCrop(true, 42, 43));
+}

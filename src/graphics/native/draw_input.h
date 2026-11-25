@@ -227,6 +227,31 @@ constexpr bool ShouldUploadResolvedCube(
   return !uploaded || cached_versions != current_versions;
 }
 
+// Cache key for a cropped GPU-resolved 2D texture. The view swizzle is excluded
+// because one cached crop image can be sampled with different component mappings.
+struct ResolvedCropKey {
+  uint32_t address = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  auto operator<=>(const ResolvedCropKey&) const = default;
+};
+
+struct ResolvedCropKeyHash {
+  size_t operator()(const ResolvedCropKey& key) const noexcept {
+    const std::array<uint32_t, 4> fields{key.address, key.width, key.height,
+                                         uint32_t(key.format)};
+    return size_t(XXH3_64bits(fields.data(), sizeof(fields)));
+  }
+};
+
+// A cached cropped GPU resolve only needs to re-copy when it has never been
+// uploaded or the source resolve version changed.
+constexpr bool ShouldUploadResolvedCrop(bool uploaded, uint64_t cached_version,
+                                        uint64_t current_version) {
+  return !uploaded || cached_version != current_version;
+}
+
 constexpr uint32_t GetTextureArrayLayers(xenos::DataDimension dimension) {
   return dimension == xenos::DataDimension::kCube ? kTextureCubeArrayLayers : 1;
 }

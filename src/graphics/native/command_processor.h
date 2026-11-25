@@ -120,6 +120,7 @@ class NativeCommandProcessor : public CommandProcessor {
   static constexpr size_t kMaxSamplers = 256;
   static constexpr size_t kMaxCachedTextures = 1024;
   static constexpr size_t kMaxResolvedCubes = 64;
+  static constexpr size_t kMaxResolvedCrops = 64;
 
   VkSampler GetSampler(const DrawSampler& key);
   void InvalidateTextures(uint32_t start, uint32_t length);
@@ -192,6 +193,7 @@ class NativeCommandProcessor : public CommandProcessor {
   std::unordered_map<DrawSampler, CachedSampler, DrawSamplerHash> samplers_;
   std::unordered_map<GuestTextureKey, CachedTextureEntry, GuestTextureKeyHash> cached_textures_;
   std::unordered_map<ResolvedCubeKey, CachedTextureEntry, ResolvedCubeKeyHash> resolved_cubes_;
+  std::unordered_map<ResolvedCropKey, CachedTextureEntry, ResolvedCropKeyHash> resolved_crops_;
   // Written from guest threads while the global critical region is held, so it
   // only guards the pending list - never call into memory_ or Vulkan here.
   std::mutex invalidation_mutex_;

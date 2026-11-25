@@ -38,6 +38,8 @@ struct CachedTexture {
   bool uploaded = false;
   // Per-face resolve versions last copied into a cached GPU-resolved cube.
   std::array<uint64_t, kTextureCubeArrayLayers> resolved_face_versions{};
+  // Resolve version last copied into a cached cropped 2D GPU resolve.
+  uint64_t resolved_crop_version = 0;
   uint64_t last_use_submission = 0;
   std::map<uint32_t, VkImageView> views;
   CachedTexture() = default;
@@ -61,6 +63,7 @@ struct DrawTexture {
   // Cached resolve of the same format but up to 8x8 larger than this texture;
   // its top-left corner is copied into a host image during the upload.
   std::shared_ptr<ColorImage> crop_source;
+  uint64_t resolved_crop_version = 0;
   // Resolved host image of each cube face, in face order, when the whole cube
   // was rendered on the GPU instead of being stored in guest memory. Each face
   // is copied into its array layer of the uploaded cube during the upload.

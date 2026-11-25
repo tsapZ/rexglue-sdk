@@ -550,15 +550,16 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
                                     ? 1u
                                     : uint32_t(texture.uploads.size()),
                                 0, texture.array_layers};
-    // A cached GPU-resolved cube may have been sampled or written earlier in
-    // the same command buffer, so wait for prior shader reads and transfers
-    // before overwriting all six layers.
+    // A cached GPU-resolved cube or crop may have been sampled or written earlier
+    // in the same command buffer, so wait for prior shader reads and transfers
+    // before overwriting it.
+    const bool cached_resolve_upload =
+        texture.cached && (resolved_faces || texture.crop_source != nullptr);
     const VkPipelineStageFlags src_stage =
-        (resolved_faces && texture.cached)
+        cached_resolve_upload
             ? (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT)
             : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    barrier.srcAccessMask =
-        (resolved_faces && texture.cached) ? VK_ACCESS_TRANSFER_WRITE_BIT : 0;
+    barrier.srcAccessMask = cached_resolve_upload ? VK_ACCESS_TRANSFER_WRITE_BIT : 0;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     vk.vkCmdPipelineBarrier(commands, src_stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                             nullptr, 1, &barrier);
@@ -572,7 +573,7 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
       copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
       copy.extent = {texture.extent.width, texture.extent.height, 1};
       vk.vkCmdCopyImage(commands, texture.crop_source->image(),
-                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture.image,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
       texture.crop_source->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
