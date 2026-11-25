@@ -327,6 +327,13 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
       }
     }
   }
+  // Asked for but not there: say so, or a player's log only lacks the layer in the list below and
+  // nobody can tell whether the setting was read (Core of Light #135).
+  if (try_enable_validation && !layer_khronos_validation) {
+    REXLOG_WARN(
+        "Vulkan validation was asked for (vulkan_validation_enabled), but VK_LAYER_KHRONOS_validation "
+        "isn't installed (the Vulkan SDK on Windows, a vulkan-validation-layers package on Linux)");
+  }
 
   // Create the instance.
 
