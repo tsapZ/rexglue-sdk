@@ -60,11 +60,53 @@ CachedTexture::~CachedTexture() {
 
 DrawBindings::~DrawBindings() {
   const auto& vk = device.functions();
+  if (shared_vertex_set_index != SIZE_MAX && pools[0]) {
+    pools[0]->Free(shared_vertex_set_index);
+  }
   for (size_t i = 0; i < layouts.size(); ++i) {
     pools[i].reset();
     vk.vkDestroyDescriptorSetLayout(device.device(), layouts[i], nullptr);
   }
   vk.vkDestroyPipelineLayout(device.device(), pipeline_layout, nullptr);
+}
+
+VkDescriptorSet DrawBindings::GetOrCreateSharedVertexSet(VkBuffer buffer, uint32_t shared_count) {
+  if (shared_vertex_set != VK_NULL_HANDLE && shared_vertex_buffer == buffer) {
+    return shared_vertex_set;
+  }
+  if (shared_vertex_set_index == SIZE_MAX) {
+    shared_vertex_set_index = pools[0]->Allocate();
+    if (shared_vertex_set_index == SIZE_MAX) {
+      return VK_NULL_HANDLE;
+    }
+    shared_vertex_set = pools[0]->Get(shared_vertex_set_index);
+  }
+  constexpr size_t kInlineSharedBuffers = 8;
+  std::array<VkDescriptorBufferInfo, kInlineSharedBuffers> inline_shared_infos{};
+  std::vector<VkDescriptorBufferInfo> heap_shared_infos;
+  VkDescriptorBufferInfo* shared_infos;
+  if (shared_count <= kInlineSharedBuffers) {
+    shared_infos = inline_shared_infos.data();
+  } else {
+    heap_shared_infos.resize(shared_count);
+    shared_infos = heap_shared_infos.data();
+  }
+  const VkDeviceSize range = kPhysicalMemorySize / shared_count;
+  for (uint32_t i = 0; i < shared_count; ++i) {
+    shared_infos[i] = {buffer, VkDeviceSize(i) * range, range};
+  }
+  const VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                   nullptr,
+                                   shared_vertex_set,
+                                   0,
+                                   0,
+                                   shared_count,
+                                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                   nullptr,
+                                   shared_infos};
+  device.functions().vkUpdateDescriptorSets(device.device(), 1, &write, 0, nullptr);
+  shared_vertex_buffer = buffer;
+  return shared_vertex_set;
 }
 
 bool DrawBindings::Initialize(uint32_t shared_count, uint32_t image_count, uint32_t sampler_count) {
@@ -142,7 +184,8 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
                           const Shader::Translation& vertex, const Shader::Translation* pixel,
                           uint32_t shared_buffer_count, VkPipelineCache pipeline_cache,
                           DrawPipelines& pipelines, DrawBindingCache& binding_cache,
-                          ui::vulkan::VulkanUploadBufferPool& uploads, uint64_t submission) {
+                          ui::vulkan::VulkanUploadBufferPool& uploads, uint64_t submission,
+                          VkBuffer shared_vertex_buffer) {
   const auto& vk = device_.functions();
   const VkDevice device = device_.device();
   const bool has_textures = !input.texture_bindings.empty() || !input.samplers.empty();
@@ -167,6 +210,13 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   }
   bindings_ = found->second.get();
   for (size_t i = 0; i < sets_.size(); ++i) {
+    if (i == 0 && shared_vertex_buffer != VK_NULL_HANDLE) {
+      sets_[0] = bindings_->GetOrCreateSharedVertexSet(shared_vertex_buffer, shared_buffer_count);
+      if (sets_[0] == VK_NULL_HANDLE) {
+        return false;
+      }
+      continue;
+    }
     auto& pool = *bindings_->pools[i];
     set_indices_[i] = pool.Allocate();
     if (set_indices_[i] == SIZE_MAX) {
@@ -186,7 +236,8 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       {reinterpret_cast<const uint8_t*>(input.bool_loop.data()), sizeof(input.bool_loop)},
       {reinterpret_cast<const uint8_t*>(input.fetch.data()), sizeof(input.fetch)},
   }};
-  const VkDeviceSize vertex_size = input.vertices.size();
+  const VkDeviceSize vertex_size =
+      shared_vertex_buffer != VK_NULL_HANDLE ? 0 : input.vertices.size();
   VkDeviceSize size = vertex_size;
   std::array<VkDescriptorBufferInfo, Translator::kConstantBufferCount> constant_infos{};
   for (size_t i = 0; i < constants.size(); ++i) {
@@ -228,7 +279,9 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   if (!bytes) {
     return false;
   }
-  std::memcpy(bytes, input.vertices.data(), vertex_size);
+  if (vertex_size) {
+    std::memcpy(bytes, input.vertices.data(), vertex_size);
+  }
   for (size_t i = 0; i < constants.size(); ++i) {
     constant_infos[i].buffer = buffer_;
     uint8_t* target = bytes + constant_infos[i].offset;
@@ -266,31 +319,34 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   constexpr size_t kInlineSharedBuffers = 8;
   std::array<VkDescriptorBufferInfo, kInlineSharedBuffers> inline_shared_infos{};
   std::vector<VkDescriptorBufferInfo> heap_shared_infos;
-  VkDescriptorBufferInfo* shared_infos;
-  if (shared_buffer_count <= kInlineSharedBuffers) {
-    shared_infos = inline_shared_infos.data();
-  } else {
-    heap_shared_infos.resize(shared_buffer_count);
-    shared_infos = heap_shared_infos.data();
-  }
-  for (uint32_t i = 0; i < shared_buffer_count; ++i) {
-    shared_infos[i] = {buffer_, buffer_offset, vertex_size};
-  }
   std::array<VkWriteDescriptorSet, 1 + Translator::kConstantBufferCount> writes{};
-  writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-               nullptr,
-               sets_[0],
-               0,
-               0,
-               shared_buffer_count,
-               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-               nullptr,
-               shared_infos};
-  for (uint32_t i = 0; i < constant_infos.size(); ++i) {
-    writes[i + 1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets_[1],          i, 0, 1,
-                     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,      nullptr, &constant_infos[i]};
+  uint32_t write_count = 0;
+  if (shared_vertex_buffer == VK_NULL_HANDLE) {
+    VkDescriptorBufferInfo* shared_infos;
+    if (shared_buffer_count <= kInlineSharedBuffers) {
+      shared_infos = inline_shared_infos.data();
+    } else {
+      heap_shared_infos.resize(shared_buffer_count);
+      shared_infos = heap_shared_infos.data();
+    }
+    for (uint32_t i = 0; i < shared_buffer_count; ++i) {
+      shared_infos[i] = {buffer_, buffer_offset, vertex_size};
+    }
+    writes[write_count++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                             nullptr,
+                             sets_[0],
+                             0,
+                             0,
+                             shared_buffer_count,
+                             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                             nullptr,
+                             shared_infos};
   }
-  vk.vkUpdateDescriptorSets(device, uint32_t(writes.size()), writes.data(), 0, nullptr);
+  for (uint32_t i = 0; i < constant_infos.size(); ++i) {
+    writes[write_count++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets_[1], i, 0, 1,
+                             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,      nullptr, &constant_infos[i]};
+  }
+  vk.vkUpdateDescriptorSets(device, write_count, writes.data(), 0, nullptr);
 
   for (size_t i = 0; i < textures_.size(); ++i) {
     const auto& input_texture = input.textures[i];

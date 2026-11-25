@@ -76,7 +76,14 @@ class NativeCommandProcessor : public CommandProcessor {
     VkRect2D area;
     VkClearDepthStencilValue value;
   };
-  using FrameCommand = std::variant<QueuedDraw, QueuedResolve, QueuedDepthClear>;
+  struct QueuedBufferUpload {
+    VkBuffer src_buffer = VK_NULL_HANDLE;
+    VkDeviceSize src_offset = 0;
+    VkDeviceSize dst_offset = 0;
+    VkDeviceSize size = 0;
+  };
+  using FrameCommand =
+      std::variant<QueuedDraw, QueuedResolve, QueuedDepthClear, QueuedBufferUpload>;
 
   // A 4x-MSAA depth-only draw that D3D9 issued to clear an aliased 1x- or
   // 2x-MSAA EDRAM tile. Kept so a target created later for the same tile is
@@ -123,7 +130,11 @@ class NativeCommandProcessor : public CommandProcessor {
   static constexpr size_t kMaxResolvedCrops = 64;
 
   VkSampler GetSampler(const DrawSampler& key);
+  void DrainMemoryInvalidations();
   void InvalidateTextures(uint32_t start, uint32_t length);
+  void RebuildCachedTexturePages();
+  void InvalidateSharedVertices(uint32_t start, uint32_t length);
+  bool EnsureSharedVertexRange(uint32_t address, uint32_t size);
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);
   std::pair<uint32_t, uint32_t> MemoryInvalidationCallback(uint32_t physical_address_start,
@@ -152,6 +163,7 @@ class NativeCommandProcessor : public CommandProcessor {
   bool SubmitCommands();
   bool FlushPendingIfFull();
   void RecordDraws(std::span<const FrameCommand> commands);
+  void RecordBufferUploads(std::span<const FrameCommand> commands);
   void RecordResolve(const QueuedResolve& resolve);
   void RecordDepthClear(const QueuedDepthClear& clear);
   bool ReadBackResolve(const draw_util::ResolveInfo& copy, uint32_t address, uint32_t pitch,
@@ -182,6 +194,9 @@ class NativeCommandProcessor : public CommandProcessor {
   DrawPipelines pipelines_;
   DrawBindingCache draw_bindings_;
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> draw_uploads_;
+  VkBuffer shared_vertex_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory shared_vertex_memory_ = VK_NULL_HANDLE;
+  std::vector<uint64_t> shared_vertex_valid_pages_;
   uint64_t next_submission_ = 1;
   uint64_t next_resolve_version_ = 1;
   VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
@@ -197,6 +212,7 @@ class NativeCommandProcessor : public CommandProcessor {
   // Written from guest threads while the global critical region is held, so it
   // only guards the pending list - never call into memory_ or Vulkan here.
   std::mutex invalidation_mutex_;
+  std::vector<uint64_t> cached_texture_pages_;
   std::vector<std::pair<uint32_t, uint32_t>> pending_invalidations_;
   std::atomic<bool> has_pending_invalidations_{false};
   void* memory_invalidation_handle_ = nullptr;

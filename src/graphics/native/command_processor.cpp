@@ -271,6 +271,17 @@ bool NativeCommandProcessor::SetupContext() {
     ShutdownContext();
     return false;
   }
+  const uint32_t shared_segment_size =
+      kPhysicalMemorySize >> translator_->GetSharedMemoryStorageBufferCountLog2();
+  if (vulkan_device_->properties().maxStorageBufferRange >= shared_segment_size &&
+      ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device_, kPhysicalMemorySize,
+          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kDeviceLocal, shared_vertex_buffer_,
+          shared_vertex_memory_)) {
+    shared_vertex_valid_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
+    cached_texture_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
+  }
   memory_invalidation_handle_ =
       memory_->RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
   if (!memory_invalidation_handle_) {
@@ -389,6 +400,16 @@ void NativeCommandProcessor::ShutdownContext() {
   }
   samplers_.clear();
   draw_uploads_.reset();
+  if (shared_vertex_buffer_ != VK_NULL_HANDLE) {
+    vk.vkDestroyBuffer(device, shared_vertex_buffer_, nullptr);
+    shared_vertex_buffer_ = VK_NULL_HANDLE;
+  }
+  if (shared_vertex_memory_ != VK_NULL_HANDLE) {
+    vk.vkFreeMemory(device, shared_vertex_memory_, nullptr);
+    shared_vertex_memory_ = VK_NULL_HANDLE;
+  }
+  shared_vertex_valid_pages_.clear();
+  cached_texture_pages_.clear();
   presented_.reset();
   presented_resolve_address_.reset();
   resolved_images_.clear();
@@ -453,17 +474,7 @@ std::span<const uint8_t> NativeCommandProcessor::ReadPhysical(uint32_t address, 
 }
 
 bool NativeCommandProcessor::ReadTextures(const SpirvShader& shader, DrawInput& input) {
-  if (has_pending_invalidations_.load(std::memory_order_acquire)) {
-    std::vector<std::pair<uint32_t, uint32_t>> invalidations;
-    {
-      std::lock_guard<std::mutex> lock(invalidation_mutex_);
-      invalidations.swap(pending_invalidations_);
-      has_pending_invalidations_.store(false, std::memory_order_release);
-    }
-    for (const auto& [start, length] : invalidations) {
-      InvalidateTextures(start, length);
-    }
-  }
+  DrainMemoryInvalidations();
   const auto& textures = shader.GetTextureBindingsAfterTranslation();
   const auto& samplers = shader.GetSamplerBindingsAfterTranslation();
   const auto& properties = vulkan_device_->properties();
@@ -570,15 +581,106 @@ VkSampler NativeCommandProcessor::GetSampler(const DrawSampler& key) {
 }
 
 void NativeCommandProcessor::InvalidateTextures(uint32_t start, uint32_t length) {
+  bool erased = false;
   for (auto it = cached_textures_.begin(); it != cached_textures_.end();) {
     const CachedTexture& texture = *it->second.texture;
     if (RangesOverlap(start, length, texture.base_start, texture.base_length) ||
         RangesOverlap(start, length, texture.mip_start, texture.mip_length)) {
       it = cached_textures_.erase(it);
+      erased = true;
     } else {
       ++it;
     }
   }
+  if (erased) {
+    RebuildCachedTexturePages();
+  }
+}
+
+void NativeCommandProcessor::RebuildCachedTexturePages() {
+  if (cached_texture_pages_.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(invalidation_mutex_);
+  std::fill(cached_texture_pages_.begin(), cached_texture_pages_.end(), 0);
+  for (const auto& [key, entry] : cached_textures_) {
+    const auto& texture = *entry.texture;
+    const auto [base_first, base_count] =
+        GetPhysicalPageRange(texture.base_start, texture.base_length);
+    SetPageRangeBits(cached_texture_pages_, base_first, base_count);
+    if (texture.mip_length) {
+      const auto [mip_first, mip_count] =
+          GetPhysicalPageRange(texture.mip_start, texture.mip_length);
+      SetPageRangeBits(cached_texture_pages_, mip_first, mip_count);
+    }
+  }
+}
+
+void NativeCommandProcessor::DrainMemoryInvalidations() {
+  if (!has_pending_invalidations_.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::vector<std::pair<uint32_t, uint32_t>> invalidations;
+  {
+    std::lock_guard<std::mutex> lock(invalidation_mutex_);
+    invalidations.swap(pending_invalidations_);
+    has_pending_invalidations_.store(false, std::memory_order_release);
+  }
+  for (const auto& [start, length] : invalidations) {
+    InvalidateTextures(start, length);
+    InvalidateSharedVertices(start, length);
+  }
+}
+
+void NativeCommandProcessor::InvalidateSharedVertices(uint32_t start, uint32_t length) {
+  if (shared_vertex_valid_pages_.empty()) {
+    return;
+  }
+  const auto [first_page, page_count] = GetPhysicalPageRange(start, length);
+  ClearPageRangeBits(shared_vertex_valid_pages_, first_page, page_count);
+}
+
+bool NativeCommandProcessor::EnsureSharedVertexRange(uint32_t address, uint32_t size) {
+  if (!size || ReadPhysical(address, size).empty()) {
+    return false;
+  }
+  const auto [first_page, page_count] = GetPhysicalPageRange(address, size);
+  const uint32_t end_page = first_page + page_count;
+  uint32_t cursor = first_page;
+  uint32_t run_first_page = 0;
+  uint32_t run_page_count = 0;
+  while (FindNextInvalidPageRun(shared_vertex_valid_pages_, cursor, end_page, run_first_page,
+                                run_page_count)) {
+    const uint32_t max_chunk_pages = uint32_t(kDrawUploadPageSize >> kSharedVertexPageShift);
+    uint32_t chunk_page = run_first_page;
+    uint32_t remaining_pages = run_page_count;
+    while (remaining_pages) {
+      const uint32_t chunk_pages = std::min(remaining_pages, max_chunk_pages);
+      const uint32_t chunk_addr = chunk_page << kSharedVertexPageShift;
+      const uint32_t chunk_size =
+          std::min(chunk_pages << kSharedVertexPageShift, kPhysicalMemorySize - chunk_addr);
+      const auto bytes = ReadPhysical(chunk_addr, chunk_size);
+      if (bytes.empty()) {
+        return false;
+      }
+      VkBuffer src_buffer = VK_NULL_HANDLE;
+      VkDeviceSize src_offset = 0;
+      uint8_t* dst =
+          draw_uploads_->Request(next_submission_, chunk_size, 16, src_buffer, src_offset);
+      if (!dst) {
+        return false;
+      }
+      // Watch the guest pages before reading them so any write after the copy
+      // invalidates them before a later draw reads stale vertices.
+      memory_->EnablePhysicalMemoryAccessCallbacks(chunk_addr, chunk_size, true, false);
+      std::memcpy(dst, bytes.data(), chunk_size);
+      pending_.emplace_back(QueuedBufferUpload{src_buffer, src_offset, chunk_addr, chunk_size});
+      SetPageRangeBits(shared_vertex_valid_pages_, chunk_page, chunk_pages);
+      chunk_page += chunk_pages;
+      remaining_pages -= chunk_pages;
+    }
+  }
+  return true;
 }
 
 std::pair<uint32_t, uint32_t> NativeCommandProcessor::MemoryInvalidationCallbackThunk(
@@ -588,7 +690,7 @@ std::pair<uint32_t, uint32_t> NativeCommandProcessor::MemoryInvalidationCallback
 }
 
 std::pair<uint32_t, uint32_t> NativeCommandProcessor::MemoryInvalidationCallback(
-    uint32_t physical_address_start, uint32_t length, bool /*exact_range*/) {
+    uint32_t physical_address_start, uint32_t length, bool exact_range) {
   if (!length || physical_address_start >= kPhysicalMemorySize) {
     return {0, UINT32_MAX};
   }
@@ -597,6 +699,14 @@ std::pair<uint32_t, uint32_t> NativeCommandProcessor::MemoryInvalidationCallback
     // Only the tiny pending list is touched here; this runs on a guest thread
     // while the global critical region is held.
     std::lock_guard<std::mutex> lock(invalidation_mutex_);
+    if (!exact_range && !cached_texture_pages_.empty()) {
+      const auto [widened_start, widened_length] =
+          WidenInvalidationPageRange(cached_texture_pages_, physical_address_start, length);
+      if (widened_length) {
+        physical_address_start = widened_start;
+        length = widened_length;
+      }
+    }
     pending_invalidations_.emplace_back(physical_address_start, length);
     has_pending_invalidations_.store(true, std::memory_order_release);
   }
@@ -992,6 +1102,7 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
         [](const GuestTextureKey&, const CachedTextureEntry&) { return true; });
     if (victim) {
       cached_textures_.erase(*victim);
+      RebuildCachedTexturePages();
     }
   }
   if (!entry && cached_textures_.size() < kMaxCachedTextures) {
@@ -1019,6 +1130,15 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
             vulkan_device_, image, ui::vulkan::util::MemoryPurpose::kDeviceLocal, entry->image,
             entry->memory)) {
       return false;
+    }
+    if (!cached_texture_pages_.empty()) {
+      std::lock_guard<std::mutex> lock(invalidation_mutex_);
+      const auto [base_first, base_count] = GetPhysicalPageRange(address, base_length);
+      SetPageRangeBits(cached_texture_pages_, base_first, base_count);
+      if (mip_length) {
+        const auto [mip_first, mip_count] = GetPhysicalPageRange(mip_start, mip_length);
+        SetPageRangeBits(cached_texture_pages_, mip_first, mip_count);
+      }
     }
     // Watch the guest pages before reading them, so a write between the read and
     // the next frame invalidates this entry.
@@ -1372,6 +1492,12 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
 
+  DrainMemoryInvalidations();
+  const bool may_snapshot_fast_clear =
+      dimensions.msaa_samples == xenos::MsaaSamples::k4X &&
+      ((!use_color && use_depth && !ps) || rectangle);
+  const bool use_shared_vertices = shared_vertex_buffer_ != VK_NULL_HANDLE &&
+                                   !(expanded && index_buffer_info) && !may_snapshot_fast_clear;
   std::array<bool, 96> uploaded{};
   for (const auto& binding : vs.vertex_bindings()) {
     if (uploaded[binding.fetch_constant]) {
@@ -1381,17 +1507,23 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (fetch.type != xenos::FetchConstantType::kVertex) {
       return false;
     }
-    const auto bytes = ReadPhysical(fetch.address << 2, fetch.size << 2);
-    if (bytes.empty() || bytes.size() > properties.maxStorageBufferRange - input.vertices.size()) {
-      return false;
+    if (use_shared_vertices) {
+      if (!EnsureSharedVertexRange(fetch.address << 2, fetch.size << 2)) {
+        return false;
+      }
+    } else {
+      const auto bytes = ReadPhysical(fetch.address << 2, fetch.size << 2);
+      if (bytes.empty() || bytes.size() > properties.maxStorageBufferRange - input.vertices.size()) {
+        return false;
+      }
+      fetch.address = uint32_t(input.vertices.size() / sizeof(uint32_t));
+      std::memcpy(&input.fetch[binding.fetch_constant * 2], &fetch, sizeof(fetch));
+      input.vertices.insert(input.vertices.end(), bytes.begin(), bytes.end());
     }
-    fetch.address = uint32_t(input.vertices.size() / sizeof(uint32_t));
-    std::memcpy(&input.fetch[binding.fetch_constant * 2], &fetch, sizeof(fetch));
-    input.vertices.insert(input.vertices.end(), bytes.begin(), bytes.end());
     uploaded[binding.fetch_constant] = true;
   }
 
-  if (input.vertices.empty()) {
+  if (!use_shared_vertices && input.vertices.empty()) {
     input.vertices.resize(sizeof(uint32_t));
   }
 
@@ -1454,7 +1586,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   draw.pass = std::make_unique<DrawPass>(*vulkan_device_);
   const uint32_t shared_count = uint32_t(1) << translator_->GetSharedMemoryStorageBufferCountLog2();
   if (!draw.pass->Initialize(input, indices, vertex, pixel, shared_count, pipeline_cache_,
-                             pipelines_, draw_bindings_, *draw_uploads_, next_submission_)) {
+                             pipelines_, draw_bindings_, *draw_uploads_, next_submission_,
+                             use_shared_vertices ? shared_vertex_buffer_ : VK_NULL_HANDLE)) {
     return false;
   }
   pending_.emplace_back(std::move(draw));
@@ -2085,6 +2218,7 @@ bool NativeCommandProcessor::ReadBackResolve(const draw_util::ResolveInfo& copy,
     // The CPU wrote guest memory directly, bypassing the access-violation watch,
     // so anything cached from the written range is stale now.
     InvalidateTextures(address, end - address);
+    InvalidateSharedVertices(address, end - address);
   }
   return stored;
 }
@@ -2366,6 +2500,34 @@ bool NativeCommandProcessor::BeginCommands() {
   return true;
 }
 
+void NativeCommandProcessor::RecordBufferUploads(std::span<const FrameCommand> commands) {
+  const auto& vk = vulkan_device_->functions();
+  VkBufferMemoryBarrier pre{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+  pre.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  pre.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  pre.srcQueueFamilyIndex = pre.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  pre.buffer = shared_vertex_buffer_;
+  pre.offset = 0;
+  pre.size = VK_WHOLE_SIZE;
+  vk.vkCmdPipelineBarrier(command_buffer_,
+                          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &pre, 0, nullptr);
+  for (const auto& command : commands) {
+    const auto& upload = std::get<QueuedBufferUpload>(command);
+    const VkBufferCopy copy{upload.src_offset, upload.dst_offset, upload.size};
+    vk.vkCmdCopyBuffer(command_buffer_, upload.src_buffer, shared_vertex_buffer_, 1, &copy);
+  }
+  VkBufferMemoryBarrier post{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+  post.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  post.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  post.srcQueueFamilyIndex = post.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  post.buffer = shared_vertex_buffer_;
+  post.offset = 0;
+  post.size = VK_WHOLE_SIZE;
+  vk.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 0, nullptr, 1, &post, 0, nullptr);
+}
+
 size_t NativeCommandProcessor::RecordPending() {
   // Clear the fallback textures and move them to the shader-read layout once,
   // before any draw that may sample them.
@@ -2383,6 +2545,15 @@ size_t NativeCommandProcessor::RecordPending() {
       }
       RecordDraws(std::span(pending_).subspan(first, end - first));
       drawn += end - first;
+      first = end;
+    } else if (std::holds_alternative<QueuedBufferUpload>(command)) {
+      size_t end = first + 1;
+      for (; end < pending_.size(); ++end) {
+        if (!std::holds_alternative<QueuedBufferUpload>(pending_[end])) {
+          break;
+        }
+      }
+      RecordBufferUploads(std::span(pending_).subspan(first, end - first));
       first = end;
     } else {
       if (const auto* resolve = std::get_if<QueuedResolve>(&command)) {

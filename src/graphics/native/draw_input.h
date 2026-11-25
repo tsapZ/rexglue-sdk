@@ -20,6 +20,119 @@
 namespace rex::graphics::native {
 
 constexpr uint32_t kPhysicalMemorySize = 512 * 1024 * 1024;
+constexpr uint32_t kSharedVertexPageShift = 12;
+constexpr uint32_t kSharedVertexPageSize = 1u << kSharedVertexPageShift;
+constexpr uint32_t kSharedVertexPageCount = kPhysicalMemorySize >> kSharedVertexPageShift;
+
+constexpr std::pair<uint32_t, uint32_t> GetPhysicalPageRange(uint32_t address, uint32_t size) {
+  if (!size || address >= kPhysicalMemorySize) {
+    return {0, 0};
+  }
+  const uint32_t clamped_size = std::min(size, kPhysicalMemorySize - address);
+  const uint32_t first_page = address >> kSharedVertexPageShift;
+  const uint32_t last_page = (address + clamped_size - 1) >> kSharedVertexPageShift;
+  return {first_page, last_page - first_page + 1};
+}
+
+inline void ClearPageRangeBits(std::vector<uint64_t>& valid_words, uint32_t first_page,
+                               uint32_t page_count) {
+  if (!page_count) {
+    return;
+  }
+  const uint32_t end_page = std::min(first_page + page_count, uint32_t(valid_words.size() * 64));
+  for (uint32_t page = first_page; page < end_page;) {
+    const uint32_t word = page >> 6;
+    const uint32_t bit = page & 63;
+    const uint32_t count = std::min(64 - bit, end_page - page);
+    const uint64_t mask = (count == 64 ? ~uint64_t(0) : ((uint64_t(1) << count) - 1)) << bit;
+    valid_words[word] &= ~mask;
+    page += count;
+  }
+}
+
+inline void SetPageRangeBits(std::vector<uint64_t>& valid_words, uint32_t first_page,
+                             uint32_t page_count) {
+  if (!page_count) {
+    return;
+  }
+  const uint32_t end_page = std::min(first_page + page_count, uint32_t(valid_words.size() * 64));
+  for (uint32_t page = first_page; page < end_page;) {
+    const uint32_t word = page >> 6;
+    const uint32_t bit = page & 63;
+    const uint32_t count = std::min(64 - bit, end_page - page);
+    const uint64_t mask = (count == 64 ? ~uint64_t(0) : ((uint64_t(1) << count) - 1)) << bit;
+    valid_words[word] |= mask;
+    page += count;
+  }
+}
+
+inline bool FindNextInvalidPageRun(const std::vector<uint64_t>& valid_words, uint32_t& cursor,
+                                   uint32_t end_page, uint32_t& run_first_page,
+                                   uint32_t& run_page_count) {
+  const uint32_t limit = std::min(end_page, uint32_t(valid_words.size() * 64));
+  while (cursor < limit) {
+    const uint32_t word = cursor >> 6;
+    const uint32_t bit = cursor & 63;
+    const uint64_t inv = ~valid_words[word] & (~uint64_t(0) << bit);
+    if (!inv) {
+      cursor = (word + 1) << 6;
+      continue;
+    }
+    const uint32_t first = (word << 6) + uint32_t(std::countr_zero(inv));
+    if (first >= limit) {
+      cursor = limit;
+      return false;
+    }
+    run_first_page = first;
+    uint32_t end = first;
+    while (end < limit) {
+      const uint32_t w = end >> 6;
+      const uint32_t b = end & 63;
+      const uint64_t valid_mask = valid_words[w] >> b;
+      if (!valid_mask) {
+        end = std::min(limit, (w + 1) << 6);
+      } else {
+        end = std::min(limit, end + uint32_t(std::countr_zero(valid_mask)));
+        break;
+      }
+    }
+    run_page_count = end - first;
+    cursor = end;
+    return true;
+  }
+  return false;
+}
+
+inline std::pair<uint32_t, uint32_t> WidenInvalidationPageRange(
+    const std::vector<uint64_t>& protected_pages, uint32_t address, uint32_t length) {
+  if (!length || address >= kPhysicalMemorySize) {
+    return {0, 0};
+  }
+  const auto [initial_first, initial_count] = GetPhysicalPageRange(address, length);
+  if (!initial_count) {
+    return {0, 0};
+  }
+  uint32_t page_first = initial_first;
+  uint32_t page_last = initial_first + initial_count - 1;
+  const uint32_t block_first = page_first >> 6;
+  const uint32_t block_last = page_last >> 6;
+  const uint32_t max_blocks = uint32_t(protected_pages.size());
+  if (block_first < max_blocks && (page_first & 63) != 0) {
+    const uint64_t before =
+        protected_pages[block_first] & ((uint64_t(1) << (page_first & 63)) - 1);
+    page_first = (page_first & ~uint32_t(63)) + (64u - uint32_t(std::countl_zero(before)));
+  }
+  if (block_last < max_blocks && (page_last & 63) != 63) {
+    const uint64_t after =
+        protected_pages[block_last] & ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
+    page_last =
+        (page_last & ~uint32_t(63)) + (std::max(uint32_t(std::countr_zero(after)), 1u) - 1u);
+  }
+  const uint32_t widened_start = page_first << kSharedVertexPageShift;
+  const uint32_t widened_length = std::min((page_last - page_first + 1) << kSharedVertexPageShift,
+                                           kPhysicalMemorySize - widened_start);
+  return {widened_start, widened_length};
+}
 
 // Host sampler state derived from a guest sampler binding. Also the device-lifetime
 // cache key, so it must order identically to how it compares.

@@ -146,11 +146,15 @@ struct DrawBindings {
   explicit DrawBindings(const ui::vulkan::VulkanDevice& device) : device(device) {}
   ~DrawBindings();
   bool Initialize(uint32_t shared_count, uint32_t image_count, uint32_t sampler_count);
+  VkDescriptorSet GetOrCreateSharedVertexSet(VkBuffer buffer, uint32_t shared_count);
 
   const ui::vulkan::VulkanDevice& device;
   std::array<VkDescriptorSetLayout, 4> layouts{};
   std::array<std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool>, 4> pools;
   VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+  VkDescriptorSet shared_vertex_set = VK_NULL_HANDLE;
+  size_t shared_vertex_set_index = SIZE_MAX;
+  VkBuffer shared_vertex_buffer = VK_NULL_HANDLE;
 };
 
 using DrawBindingCache = std::map<std::array<uint32_t, 3>, std::unique_ptr<DrawBindings>>;
@@ -164,7 +168,8 @@ class DrawPass {
                   const Shader::Translation& vertex, const Shader::Translation* pixel,
                   uint32_t shared_buffer_count, VkPipelineCache pipeline_cache,
                   DrawPipelines& pipelines, DrawBindingCache& binding_cache,
-                  ui::vulkan::VulkanUploadBufferPool& uploads, uint64_t submission);
+                  ui::vulkan::VulkanUploadBufferPool& uploads, uint64_t submission,
+                  VkBuffer shared_vertex_buffer = VK_NULL_HANDLE);
   void Record(VkCommandBuffer commands, VkExtent2D extent);
   void RecordTextureUpload(VkCommandBuffer commands);
   const draw_util::Scissor& scissor() const { return scissor_; }

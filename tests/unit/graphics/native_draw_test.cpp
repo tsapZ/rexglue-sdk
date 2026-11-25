@@ -772,3 +772,81 @@ TEST_CASE("Native cached cropped resolve key and version gating", "[gpu][native]
   CHECK_FALSE(native::ShouldUploadResolvedCrop(true, 42, 42));
   CHECK(native::ShouldUploadResolvedCrop(true, 42, 43));
 }
+
+TEST_CASE("Native shared vertex page range tracking and invalidation", "[gpu][native]") {
+  const auto empty = native::GetPhysicalPageRange(0x1000u, 0);
+  CHECK(empty.first == 0u);
+  CHECK(empty.second == 0u);
+
+  const auto oob = native::GetPhysicalPageRange(native::kPhysicalMemorySize, 64);
+  CHECK(oob.first == 0u);
+  CHECK(oob.second == 0u);
+
+  const auto span = native::GetPhysicalPageRange(0x1800u, 0x2000u);
+  CHECK(span.first == 1u);
+  CHECK(span.second == 3u);
+
+  std::vector<uint64_t> valid(4, 0);
+  native::SetPageRangeBits(valid, 1, 3);
+  native::SetPageRangeBits(valid, 62, 5);
+  native::ClearPageRangeBits(valid, 2, 1);
+
+  uint32_t cursor = 0;
+  uint32_t run_first = 0;
+  uint32_t run_count = 0;
+  REQUIRE(native::FindNextInvalidPageRun(valid, cursor, 70, run_first, run_count));
+  CHECK(run_first == 0u);
+  CHECK(run_count == 1u);
+  REQUIRE(native::FindNextInvalidPageRun(valid, cursor, 70, run_first, run_count));
+  CHECK(run_first == 2u);
+  CHECK(run_count == 1u);
+  REQUIRE(native::FindNextInvalidPageRun(valid, cursor, 70, run_first, run_count));
+  CHECK(run_first == 4u);
+  CHECK(run_count == 58u);
+  REQUIRE(native::FindNextInvalidPageRun(valid, cursor, 70, run_first, run_count));
+  CHECK(run_first == 67u);
+  CHECK(run_count == 3u);
+  CHECK_FALSE(native::FindNextInvalidPageRun(valid, cursor, 70, run_first, run_count));
+}
+
+TEST_CASE("Native invalidation widening respects protected texture pages", "[gpu][native]") {
+  std::vector<uint64_t> protected_pages(4, 0);
+
+  // Unprotected 256 KiB block widens a single 4 KiB page to the full 64-page block.
+  const auto full_block = native::WidenInvalidationPageRange(protected_pages, 0x10000u, 4096u);
+  CHECK(full_block.first == 0u);
+  CHECK(full_block.second == 64u * 4096u);
+
+  // Protected pages at 5 and 40 constrain page 16 to [6, 39].
+  native::SetPageRangeBits(protected_pages, 5, 1);
+  native::SetPageRangeBits(protected_pages, 40, 1);
+  const auto bounded = native::WidenInvalidationPageRange(protected_pages, 0x10000u, 4096u);
+  CHECK(bounded.first == 6u * 4096u);
+  CHECK(bounded.second == 34u * 4096u);
+
+  // Adjacent protected pages at 15 and 17 constrain page 16 to [16, 16].
+  native::SetPageRangeBits(protected_pages, 15, 1);
+  native::SetPageRangeBits(protected_pages, 17, 1);
+  const auto tight = native::WidenInvalidationPageRange(protected_pages, 0x10000u, 4096u);
+  CHECK(tight.first == 16u * 4096u);
+  CHECK(tight.second == 4096u);
+
+  // Protected page on the invalidated page itself (16) with neighbor at 17 still includes 16.
+  std::fill(protected_pages.begin(), protected_pages.end(), 0);
+  native::SetPageRangeBits(protected_pages, 16, 2);
+  const auto self_protected = native::WidenInvalidationPageRange(protected_pages, 0x10000u, 4096u);
+  CHECK(self_protected.first == 0u);
+  CHECK(self_protected.second == 17u * 4096u);
+
+  // Empty protected_pages leaves the range page-aligned without widening.
+  const std::vector<uint64_t> empty_protected;
+  const auto no_widen = native::WidenInvalidationPageRange(empty_protected, 0x10000u, 4096u);
+  CHECK(no_widen.first == 0x10000u);
+  CHECK(no_widen.second == 4096u);
+
+  // End of 512 MiB physical memory clamps safely without overflow.
+  const auto end_clamped =
+      native::WidenInvalidationPageRange(empty_protected, native::kPhysicalMemorySize - 4096u, 4096u);
+  CHECK(end_clamped.first == native::kPhysicalMemorySize - 4096u);
+  CHECK(end_clamped.second == 4096u);
+}
