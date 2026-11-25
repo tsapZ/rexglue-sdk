@@ -395,6 +395,23 @@ constexpr bool IsEdramDepthClearToColor(xenos::DepthRenderTargetFormat depth_for
          stencil_write_mask == 0xFF;
 }
 
+// D3D9 also clears 1x/2x color (including 64bpp) and depth/stencil targets
+// with a 4x-MSAA kColorDepth rectangle-list draw using a constant-color
+// pixel shader, clip disabled, blending off, and ALWAYS depth/stencil tests.
+constexpr bool IsAliased4xColorDepthClear(bool use_color, bool has_pixel_shader,
+                                          bool has_textures, xenos::PrimitiveType prim_type,
+                                          xenos::MsaaSamples samples, bool clip_disable,
+                                          bool any_blend_enabled, bool use_depth,
+                                          reg::RB_DEPTHCONTROL depth_control) {
+  return use_color && has_pixel_shader && !has_textures &&
+         prim_type == xenos::PrimitiveType::kRectangleList &&
+         samples == xenos::MsaaSamples::k4X && clip_disable && !any_blend_enabled &&
+         (!use_depth ||
+          ((!depth_control.z_enable || depth_control.zfunc == xenos::CompareFunction::kAlways) &&
+           (!depth_control.stencil_enable ||
+            depth_control.stencilfunc == xenos::CompareFunction::kAlways)));
+}
+
 // Index of the shader packing mode that unpacks a 32-bit EDRAM clear color into
 // an aliased color target of this host format, matching the format indices used
 // by ColorResolve.

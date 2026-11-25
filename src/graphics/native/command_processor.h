@@ -89,6 +89,14 @@ class NativeCommandProcessor : public CommandProcessor {
     bool color_clear_capable = false;
     uint32_t clear_stencil = 0;
   };
+  struct PendingColorFastClear {
+    DrawInput input;
+    std::vector<uint32_t> indices;
+    const Shader::Translation* vertex = nullptr;
+    const Shader::Translation* pixel = nullptr;
+    uint32_t rt_index = 0;
+    bool is_64bpp = false;
+  };
 
   struct CachedImage {
     std::shared_ptr<ColorImage> image;
@@ -131,6 +139,12 @@ class NativeCommandProcessor : public CommandProcessor {
   // is compatible with the newly created image, then drops it.
   void ApplyPendingFastClear(uint32_t tile, uint32_t pitch_tiles, xenos::MsaaSamples samples,
                              const std::shared_ptr<ColorImage>& image);
+  void ReplayAliasedColorFastClear(const PendingColorFastClear& clear,
+                                   const std::shared_ptr<ColorImage>& image,
+                                   xenos::MsaaSamples samples);
+  void ApplyPendingColorFastClear(uint32_t tile, uint32_t pitch_tiles, xenos::MsaaSamples samples,
+                                  VkFormat format, const std::shared_ptr<ColorImage>& image);
+  void ErasePendingColorFastClears(uint32_t tile, uint32_t pitch_tiles);
   VkFormat GetDepthFormat(xenos::DepthRenderTargetFormat format) const;
   bool BeginCommands();
   size_t RecordPending();
@@ -172,6 +186,8 @@ class NativeCommandProcessor : public CommandProcessor {
   VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
   std::map<std::tuple<uint32_t, uint32_t, xenos::MsaaSamples, VkFormat>, CachedImage> targets_;
   std::map<std::pair<uint32_t, uint32_t>, PendingFastClear> pending_fast_clears_;
+  std::map<std::tuple<uint32_t, uint32_t, VkFormat>, PendingColorFastClear>
+      pending_color_fast_clears_;
   std::unordered_map<uint32_t, CachedResolve> resolved_images_;
   std::unordered_map<DrawSampler, CachedSampler, DrawSamplerHash> samplers_;
   std::unordered_map<GuestTextureKey, CachedTextureEntry, GuestTextureKeyHash> cached_textures_;

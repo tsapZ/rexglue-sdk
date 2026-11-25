@@ -392,6 +392,7 @@ void NativeCommandProcessor::ShutdownContext() {
   presented_resolve_address_.reset();
   resolved_images_.clear();
   pending_fast_clears_.clear();
+  pending_color_fast_clears_.clear();
   targets_.clear();
   DestroyNullTextures();
   for (const auto& entry : pipelines_) {
@@ -1332,6 +1333,10 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   const auto layout = ActiveEdramLayout();
   const uint32_t writes =
       use_color ? draw_util::GetNormalizedColorMask(regs, ps->writes_color_targets()) : 0;
+  std::array<bool, xenos::kMaxColorRenderTargets> bound_rt{};
+  std::array<uint32_t, xenos::kMaxColorRenderTargets> bound_rt_tile{};
+  std::array<bool, xenos::kMaxColorRenderTargets> bound_rt_64bpp{};
+  bool any_blend_enabled = false;
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
     const uint32_t mask = (writes >> (i * 4)) & 15;
     if (!mask) {
@@ -1344,9 +1349,10 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         (!vulkan_device_->properties().independentBlend && i != 0)) {
       return false;
     }
-    draw.colors[i] = FindTarget(layout.DecodeBase(target.value), dimensions.surface_pitch,
-                                dimensions.msaa_samples, format, VK_IMAGE_ASPECT_COLOR_BIT,
-                                xenos::IsColorRenderTargetFormat64bpp(target.color_format));
+    const uint32_t rt_tile = layout.DecodeBase(target.value);
+    const bool rt_is_64bpp = xenos::IsColorRenderTargetFormat64bpp(target.color_format);
+    draw.colors[i] = FindTarget(rt_tile, dimensions.surface_pitch, dimensions.msaa_samples,
+                                format, VK_IMAGE_ASPECT_COLOR_BIT, rt_is_64bpp);
     if (!draw.colors[i]) {
       return false;
     }
@@ -1355,6 +1361,10 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       draw.colors[i].reset();
       continue;
     }
+    bound_rt[i] = true;
+    bound_rt_tile[i] = rt_tile;
+    bound_rt_64bpp[i] = rt_is_64bpp;
+    any_blend_enabled |= blend->blendEnable != VK_FALSE;
     input.blend[i] = *blend;
     input.color_formats[i] = format;
     input.system.color_exp_bias[i] = std::ldexp(1.0f, target.color_exp_bias);
@@ -1399,6 +1409,10 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // targets created later start out cleared instead of uninitialized.
   const bool aliased_4x_depth_clear =
       !use_color && use_depth && dimensions.msaa_samples == xenos::MsaaSamples::k4X && !ps;
+  const bool aliased_4x_color_depth_clear = IsAliased4xColorDepthClear(
+      use_color, pixel != nullptr, !input.textures.empty(), prim_type, dimensions.msaa_samples,
+      regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable != 0, any_blend_enabled, use_depth,
+      depth_control);
   const uint32_t depth_tile = layout.DecodeBase(depth_info.value);
   const uint32_t pitch_tiles_4x =
       xenos::GetSurfacePitchTiles(dimensions.surface_pitch, xenos::MsaaSamples::k4X, false);
@@ -1439,19 +1453,130 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       ReplayAliasedFastClear(clear, image, samples);
     }
     pending_fast_clears_.insert_or_assign({depth_tile, pitch_tiles_4x}, std::move(clear));
-  } else if (!aliased_4x_depth_clear) {
+    if (clear.color_clear_capable) {
+      ErasePendingColorFastClears(depth_tile, pitch_tiles_4x);
+    }
+  } else if (aliased_4x_color_depth_clear) {
+    if (use_depth && pitch_tiles_4x) {
+      const Shader::Translation* depth_vs = &vertex;
+      if (interpolators != 0) {
+        auto depth_vs_mod = vertex_modification;
+        depth_vs_mod.vertex.interpolator_mask = 0;
+        auto* candidate_depth_vs = vs.GetOrCreateTranslation(depth_vs_mod.value);
+        if (candidate_depth_vs &&
+            (candidate_depth_vs->is_translated() ||
+             translator_->TranslateAnalyzedShader(*candidate_depth_vs)) &&
+            candidate_depth_vs->is_valid()) {
+          depth_vs = candidate_depth_vs;
+        }
+      }
+      PendingFastClear clear;
+      clear.input = input;
+      clear.input.color_count = 0;
+      clear.input.color_formats.fill(VK_FORMAT_UNDEFINED);
+      clear.input.blend = {};
+      clear.input.float_constants[1].clear();
+      clear.input.system.flags &= ~(uint32_t(0xF) << Translator::kSysFlag_ConvertColor0ToGamma_Shift);
+      clear.indices = indices;
+      clear.vertex = depth_vs;
+      clear.depth_format = depth_info.depth_format;
+      clear.color_clear_capable = false;
+      clear.clear_stencil = 0;
+      std::vector<std::pair<std::shared_ptr<ColorImage>, xenos::MsaaSamples>> depth_aliases;
+      for (auto& [target_key, entry] : targets_) {
+        const uint32_t tile = std::get<0>(target_key);
+        const uint32_t pitch = std::get<1>(target_key);
+        const xenos::MsaaSamples samples = std::get<2>(target_key);
+        if (tile != depth_tile || samples >= xenos::MsaaSamples::k4X ||
+            xenos::GetSurfacePitchTiles(pitch, samples, false) != pitch_tiles_4x) {
+          continue;
+        }
+        if ((entry.image->aspects() & VK_IMAGE_ASPECT_DEPTH_BIT) == 0 ||
+            entry.image->format() != input.depth_format) {
+          continue;
+        }
+        entry.last_use_submission = next_submission_;
+        depth_aliases.emplace_back(entry.image, samples);
+      }
+      for (const auto& [image, samples] : depth_aliases) {
+        ReplayAliasedFastClear(clear, image, samples);
+      }
+      pending_fast_clears_.insert_or_assign({depth_tile, pitch_tiles_4x}, std::move(clear));
+    }
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if (!bound_rt[i]) {
+        continue;
+      }
+      const uint32_t rt_tile = bound_rt_tile[i];
+      const bool rt_is_64bpp = bound_rt_64bpp[i];
+      const VkFormat rt_format = input.color_formats[i];
+      const uint32_t rt_pitch_tiles_4x =
+          xenos::GetSurfacePitchTiles(dimensions.surface_pitch, xenos::MsaaSamples::k4X, rt_is_64bpp);
+      if (!rt_pitch_tiles_4x) {
+        continue;
+      }
+      PendingColorFastClear color_clear;
+      color_clear.input = input;
+      color_clear.input.depth_format = VK_FORMAT_UNDEFINED;
+      color_clear.input.depth_stencil = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+      color_clear.input.color_count = i + 1;
+      for (uint32_t j = 0; j < xenos::kMaxColorRenderTargets; ++j) {
+        if (j != i) {
+          color_clear.input.color_formats[j] = VK_FORMAT_UNDEFINED;
+          color_clear.input.blend[j] = {};
+        }
+      }
+      color_clear.indices = indices;
+      color_clear.vertex = &vertex;
+      color_clear.pixel = pixel;
+      color_clear.rt_index = i;
+      color_clear.is_64bpp = rt_is_64bpp;
+      std::vector<std::pair<std::shared_ptr<ColorImage>, xenos::MsaaSamples>> color_aliases;
+      for (auto& [target_key, entry] : targets_) {
+        const uint32_t tile = std::get<0>(target_key);
+        const uint32_t pitch = std::get<1>(target_key);
+        const xenos::MsaaSamples samples = std::get<2>(target_key);
+        const VkFormat fmt = std::get<3>(target_key);
+        if (tile != rt_tile || samples >= xenos::MsaaSamples::k4X || fmt != rt_format ||
+            (entry.image->aspects() & VK_IMAGE_ASPECT_COLOR_BIT) == 0 ||
+            xenos::GetSurfacePitchTiles(pitch, samples, rt_is_64bpp) != rt_pitch_tiles_4x) {
+          continue;
+        }
+        entry.last_use_submission = next_submission_;
+        color_aliases.emplace_back(entry.image, samples);
+      }
+      for (const auto& [image, samples] : color_aliases) {
+        ReplayAliasedColorFastClear(color_clear, image, samples);
+      }
+      pending_color_fast_clears_.insert_or_assign({rt_tile, rt_pitch_tiles_4x, rt_format},
+                                                  std::move(color_clear));
+      if (!rt_is_64bpp) {
+        if (auto fc = pending_fast_clears_.find({rt_tile, rt_pitch_tiles_4x});
+            fc != pending_fast_clears_.end()) {
+          fc->second.color_clear_capable = false;
+        }
+      }
+    }
+  } else if (!aliased_4x_depth_clear && !aliased_4x_color_depth_clear) {
     // Any ordinary draw at a tile consumes its pending fast clear.
     const uint32_t pitch_tiles =
         xenos::GetSurfacePitchTiles(dimensions.surface_pitch, dimensions.msaa_samples, false);
-    if (pitch_tiles) {
-      if (use_depth) {
-        pending_fast_clears_.erase({depth_tile, pitch_tiles});
-      }
-      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-        if ((writes >> (i * 4)) & 15) {
-          const auto target =
-              regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
-          pending_fast_clears_.erase({layout.DecodeBase(target.value), pitch_tiles});
+    if (pitch_tiles && use_depth) {
+      pending_fast_clears_.erase({depth_tile, pitch_tiles});
+    }
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if ((writes >> (i * 4)) & 15) {
+        const auto target =
+            regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+        const uint32_t rt_tile = layout.DecodeBase(target.value);
+        if (pitch_tiles) {
+          pending_fast_clears_.erase({rt_tile, pitch_tiles});
+        }
+        const uint32_t rt_pitch_tiles = xenos::GetSurfacePitchTiles(
+            dimensions.surface_pitch, dimensions.msaa_samples,
+            xenos::IsColorRenderTargetFormat64bpp(target.color_format));
+        if (rt_pitch_tiles) {
+          ErasePendingColorFastClears(rt_tile, rt_pitch_tiles);
         }
       }
     }
@@ -1549,6 +1674,66 @@ void NativeCommandProcessor::ApplyPendingFastClear(uint32_t tile, uint32_t pitch
   }
 }
 
+void NativeCommandProcessor::ReplayAliasedColorFastClear(const PendingColorFastClear& clear,
+                                                          const std::shared_ptr<ColorImage>& image,
+                                                          xenos::MsaaSamples samples) {
+  const auto scale = GetMsaa4xAliasScale(samples);
+  const auto& properties = vulkan_device_->properties();
+  std::array<float, 3> ndc_scale;
+  std::array<float, 3> ndc_offset;
+  std::copy(std::begin(clear.input.viewport.ndc_scale), std::end(clear.input.viewport.ndc_scale),
+            ndc_scale.begin());
+  std::copy(std::begin(clear.input.viewport.ndc_offset), std::end(clear.input.viewport.ndc_offset),
+            ndc_offset.begin());
+
+  DrawInput input = clear.input;
+  input.samples = VkSampleCountFlagBits(1u << uint32_t(samples));
+  constexpr uint32_t kMsaaSamplesFlagMask =
+      ((1u << xenos::kMsaaSamplesBits) - 1u) << Translator::kSysFlag_MsaaSamples_Shift;
+  input.system.flags = (clear.input.system.flags & ~kMsaaSamplesFlagMask) |
+                       (uint32_t(samples) << Translator::kSysFlag_MsaaSamples_Shift);
+  ScaleViewportAndScissor(input.viewport, input.scissor, ndc_scale, ndc_offset, scale.x, scale.y,
+                          properties.maxViewportDimensions[0], properties.maxViewportDimensions[1]);
+  std::copy(ndc_scale.begin(), ndc_scale.end(), input.viewport.ndc_scale);
+  std::copy(ndc_offset.begin(), ndc_offset.end(), input.viewport.ndc_offset);
+  std::copy(ndc_scale.begin(), ndc_scale.end(), input.system.ndc_scale);
+  std::copy(ndc_offset.begin(), ndc_offset.end(), input.system.ndc_offset);
+
+  QueuedDraw draw{};
+  draw.colors[clear.rt_index] = image;
+  draw.color_count = clear.rt_index + 1;
+  draw.pass = std::make_unique<DrawPass>(*vulkan_device_);
+  const uint32_t shared_count = uint32_t(1) << translator_->GetSharedMemoryStorageBufferCountLog2();
+  if (!draw.pass->Initialize(input, clear.indices, *clear.vertex, clear.pixel, shared_count,
+                             pipeline_cache_, pipelines_, draw_bindings_, *draw_uploads_,
+                             next_submission_)) {
+    return;
+  }
+  pending_.emplace_back(std::move(draw));
+}
+
+void NativeCommandProcessor::ApplyPendingColorFastClear(uint32_t tile, uint32_t pitch_tiles,
+                                                         xenos::MsaaSamples samples,
+                                                         VkFormat format,
+                                                         const std::shared_ptr<ColorImage>& image) {
+  if (samples >= xenos::MsaaSamples::k4X || !pitch_tiles) {
+    return;
+  }
+  const auto pending = pending_color_fast_clears_.find({tile, pitch_tiles, format});
+  if (pending == pending_color_fast_clears_.end()) {
+    return;
+  }
+  ReplayAliasedColorFastClear(pending->second, image, samples);
+}
+
+void NativeCommandProcessor::ErasePendingColorFastClears(uint32_t tile, uint32_t pitch_tiles) {
+  for (auto it = pending_color_fast_clears_.lower_bound({tile, pitch_tiles, VK_FORMAT_UNDEFINED});
+       it != pending_color_fast_clears_.end() && std::get<0>(it->first) == tile &&
+       std::get<1>(it->first) == pitch_tiles;) {
+    it = pending_color_fast_clears_.erase(it);
+  }
+}
+
 std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, uint32_t pitch,
                                                                xenos::MsaaSamples samples,
                                                                VkFormat format,
@@ -1588,6 +1773,10 @@ std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, ui
   targets_.emplace(key, CachedImage{image, next_submission_});
   if (!is_64bpp) {
     ApplyPendingFastClear(tile, xenos::GetSurfacePitchTiles(pitch, samples, false), samples, image);
+  }
+  if ((aspects & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
+    ApplyPendingColorFastClear(tile, xenos::GetSurfacePitchTiles(pitch, samples, is_64bpp), samples,
+                               format, image);
   }
   return image;
 }
@@ -1681,6 +1870,11 @@ bool NativeCommandProcessor::IssueCopy() {
     }
     if (copy.IsClearingColor() || !depth) {
       pending_fast_clears_.erase({copy.color_original_base, copy_pitch_tiles});
+      const uint32_t color_copy_pitch_tiles =
+          xenos::GetSurfacePitchTiles(surface_info.surface_pitch, samples, color_is_64bpp);
+      if (color_copy_pitch_tiles) {
+        ErasePendingColorFastClears(copy.color_original_base, color_copy_pitch_tiles);
+      }
     }
   }
   const auto source_extent = source->extent();
@@ -1839,6 +2033,7 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
   rendering.colorAttachmentCount = draw.color_count;
   rendering.pColorAttachments = colors.data();
   bool needs_full_clear = false;
+  VkExtent2D attachment_extent{UINT32_MAX, UINT32_MAX};
   for (uint32_t i = 0; i < draw.color_count; ++i) {
     auto& color = colors[i];
     color.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -1846,7 +2041,9 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
     if (!image) {
       continue;
     }
-    rendering.renderArea.extent = image->extent();
+    const auto ext = image->extent();
+    attachment_extent.width = std::min(attachment_extent.width, ext.width);
+    attachment_extent.height = std::min(attachment_extent.height, ext.height);
     color.loadOp = image->initialized() ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
     needs_full_clear |= color.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
     color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -1857,7 +2054,9 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
                       VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
   }
   if (draw.depth) {
-    rendering.renderArea.extent = draw.depth->extent();
+    const auto ext = draw.depth->extent();
+    attachment_extent.width = std::min(attachment_extent.width, ext.width);
+    attachment_extent.height = std::min(attachment_extent.height, ext.height);
     depth.loadOp =
         draw.depth->initialized() ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
     needs_full_clear |= depth.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -1872,7 +2071,10 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
     rendering.pDepthAttachment = rendering.pStencilAttachment = &depth;
   }
-  const VkExtent2D attachment_extent = rendering.renderArea.extent;
+  if (attachment_extent.width == UINT32_MAX) {
+    attachment_extent = {};
+  }
+  rendering.renderArea.extent = attachment_extent;
   if (!needs_full_clear) {
     VkExtent2D covered{};
     for (const auto& command : commands) {

@@ -702,3 +702,60 @@ TEST_CASE("Native depth format falls back when D24_UNORM_S8_UINT is unsupported"
   CHECK(native::SelectDepthFormat(xenos::DepthRenderTargetFormat::kD24FS8, false) ==
         VK_FORMAT_D32_SFLOAT_S8_UINT);
 }
+
+TEST_CASE("Native 4x-MSAA kColorDepth fast-clear detection and 64bpp pitch alias parity",
+          "[gpu][native]") {
+  reg::RB_DEPTHCONTROL depth{};
+  depth.z_enable = 1;
+  depth.z_write_enable = 1;
+  depth.zfunc = xenos::CompareFunction::kAlways;
+  depth.stencil_enable = 1;
+  depth.stencilfunc = xenos::CompareFunction::kAlways;
+
+  // Color + depth, color-only, and stencil-only 4x-MSAA rectangle clears.
+  CHECK(native::IsAliased4xColorDepthClear(true, true, false,
+                                            xenos::PrimitiveType::kRectangleList,
+                                            xenos::MsaaSamples::k4X, true, false, true, depth));
+  CHECK(native::IsAliased4xColorDepthClear(true, true, false,
+                                            xenos::PrimitiveType::kRectangleList,
+                                            xenos::MsaaSamples::k4X, true, false, false, depth));
+  reg::RB_DEPTHCONTROL stencil_only{};
+  stencil_only.stencil_enable = 1;
+  stencil_only.stencilfunc = xenos::CompareFunction::kAlways;
+  CHECK(native::IsAliased4xColorDepthClear(
+      true, true, false, xenos::PrimitiveType::kRectangleList, xenos::MsaaSamples::k4X, true,
+      false, true, stencil_only));
+
+  // Rejects when any non-clear condition is present.
+  CHECK_FALSE(native::IsAliased4xColorDepthClear(
+      true, true, false, xenos::PrimitiveType::kRectangleList, xenos::MsaaSamples::k4X, true,
+      true, true, depth));
+  CHECK_FALSE(native::IsAliased4xColorDepthClear(
+      true, true, true, xenos::PrimitiveType::kRectangleList, xenos::MsaaSamples::k4X, true,
+      false, true, depth));
+  CHECK_FALSE(native::IsAliased4xColorDepthClear(
+      true, true, false, xenos::PrimitiveType::kRectangleList, xenos::MsaaSamples::k4X, false,
+      false, true, depth));
+  CHECK_FALSE(native::IsAliased4xColorDepthClear(
+      true, true, false, xenos::PrimitiveType::kRectangleList, xenos::MsaaSamples::k1X, true,
+      false, true, depth));
+  CHECK_FALSE(native::IsAliased4xColorDepthClear(
+      true, true, false, xenos::PrimitiveType::kTriangleList, xenos::MsaaSamples::k4X, true,
+      false, true, depth));
+  depth.zfunc = xenos::CompareFunction::kGreaterEqual;
+  CHECK_FALSE(native::IsAliased4xColorDepthClear(
+      true, true, false, xenos::PrimitiveType::kRectangleList, xenos::MsaaSamples::k4X, true,
+      false, true, depth));
+  depth.zfunc = xenos::CompareFunction::kAlways;
+  depth.stencilfunc = xenos::CompareFunction::kEqual;
+  CHECK_FALSE(native::IsAliased4xColorDepthClear(
+      true, true, false, xenos::PrimitiveType::kRectangleList, xenos::MsaaSamples::k4X, true,
+      false, true, depth));
+
+  // 64bpp 4x->1x pitch tile parity and alias scale.
+  CHECK(xenos::GetSurfacePitchTiles(640, xenos::MsaaSamples::k4X, true) ==
+        xenos::GetSurfacePitchTiles(1280, xenos::MsaaSamples::k1X, true));
+  const auto scale_1x = native::GetMsaa4xAliasScale(xenos::MsaaSamples::k1X);
+  CHECK(scale_1x.x == 2);
+  CHECK(scale_1x.y == 2);
+}
