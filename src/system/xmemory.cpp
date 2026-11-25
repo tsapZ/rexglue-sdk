@@ -16,6 +16,11 @@
 #if REX_PLATFORM_MAC
 #include <sys/mman.h>
 #endif
+#if REX_PLATFORM_LINUX
+#include <sys/stat.h>
+#include <filesystem>
+#include <string>
+#endif
 
 #include <fmt/format.h>
 
@@ -131,7 +136,40 @@ Memory::~Memory() {
   physical_membase_ = nullptr;
 }
 
+#if REX_PLATFORM_LINUX
+// Earlier runs' guest memory left in /dev/shm: before CreateFileMappingHandle unlinked its name at
+// once, every run that crashed or quit through _Exit (a closed window) left its object there, with
+// all the pages it had used, until a reboot. With /dev/shm full (half the RAM), the next start died
+// with SIGBUS on its first new page (Core of Light #135). Removing the names is safe while such a
+// run is still going: its mapping keeps the memory until it ends.
+static void RemoveLeftoverGuestMemory() {
+  std::error_code ec;
+  int count = 0;
+  uint64_t bytes = 0;
+  for (const auto& entry : std::filesystem::directory_iterator("/dev/shm", ec)) {
+    const std::string name = entry.path().filename().string();
+    if (name.rfind("xenia_memory_", 0) != 0) {
+      continue;
+    }
+    struct stat st {};
+    const bool sized = ::stat(entry.path().c_str(), &st) == 0;
+    std::error_code remove_ec;
+    if (std::filesystem::remove(entry.path(), remove_ec)) {
+      ++count;
+      bytes += sized ? uint64_t(st.st_blocks) * 512 : 0;
+    }
+  }
+  if (count) {
+    REXSYS_INFO("Guest memory: removed {} file(s) of earlier runs from /dev/shm ({} MB)", count,
+                bytes >> 20);
+  }
+}
+#endif
+
 bool Memory::Initialize() {
+#if REX_PLATFORM_LINUX
+  RemoveLeftoverGuestMemory();
+#endif
   file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
 
   // Create main page file-backed mapping. This is all reserved but
