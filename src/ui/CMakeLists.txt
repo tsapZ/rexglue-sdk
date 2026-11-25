@@ -116,12 +116,17 @@ target_link_libraries(rexui PUBLIC
 )
 target_link_libraries(rexui PRIVATE utf8cpp)
 
+# REX_HAS_FIDELITYFX_SDK turns on the presenters' CAS and FSR 1 (present_effect cas / fsr). They need nothing of the
+# fetched FidelityFX SDK: their shaders are prebuilt in src/ui/shaders and their constants are the presenters' own
+# structs. The SDK only brings the FSR 2/3 runtime (REX_HAS_FIDELITYFX_RUNTIME below), whose shaders need
+# FidelityFX_SC.exe, a Windows program (Wine on Linux); without it fsr2/fsr3 fall back to spatial FSR. So CAS and FSR 1
+# stay on in every build (2026-11-25: the Linux builds, which don't fetch the SDK, took present_effect bilinear only).
+target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
 if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include")
     target_include_directories(rexui PRIVATE
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include"
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/ffx-api/include"
     )
-    target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
 endif()
 
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)
