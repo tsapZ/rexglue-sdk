@@ -121,7 +121,8 @@ class NativeCommandProcessor : public CommandProcessor {
                                                            uint32_t length, bool exact_range);
 
   std::shared_ptr<ColorImage> FindTarget(uint32_t tile, uint32_t pitch, xenos::MsaaSamples samples,
-                                         VkFormat format, VkImageAspectFlags aspects);
+                                         VkFormat format, VkImageAspectFlags aspects,
+                                         bool is_64bpp = false);
   // Replays an aliased 4x-MSAA fast clear onto a 1x/2x target that already
   // exists (depth or color), appending the queued draw to pending_.
   void ReplayAliasedFastClear(const PendingFastClear& clear, const std::shared_ptr<ColorImage>& image,

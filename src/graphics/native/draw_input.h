@@ -108,6 +108,8 @@ constexpr uint32_t TextureChannelCount(xenos::TextureFormat format) {
     case xenos::TextureFormat::k_16_16_FLOAT:
     case xenos::TextureFormat::k_DXN:
       return 2;
+    case xenos::TextureFormat::k_5_6_5:
+      return 3;
     default:
       return 4;
   }
@@ -132,7 +134,7 @@ constexpr VkComponentMapping MakeTextureComponentMapping(uint32_t fetch_swizzle,
       first,
       channel_count == 1 ? r : g,
       channel_count == 1 ? r : channel_count == 2 ? g : third,
-      channel_count == 1 ? r : channel_count == 2 ? g : a,
+      channel_count == 1 ? r : channel_count == 2 ? g : channel_count == 3 ? third : a,
       VK_COMPONENT_SWIZZLE_ZERO,
       VK_COMPONENT_SWIZZLE_ONE,
       VK_COMPONENT_SWIZZLE_ZERO,
@@ -152,7 +154,8 @@ constexpr uint32_t PackTextureComponentMapping(VkComponentMapping mapping) {
 // maps directly onto them without a separate SNORM view.
 constexpr bool IsFloatTextureFormat(xenos::TextureFormat format) {
   return format == xenos::TextureFormat::k_32_FLOAT ||
-         format == xenos::TextureFormat::k_16_16_FLOAT;
+         format == xenos::TextureFormat::k_16_16_FLOAT ||
+         format == xenos::TextureFormat::k_16_16_16_16_FLOAT;
 }
 
 // A fetch constant that cannot produce texels - not a texture fetch, no base
@@ -314,8 +317,9 @@ inline bool IsResolveFormatConvertSupported(const draw_util::ResolveInfo& copy,
 
 // shortcut: cap attachments to full tile rows until native EDRAM supports split images.
 constexpr uint32_t GetTargetHeight(uint32_t pitch, xenos::MsaaSamples samples,
-                                   uint32_t tile_count, uint32_t max_height) {
-  const uint32_t tiles_per_row = xenos::GetSurfacePitchTiles(pitch, samples, false);
+                                   uint32_t tile_count, uint32_t max_height,
+                                   bool is_64bpp = false) {
+  const uint32_t tiles_per_row = xenos::GetSurfacePitchTiles(pitch, samples, is_64bpp);
   if (!tiles_per_row) {
     return 0;
   }
@@ -491,8 +495,11 @@ inline std::optional<ResolveRectangle> GetResolveRectangle(const draw_util::Reso
   }
   const uint32_t base = depth ? copy.depth_original_base : copy.color_original_base;
   const uint32_t tiles = layout.Wrap(target.base_tiles - base);
+  const bool is_64bpp =
+      !depth && xenos::IsColorRenderTargetFormat64bpp(
+                    xenos::ColorRenderTargetFormat(copy.color_edram_info.format));
   const uint32_t tile_width =
-      xenos::kEdramTileWidthSamples >> (target.msaa_samples >= xenos::MsaaSamples::k4X);
+      xenos::kEdramTileWidthSamples >> ((target.msaa_samples >= xenos::MsaaSamples::k4X) + is_64bpp);
   const uint32_t tile_height =
       xenos::kEdramTileHeightSamples >> (target.msaa_samples >= xenos::MsaaSamples::k2X);
   const ResolveRectangle rect{

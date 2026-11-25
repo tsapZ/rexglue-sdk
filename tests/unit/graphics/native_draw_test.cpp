@@ -257,12 +257,21 @@ TEST_CASE("Native texture channel counts drive swizzle replication", "[gpu][nati
   CHECK(native::TextureChannelCount(TextureFormat::k_8_8_8_8) == 4);
   CHECK(native::TextureChannelCount(TextureFormat::k_2_10_10_10) == 4);
   CHECK(native::TextureChannelCount(TextureFormat::k_DXT1) == 4);
+  // Three-channel k_5_6_5 swaps R and B and replicates the 3rd channel into A.
+  CHECK(native::TextureChannelCount(TextureFormat::k_5_6_5) == 3);
+  const auto k565_swizzle = native::MakeTextureComponentMapping(
+      xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA, 3, true);
+  CHECK(k565_swizzle.r == VK_COMPONENT_SWIZZLE_B);
+  CHECK(k565_swizzle.g == VK_COMPONENT_SWIZZLE_G);
+  CHECK(k565_swizzle.b == VK_COMPONENT_SWIZZLE_R);
+  CHECK(k565_swizzle.a == VK_COMPONENT_SWIZZLE_R);
 }
 
 TEST_CASE("Native signed fetches only pass through float formats", "[gpu][native]") {
   using xenos::TextureFormat;
   CHECK(native::IsFloatTextureFormat(TextureFormat::k_32_FLOAT));
   CHECK(native::IsFloatTextureFormat(TextureFormat::k_16_16_FLOAT));
+  CHECK(native::IsFloatTextureFormat(TextureFormat::k_16_16_16_16_FLOAT));
   CHECK_FALSE(native::IsFloatTextureFormat(TextureFormat::k_8_8_8_8));
   CHECK_FALSE(native::IsFloatTextureFormat(TextureFormat::k_8_8));
   CHECK_FALSE(native::IsFloatTextureFormat(TextureFormat::k_DXN));
@@ -374,6 +383,27 @@ TEST_CASE("Native resolve rectangles use multisample tile dimensions", "[gpu][na
   CHECK(rect->x == 40);
   CHECK(rect->y == 8);
   CHECK(rect->width == 24);
+}
+
+TEST_CASE("Native 64bpp targets halve EDRAM tile width and target height", "[gpu][native]") {
+  // At 1280px pitch, 32bpp uses 16 tiles/row (2048/16*16 = 2048px) while 64bpp
+  // uses 32 tiles/row (2048/32*16 = 1024px).
+  CHECK(native::GetTargetHeight(1280, xenos::MsaaSamples::k1X, 2048, 8192, false) == 2048);
+  CHECK(native::GetTargetHeight(1280, xenos::MsaaSamples::k1X, 2048, 8192, true) == 1024);
+
+  draw_util::ResolveInfo copy{};
+  copy.color_edram_info.format =
+      uint32_t(xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT);
+  copy.color_edram_info.pitch_tiles = 32;
+  copy.color_edram_info.base_tiles = 33;
+  copy.color_edram_info.msaa_samples = xenos::MsaaSamples::k1X;
+  copy.color_original_base = 0;
+  copy.coordinate_info.width_div_8 = 2;
+  copy.height_div_8 = 1;
+  const auto rect = native::GetResolveRectangle(copy, EdramLayout{}, 1280, 1024, false);
+  REQUIRE(rect);
+  CHECK(rect->x == 40);
+  CHECK(rect->y == 16);
 }
 
 TEST_CASE("Native guest texture cache keys cover the uploaded texels", "[gpu][native]") {

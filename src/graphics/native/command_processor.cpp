@@ -123,6 +123,8 @@ VkFormat ColorTargetFormat(xenos::ColorRenderTargetFormat format) {
       return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
       return VK_FORMAT_R16G16_SFLOAT;
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
+      return VK_FORMAT_R16G16B16A16_SFLOAT;
     case xenos::ColorRenderTargetFormat::k_32_FLOAT:
       return VK_FORMAT_R32_SFLOAT;
     default:
@@ -143,6 +145,8 @@ VkFormat CopyColorFormat(xenos::ColorFormat format) {
       return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case xenos::ColorFormat::k_16_16_FLOAT:
       return VK_FORMAT_R16G16_SFLOAT;
+    case xenos::ColorFormat::k_16_16_16_16_FLOAT:
+      return VK_FORMAT_R16G16B16A16_SFLOAT;
     case xenos::ColorFormat::k_32_FLOAT:
       return VK_FORMAT_R32_SFLOAT;
     default:
@@ -162,7 +166,7 @@ bool SupportsResolveFormatBlit(const ui::vulkan::VulkanDevice& device, VkFormat 
          (destination_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0;
 }
 
-VkClearColorValue UnpackColor(VkFormat format, uint32_t packed) {
+VkClearColorValue UnpackColor(VkFormat format, uint32_t packed, uint32_t packed_hi = 0) {
   switch (format) {
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
       return {{float(packed & 1023) / 1023.0f, float((packed >> 10) & 1023) / 1023.0f,
@@ -170,6 +174,11 @@ VkClearColorValue UnpackColor(VkFormat format, uint32_t packed) {
     case VK_FORMAT_R16G16_SFLOAT:
       return {{rex::xenos_half_to_float(uint16_t(packed)),
                rex::xenos_half_to_float(uint16_t(packed >> 16)), 0, 0}};
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+      return {{rex::xenos_half_to_float(uint16_t(packed)),
+               rex::xenos_half_to_float(uint16_t(packed >> 16)),
+               rex::xenos_half_to_float(uint16_t(packed_hi)),
+               rex::xenos_half_to_float(uint16_t(packed_hi >> 16))}};
     case VK_FORMAT_R32_SFLOAT:
       return {{std::bit_cast<float>(packed), 0, 0, 0}};
     default:
@@ -631,6 +640,10 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
       texture.format = VK_FORMAT_R8G8_UNORM;
       block_size = 2;
       break;
+    case xenos::TextureFormat::k_5_6_5:
+      texture.format = VK_FORMAT_R5G6B5_UNORM_PACK16;
+      block_size = 2;
+      break;
     case xenos::TextureFormat::k_32_FLOAT:
       texture.format = VK_FORMAT_R32_SFLOAT;
       block_size = 4;
@@ -638,6 +651,10 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
     case xenos::TextureFormat::k_16_16_FLOAT:
       texture.format = VK_FORMAT_R16G16_SFLOAT;
       block_size = 4;
+      break;
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+      texture.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+      block_size = 8;
       break;
     case xenos::TextureFormat::k_24_8:
     case xenos::TextureFormat::k_24_8_FLOAT:
@@ -830,7 +847,8 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
     texture.crop_source = resolved->second.image;
     return true;
   }
-  texture.swizzle = MakeTextureComponentMapping(fetch.swizzle, channel_count, false);
+  texture.swizzle = MakeTextureComponentMapping(
+      fetch.swizzle, channel_count, fetch.format == xenos::TextureFormat::k_5_6_5);
 
   GuestTextureKey key;
   key.base_page = base_page;
@@ -1327,7 +1345,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return false;
     }
     draw.colors[i] = FindTarget(layout.DecodeBase(target.value), dimensions.surface_pitch,
-                                dimensions.msaa_samples, format, VK_IMAGE_ASPECT_COLOR_BIT);
+                                dimensions.msaa_samples, format, VK_IMAGE_ASPECT_COLOR_BIT,
+                                xenos::IsColorRenderTargetFormat64bpp(target.color_format));
     if (!draw.colors[i]) {
       return false;
     }
@@ -1533,7 +1552,8 @@ void NativeCommandProcessor::ApplyPendingFastClear(uint32_t tile, uint32_t pitch
 std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, uint32_t pitch,
                                                                xenos::MsaaSamples samples,
                                                                VkFormat format,
-                                                               VkImageAspectFlags aspects) {
+                                                               VkImageAspectFlags aspects,
+                                                               bool is_64bpp) {
   const auto key = std::tuple(tile, pitch, samples, format);
   if (auto existing = targets_.find(key); existing != targets_.end()) {
     existing->second.last_use_submission = next_submission_;
@@ -1558,7 +1578,7 @@ std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, ui
   const uint32_t max_height = std::min(properties.maxImageDimension2D,
                                        properties.maxFramebufferHeight);
   const uint32_t height =
-      GetTargetHeight(pitch, samples, ActiveEdramLayout().tile_count, max_height);
+      GetTargetHeight(pitch, samples, ActiveEdramLayout().tile_count, max_height, is_64bpp);
   auto image = std::make_shared<ColorImage>(*vulkan_device_);
   if (!image->Initialize({pitch, height}, format, VkSampleCountFlagBits(1u << uint32_t(samples)),
                          aspects)) {
@@ -1566,7 +1586,9 @@ std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, ui
   }
   // shortcut: separate host images, share overlapping tiles when ownership tracking is added.
   targets_.emplace(key, CachedImage{image, next_submission_});
-  ApplyPendingFastClear(tile, xenos::GetSurfacePitchTiles(pitch, samples, false), samples, image);
+  if (!is_64bpp) {
+    ApplyPendingFastClear(tile, xenos::GetSurfacePitchTiles(pitch, samples, false), samples, image);
+  }
   return image;
 }
 
@@ -1614,10 +1636,11 @@ bool NativeCommandProcessor::IssueCopy() {
       ((samples == xenos::MsaaSamples::k2X && selection == xenos::CopySampleSelect::k01) ||
        (samples == xenos::MsaaSamples::k4X && selection == xenos::CopySampleSelect::k0123));
   const bool depth = copy.IsCopyingDepth();
-  const bool single_sample =
-      !depth && samples != xenos::MsaaSamples::k1X && xenos::IsSingleCopySampleSelected(selection);
   const VkFormat color_format =
       ColorTargetFormat(xenos::ColorRenderTargetFormat(copy.color_edram_info.format));
+  const bool single_sample = !depth && samples != xenos::MsaaSamples::k1X &&
+                             color_format != VK_FORMAT_R16G16B16A16_SFLOAT &&
+                             xenos::IsSingleCopySampleSelected(selection);
   const VkFormat output_format =
       depth ? VK_FORMAT_R32_SFLOAT : CopyColorFormat(copy.copy_dest_info.copy_dest_format);
   const uint32_t resolve_address = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
@@ -1640,11 +1663,13 @@ bool NativeCommandProcessor::IssueCopy() {
     return false;
   }
   const auto depth_format = xenos::DepthRenderTargetFormat(copy.depth_edram_info.format);
+  const bool color_is_64bpp = !depth && xenos::IsColorRenderTargetFormat64bpp(
+                                            xenos::ColorRenderTargetFormat(copy.color_edram_info.format));
   auto source = depth ? FindTarget(copy.depth_original_base, surface_info.surface_pitch, samples,
                                    GetDepthFormat(depth_format),
                                    VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
                       : FindTarget(copy.color_original_base, surface_info.surface_pitch, samples,
-                                   color_format, VK_IMAGE_ASPECT_COLOR_BIT);
+                                   color_format, VK_IMAGE_ASPECT_COLOR_BIT, color_is_64bpp);
   if (!source) {
     return false;
   }
@@ -1734,7 +1759,7 @@ bool NativeCommandProcessor::IssueCopy() {
                     destination_offset,
                     extent,
                     copy.IsClearingColor(),
-                    UnpackColor(color_format, copy.rb_color_clear),
+                    UnpackColor(color_format, copy.rb_color_clear, copy.rb_color_clear_lo),
                     depth_descriptor,
                     uint32_t(selection),
                     depth_format == xenos::DepthRenderTargetFormat::kD24FS8 ? 2.0f : 1.0f,
