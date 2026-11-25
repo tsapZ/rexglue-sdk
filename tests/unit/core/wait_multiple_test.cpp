@@ -6,8 +6,11 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 #include <rex/thread.h>
@@ -80,4 +83,38 @@ TEST_CASE("rex::thread::WaitAny - wakes for the object that gets set", "[thread]
   setter.join();
   CHECK(result.first == WaitResult::kSuccess);
   CHECK(result.second == 1);
+}
+
+// A wait on several objects ends as soon as one of them is set, not at its next look up to 1 ms later (CoL #136:
+// Spyro's Adventure makes about 650 such waits a second in a level, each up to 1 ms late on Linux). The setter's
+// moment moves through a whole millisecond, so a waiter that looks once a millisecond is late by half of one on the
+// median.
+TEST_CASE("rex::thread::WaitAny - wakes at once when an object is set", "[thread]") {
+  auto now_us = [] {
+    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  };
+  for (bool alertable : {false, true}) {
+    std::vector<double> late_us;
+    for (int i = 0; i < 100; ++i) {
+      auto a = Event::CreateAutoResetEvent(false);
+      auto b = Event::CreateAutoResetEvent(false);
+      WaitHandle* handles[] = {a.get(), b.get()};
+      std::atomic<double> set_at{0.0};
+      std::thread setter([&] {
+        std::this_thread::sleep_for(2ms + std::chrono::microseconds((i * 37) % 1000));
+        set_at = now_us();
+        b->Set();
+      });
+      auto result = rex::thread::WaitAny(handles, 2, alertable, 1000ms);
+      const double woke = now_us();
+      setter.join();
+      REQUIRE(result.first == WaitResult::kSuccess);
+      late_us.push_back(woke - set_at.load());
+    }
+    std::sort(late_us.begin(), late_us.end());
+    const double median = late_us[late_us.size() / 2];
+    INFO("alertable " << alertable << ": median " << median << " us, slowest " << late_us.back() << " us");
+    CHECK(median < 250.0);
+  }
 }
