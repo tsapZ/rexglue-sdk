@@ -21,6 +21,7 @@
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/platform.h>
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
@@ -61,8 +62,20 @@ bool VulkanSharedMemory::Initialize() {
   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   buffer_create_info.queueFamilyIndexCount = 0;
   buffer_create_info.pQueueFamilyIndices = nullptr;
-  if (REXCVAR_GET(vulkan_sparse_shared_memory) &&
-      vulkan_device->properties().sparseResidencyBuffer) {
+  // NVIDIA on Linux: no sparse buffer unless the setting asks for it. A player's RTX 2060 with the
+  // 620 driver ran Swap Force at ~15 FPS with it and ~25 without, and one version stopped at every
+  // start with it (Core of Light #135); the whole buffer at once costs only its memory up front.
+  bool sparse = REXCVAR_GET(vulkan_sparse_shared_memory);
+#if REX_PLATFORM_LINUX
+  if (sparse && vulkan_device->properties().vendorID == 0x10DE &&
+      rex::cvar::GetFlagSource("vulkan_sparse_shared_memory") == rex::cvar::Source::kDefault) {
+    sparse = false;
+    REXLOG_INFO(
+        "Vulkan: NVIDIA on Linux, shared memory as one buffer without sparse binding "
+        "(vulkan_sparse_shared_memory = true uses it)");
+  }
+#endif
+  if (sparse && vulkan_device->properties().sparseResidencyBuffer) {
     if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) == VK_SUCCESS) {
       VkMemoryRequirements buffer_memory_requirements;
       dfn.vkGetBufferMemoryRequirements(device, buffer_, &buffer_memory_requirements);
