@@ -483,6 +483,11 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
     shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
+  // The name only served to create the object: views are mapped from the descriptor, and nothing
+  // opens it by name again. Unlinked now, the memory goes back when the process ends, however it
+  // ends; before, a run that crashed or quit through _Exit (a closed window) left the whole object
+  // in /dev/shm, and once that was full the next start died with SIGBUS (Core of Light #135).
+  shm_unlink(full_path.c_str());
   return static_cast<FileMappingHandle>(ret);
 #endif
 }
