@@ -12,7 +12,7 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/edram_layout.h>
-#include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/video_mode_util.h>
@@ -247,7 +247,7 @@ bool NativeCommandProcessor::SetupContext() {
     return false;
   }
 
-  TextureCache::GetConfigDrawResolutionScale(draw_resolution_scale_x_, draw_resolution_scale_y_);
+  graphics::GetConfigDrawResolutionScale(draw_resolution_scale_x_, draw_resolution_scale_y_);
   const uint32_t max_w = std::min(vulkan_device_->properties().maxImageDimension2D,
                                   vulkan_device_->properties().maxFramebufferWidth);
   const uint32_t max_h = std::min(vulkan_device_->properties().maxImageDimension2D,

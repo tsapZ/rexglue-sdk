@@ -23,10 +23,6 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
-REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
-                    "Use sparse shared memory on Vulkan")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
 namespace rex::graphics::vulkan {
 
 VulkanSharedMemory::VulkanSharedMemory(VulkanCommandProcessor& command_processor,
