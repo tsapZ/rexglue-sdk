@@ -1,5 +1,8 @@
 #include <array>
+#include <cstring>
 #include <map>
+#include <span>
+#include <vector>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -1106,4 +1109,301 @@ TEST_CASE("Native depth bias, user clip planes, and clear helpers", "[gpu][nativ
 
   CHECK(native::ClampResolutionScaleAxis(3, 1920, 4096) == 2u);
   CHECK(native::ClampResolutionScaleAxis(3, 1280, 4096) == 3u);
+}
+
+TEST_CASE("Native dynamic constant buffers stay in bounds", "[gpu][native]") {
+  const std::array<uint64_t, 3> offsets{0, 256, 512};
+  const std::array<uint64_t, 3> ranges{100, 4096, 16};
+  // The float constants at 256 bind 4096 bytes, past the 600 bytes of data.
+  CHECK(native::ComputeDynamicUboRequiredSize(offsets, ranges, 600) == 256 + 4096);
+  // Already large enough: unchanged.
+  CHECK(native::ComputeDynamicUboRequiredSize(offsets, ranges, 8192) == 8192);
+  CHECK(native::ComputeDynamicUboRequiredSize({}, {}, 64) == 64);
+}
+
+TEST_CASE("Native sparse vertex granules cover committed ranges", "[gpu][native]") {
+  constexpr uint64_t kMiB = 1024 * 1024;
+  CHECK(native::ComputeSparseGranuleSize(64 * 1024) == 4 * kMiB);
+  CHECK(native::ComputeSparseGranuleSize(0) == 4 * kMiB);
+  // Rounded up to a multiple of an unusual alignment.
+  CHECK(native::ComputeSparseGranuleSize(3 * kMiB) == 6 * kMiB);
+  CHECK(native::ComputeSparseGranuleSize(8 * kMiB) == 8 * kMiB);
+  // At most 128 granules for the 512 MiB buffer.
+  CHECK(native::kPhysicalMemorySize / native::ComputeSparseGranuleSize(64 * 1024) == 128);
+
+  using Range = std::pair<uint32_t, uint32_t>;
+  CHECK(native::GetSparseGranuleRange(0, 1, 4 * kMiB) == Range{0, 1});
+  CHECK(native::GetSparseGranuleRange(4 * kMiB - 1, 2, 4 * kMiB) == Range{0, 2});
+  CHECK(native::GetSparseGranuleRange(8 * kMiB, 4 * kMiB, 4 * kMiB) == Range{2, 1});
+  CHECK(native::GetSparseGranuleRange(8 * kMiB, 4 * kMiB + 1, 4 * kMiB) == Range{2, 2});
+  CHECK(native::GetSparseGranuleRange(0, 0, 4 * kMiB) == Range{0, 0});
+}
+
+TEST_CASE("Native draw state tracking elides redundant binds", "[gpu][native]") {
+  const auto handle = [](auto type, uintptr_t value) {
+    return reinterpret_cast<decltype(type)>(value);
+  };
+  native::DrawRenderState state;
+  const VkPipeline pipeline_a = handle(VkPipeline{}, 0x10);
+  const VkPipeline pipeline_b = handle(VkPipeline{}, 0x20);
+  CHECK(state.SetPipeline(pipeline_a));
+  CHECK_FALSE(state.SetPipeline(pipeline_a));
+  CHECK(state.SetPipeline(pipeline_b));
+
+  const VkPipelineLayout layout_a = handle(VkPipelineLayout{}, 0x30);
+  const VkPipelineLayout layout_b = handle(VkPipelineLayout{}, 0x40);
+  std::array<VkDescriptorSet, 4> sets{handle(VkDescriptorSet{}, 1), handle(VkDescriptorSet{}, 2),
+                                      handle(VkDescriptorSet{}, 3), handle(VkDescriptorSet{}, 4)};
+  std::array<uint32_t, 5> offsets{0, 256, 512, 768, 1024};
+  // The first bind, and any pipeline layout change, rebind every set.
+  CHECK(state.FirstChangedSet(layout_a, sets, offsets) == 0);
+  CHECK(state.FirstChangedSet(layout_a, sets, offsets) == 4);
+  sets[3] = handle(VkDescriptorSet{}, 5);
+  CHECK(state.FirstChangedSet(layout_a, sets, offsets) == 3);
+  // New dynamic offsets rebind the constant set (1) and everything after it.
+  offsets[2] = 1280;
+  CHECK(state.FirstChangedSet(layout_a, sets, offsets) == 1);
+  sets[0] = handle(VkDescriptorSet{}, 6);
+  CHECK(state.FirstChangedSet(layout_a, sets, offsets) == 0);
+  CHECK(state.FirstChangedSet(layout_b, sets, offsets) == 0);
+  CHECK(state.FirstChangedSet(layout_b, sets, offsets) == 4);
+
+  const VkViewport viewport{0.0f, 0.0f, 1280.0f, 720.0f, 0.0f, 1.0f};
+  CHECK(native::DrawRenderState::Update(state.viewport_valid, state.viewport, viewport));
+  CHECK_FALSE(native::DrawRenderState::Update(state.viewport_valid, state.viewport, viewport));
+  const VkViewport smaller{0.0f, 0.0f, 640.0f, 360.0f, 0.0f, 1.0f};
+  CHECK(native::DrawRenderState::Update(state.viewport_valid, state.viewport, smaller));
+  const std::array<float, 4> blend{0.5f, 0.5f, 0.5f, 1.0f};
+  CHECK(native::DrawRenderState::Update(state.blend_constants_valid, state.blend_constants, blend));
+  CHECK_FALSE(
+      native::DrawRenderState::Update(state.blend_constants_valid, state.blend_constants, blend));
+
+  CHECK(native::DrawRenderState::UpdateStencil(state.stencil_reference,
+                                               state.stencil_reference_valid, {1, 1}) == 3);
+  CHECK(native::DrawRenderState::UpdateStencil(state.stencil_reference,
+                                               state.stencil_reference_valid, {1, 1}) == 0);
+  CHECK(native::DrawRenderState::UpdateStencil(state.stencil_reference,
+                                               state.stencil_reference_valid, {1, 2}) == 2);
+  CHECK(native::DrawRenderState::UpdateStencil(state.stencil_reference,
+                                               state.stencil_reference_valid, {3, 2}) == 1);
+
+  const VkBuffer buffer = handle(VkBuffer{}, 0x50);
+  CHECK(state.SetIndexBuffer(buffer, 64));
+  CHECK_FALSE(state.SetIndexBuffer(buffer, 64));
+  CHECK(state.SetIndexBuffer(buffer, 128));
+}
+
+TEST_CASE("Native samplers normalize guest address, anisotropy and filtering", "[gpu][native]") {
+  using xenos::ClampMode;
+  CHECK(native::GetSamplerAddressMode(ClampMode::kRepeat, false) == VK_SAMPLER_ADDRESS_MODE_REPEAT);
+  CHECK(native::GetSamplerAddressMode(ClampMode::kClampToHalfway, true) ==
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+  CHECK(native::GetSamplerAddressMode(ClampMode::kClampToBorder, false) ==
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER);
+  CHECK(native::GetSamplerAddressMode(ClampMode::kMirrorClampToBorder, true) ==
+        VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE);
+  // Without samplerMirrorClampToEdge, mirrored clamps fall back to mirrored repeat.
+  CHECK(native::GetSamplerAddressMode(ClampMode::kMirrorClampToEdge, false) ==
+        VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT);
+
+  using xenos::AnisoFilter;
+  CHECK(native::GetSamplerAnisotropy(AnisoFilter::kMax_4_1, -1, false, 16.0f) == 4.0f);
+  CHECK(native::GetSamplerAnisotropy(AnisoFilter::kDisabled, -1, true, 16.0f) == 0.0f);
+  // anisotropic_override applies only to eligible (mipmapped linear) samplers.
+  CHECK(native::GetSamplerAnisotropy(AnisoFilter::kDisabled, 5, true, 16.0f) == 16.0f);
+  CHECK(native::GetSamplerAnisotropy(AnisoFilter::kDisabled, 5, false, 16.0f) == 0.0f);
+  CHECK(native::GetSamplerAnisotropy(AnisoFilter::kMax_16_1, 0, true, 16.0f) == 0.0f);
+  // The device limit caps it, and no anisotropy support disables it.
+  CHECK(native::GetSamplerAnisotropy(AnisoFilter::kMax_16_1, -1, false, 8.0f) == 8.0f);
+  CHECK(native::GetSamplerAnisotropy(AnisoFilter::kMax_16_1, -1, false, 0.0f) == 0.0f);
+
+  native::DrawSampler sampler;
+  sampler.min_filter = sampler.mag_filter = VK_FILTER_LINEAR;
+  sampler.mip_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  sampler.max_anisotropy = 4.0f;
+  sampler.border_color = xenos::BorderColor::k_ABGR_White;
+  const auto unfilterable = native::NormalizeDrawSampler(sampler, false);
+  CHECK(unfilterable.min_filter == VK_FILTER_NEAREST);
+  CHECK(unfilterable.mag_filter == VK_FILTER_NEAREST);
+  CHECK(unfilterable.mip_mode == VK_SAMPLER_MIPMAP_MODE_NEAREST);
+  CHECK(unfilterable.max_anisotropy == 0.0f);
+  // Without a border address mode the color is irrelevant and dropped from the key.
+  CHECK(unfilterable.border_color == xenos::BorderColor::k_ABGR_Black);
+
+  native::DrawSampler anisotropic;
+  anisotropic.max_anisotropy = 2.0f;
+  anisotropic.address_w = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+  anisotropic.border_color = xenos::BorderColor::k_ACBYCR_Black;
+  const auto forced = native::NormalizeDrawSampler(anisotropic, true);
+  CHECK(forced.min_filter == VK_FILTER_LINEAR);
+  CHECK(forced.mag_filter == VK_FILTER_LINEAR);
+  CHECK(forced.mip_mode == VK_SAMPLER_MIPMAP_MODE_LINEAR);
+  CHECK(forced.border_color == xenos::BorderColor::k_ACBYCR_Black);
+
+  // The new fields are part of the cache key and its hash.
+  native::DrawSampler other = forced;
+  other.min_lod = 1.0f;
+  CHECK(other != forced);
+  CHECK(native::DrawSamplerHash{}(other) != native::DrawSamplerHash{}(forced));
+}
+
+TEST_CASE("Native texture unpackers match the Xenos load shaders", "[gpu][native]") {
+  CHECK(native::ExpandUnorm16(0x1F, 5) == 0xFFFF);
+  CHECK(native::ExpandUnorm16(0x10, 5) == 0x8421);
+  CHECK(native::ExpandUnorm16(0x7FF, 11) == 0xFFFF);
+  CHECK(native::ExpandUnorm16(0x200, 10) == 0x8020);
+  // Both most negative values are -1.0, and the extremes map to +-32767.
+  CHECK(native::ExpandSnorm16(0x3FF, 11) == 0x7FFF);
+  CHECK(native::ExpandSnorm16(0x401, 11) == 0x8001);
+  CHECK(native::ExpandSnorm16(0x400, 11) == 0x8001);
+  CHECK(native::ExpandSnorm16(0x1FF, 10) == 0x7FFF);
+  CHECK(native::ExpandSnorm16(0x200, 10) == 0x8001);
+  CHECK(native::ExpandSnorm16(0, 11) == 0);
+
+  CHECK(native::UnpackRgba4ToRgba8(0xF0A5) == 0xFF00AA55u);
+  CHECK(native::UnpackRgb5a1ToRgba8(0x801F) == 0xFF0000FFu);
+  CHECK(native::UnpackRgb5a1ToRgba8(0x7C00) == 0x00FF0000u);
+
+  using Rgba16 = std::array<uint16_t, 4>;
+  // k_10_11_11: R11 G11 B10 from the low bits.
+  CHECK(native::UnpackR11G11B10ToRgba16(0x7FFu | (0x3FFu << 22), false, false) ==
+        Rgba16{0xFFFF, 0, 0xFFFF, 0xFFFF});
+  CHECK(native::UnpackR11G11B10ToRgba16(0x3FFu, false, true) == Rgba16{0x7FFF, 0, 0, 0x7FFF});
+  // k_11_11_10: R10 G11 B11.
+  CHECK(native::UnpackR11G11B10ToRgba16(0x3FFu | (0x7FFu << 21), true, false) ==
+        Rgba16{0xFFFF, 0, 0xFFFF, 0xFFFF});
+  CHECK(native::UnpackR11G11B10ToRgba16(0x200u, true, true) == Rgba16{0x8001, 0, 0, 0x7FFF});
+
+  const auto alpha = native::DecodeDxt3aBlock(0x100000000000000Full);
+  CHECK(alpha[0] == 0xFF);
+  CHECK(alpha[1] == 0);
+  CHECK(alpha[15] == 0x11);
+
+  // Endpoints (0, 30) and (90, 60); texels 0-3 select 0, 1, 2:1 and 1:2.
+  const uint64_t ctx1 = uint64_t(30u << 8 | 90u << 16 | 60u << 24) | (uint64_t(0xE4) << 32);
+  const auto rg = native::DecodeCtx1Block(ctx1);
+  CHECK(rg[0] == 0x1E00);
+  CHECK(rg[1] == 0x3C5A);
+  CHECK(rg[2] == 0x281E);
+  CHECK(rg[3] == 0x323C);
+  CHECK(rg[4] == 0x1E00);
+}
+
+TEST_CASE("Native texture formats select host formats and signed views", "[gpu][native]") {
+  using xenos::TextureFormat;
+  CHECK(native::TextureChannelCount(TextureFormat::k_16) == 1);
+  CHECK(native::TextureChannelCount(TextureFormat::k_DXT3A) == 1);
+  CHECK(native::TextureChannelCount(TextureFormat::k_16_16) == 2);
+  CHECK(native::TextureChannelCount(TextureFormat::k_CTX1) == 2);
+  CHECK(native::TextureChannelCount(TextureFormat::k_10_11_11) == 3);
+  CHECK(native::TextureChannelCount(TextureFormat::k_11_11_10_AS_16_16_16_16) == 3);
+  CHECK(native::TextureChannelCount(TextureFormat::k_32_32_32_32_FLOAT) == 4);
+
+  const auto rgba8 = native::GetTextureFormatInfo(TextureFormat::k_8_8_8_8);
+  CHECK(rgba8.format == VK_FORMAT_R8G8B8A8_UNORM);
+  CHECK(rgba8.signed_format == VK_FORMAT_R8G8B8A8_SNORM);
+  CHECK(rgba8.needs_signed_view());
+  CHECK(rgba8.host_block_size() == 4);
+
+  const auto dxn = native::GetTextureFormatInfo(TextureFormat::k_DXN);
+  CHECK(dxn.signed_format == VK_FORMAT_BC5_SNORM_BLOCK);
+  CHECK(dxn.block_width == 4);
+  CHECK(native::GetTextureFormatInfo(TextureFormat::k_DXT5A).signed_format ==
+        VK_FORMAT_BC4_SNORM_BLOCK);
+
+  // Signed 10_11_11 is a differently unpacked image, not a view.
+  const auto packed = native::GetTextureFormatInfo(TextureFormat::k_10_11_11);
+  CHECK(packed.unpack_depends_on_sign());
+  CHECK_FALSE(packed.needs_signed_view());
+  CHECK(packed.host_block_size() == 8);
+  CHECK(packed.signed_format == VK_FORMAT_R16G16B16A16_SNORM);
+
+  const auto dxt3a = native::GetTextureFormatInfo(TextureFormat::k_DXT3A);
+  CHECK(dxt3a.decompresses_blocks());
+  CHECK(dxt3a.host_block_size() == 1);
+  CHECK(dxt3a.signed_format == VK_FORMAT_UNDEFINED);
+
+  CHECK(native::GetTextureFormatInfo(TextureFormat::k_4_4_4_4).host_block_size() == 4);
+  CHECK(native::GetTextureFormatInfo(TextureFormat::k_24_8).unpack ==
+        native::TextureUnpack::kDepthUnorm24);
+  CHECK(native::GetTextureFormatInfo(TextureFormat::k_1).format == VK_FORMAT_UNDEFINED);
+  CHECK(native::GetTextureFormatInfo(TextureFormat::k_32_32_32_FLOAT).format ==
+        VK_FORMAT_UNDEFINED);
+
+  using xenos::DataDimension;
+  using xenos::FetchOpDimension;
+  CHECK(native::TextureBindingMatchesDimension(FetchOpDimension::k2D, DataDimension::k1D));
+  CHECK(native::TextureBindingMatchesDimension(FetchOpDimension::k2D, DataDimension::k2DOrStacked));
+  CHECK_FALSE(native::TextureBindingMatchesDimension(FetchOpDimension::k2D, DataDimension::k3D));
+  CHECK(native::TextureBindingMatchesDimension(FetchOpDimension::k3DOrStacked, DataDimension::k3D));
+  CHECK_FALSE(native::TextureBindingMatchesDimension(FetchOpDimension::k3DOrStacked,
+                                                     DataDimension::k2DOrStacked));
+  CHECK(native::TextureBindingMatchesDimension(FetchOpDimension::kCube, DataDimension::kCube));
+  CHECK_FALSE(native::TextureBindingMatchesDimension(FetchOpDimension::kCube,
+                                                     DataDimension::k2DOrStacked));
+
+  // Keys for the signed unpack and the mutable image differ from the plain one.
+  native::GuestTextureKey key;
+  native::GuestTextureKey signed_key = key;
+  signed_key.is_signed = true;
+  native::GuestTextureKey view_key = key;
+  view_key.signed_view = true;
+  CHECK(key != signed_key);
+  CHECK(key != view_key);
+  CHECK(native::GuestTextureKeyHash{}(key) != native::GuestTextureKeyHash{}(view_key));
+}
+
+TEST_CASE("Native EDRAM tile overlaps become image copies", "[gpu][native]") {
+  using Copy = native::EdramTileCopy;
+  // Bases a whole number of rows apart: one rectangle.
+  CHECK(native::ComputeOverlappingEdramTileCopies(0, 16, 16, 16, 48) ==
+        std::vector<Copy>{{0, 1, 0, 0, 16, 2}});
+  // Half a row apart: the runs wrap at different columns.
+  CHECK(native::ComputeOverlappingEdramTileCopies(0, 8, 16, 8, 40) ==
+        std::vector<Copy>{{8, 0, 0, 0, 8, 1},
+                          {0, 1, 8, 0, 8, 1},
+                          {8, 1, 0, 1, 8, 1},
+                          {0, 2, 8, 1, 8, 1}});
+  // A partial last row after full rows.
+  CHECK(native::ComputeOverlappingEdramTileCopies(32, 0, 16, 32, 52) ==
+        std::vector<Copy>{{0, 0, 0, 2, 16, 1}, {0, 1, 0, 3, 4, 1}});
+  CHECK(native::ComputeOverlappingEdramTileCopies(0, 16, 16, 8, 32).empty());
+  CHECK(native::ComputeOverlappingEdramTileCopies(0, 0, 0, 0, 16).empty());
+  CHECK(native::ComputeOverlappingEdramTileCopies(0, 0, 16, 16, 16).empty());
+
+  using xenos::MsaaSamples;
+  CHECK(native::GetEdramTileHostExtent(MsaaSamples::k1X, false, 1, 1).width == 80);
+  CHECK(native::GetEdramTileHostExtent(MsaaSamples::k1X, false, 1, 1).height == 16);
+  CHECK(native::GetEdramTileHostExtent(MsaaSamples::k2X, false, 1, 1).height == 8);
+  CHECK(native::GetEdramTileHostExtent(MsaaSamples::k4X, false, 1, 1).width == 40);
+  CHECK(native::GetEdramTileHostExtent(MsaaSamples::k1X, true, 1, 1).width == 40);
+  const auto scaled = native::GetEdramTileHostExtent(MsaaSamples::k4X, true, 2, 3);
+  CHECK(scaled.width == 40);
+  CHECK(scaled.height == 24);
+}
+
+TEST_CASE("Native pipeline cache files are validated before merging", "[gpu][native]") {
+  const std::array<uint8_t, VK_UUID_SIZE> uuid{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+  const std::vector<uint8_t> data{0xDE, 0xAD, 0xBE, 0xEF, 0x01};
+  const auto header = native::MakePipelineCacheFileHeader(0x10DE, 0x2684, uuid, data);
+  std::vector<uint8_t> file(sizeof(header));
+  std::memcpy(file.data(), &header, sizeof(header));
+  file.insert(file.end(), data.begin(), data.end());
+
+  const auto stored = native::GetPipelineCacheFileData(file, 0x10DE, 0x2684, uuid);
+  CHECK(std::vector<uint8_t>(stored.begin(), stored.end()) == data);
+  // Another device or driver cache version.
+  CHECK(native::GetPipelineCacheFileData(file, 0x1002, 0x2684, uuid).empty());
+  CHECK(native::GetPipelineCacheFileData(file, 0x10DE, 0x2685, uuid).empty());
+  auto other_uuid = uuid;
+  other_uuid[0] ^= 1;
+  CHECK(native::GetPipelineCacheFileData(file, 0x10DE, 0x2684, other_uuid).empty());
+  // Truncated or corrupted.
+  CHECK(native::GetPipelineCacheFileData(std::span(file).first(file.size() - 1), 0x10DE, 0x2684,
+                                         uuid)
+            .empty());
+  CHECK(native::GetPipelineCacheFileData(std::span(file).first(10), 0x10DE, 0x2684, uuid).empty());
+  auto corrupt = file;
+  corrupt.back() ^= 0xFF;
+  CHECK(native::GetPipelineCacheFileData(corrupt, 0x10DE, 0x2684, uuid).empty());
 }
