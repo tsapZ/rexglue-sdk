@@ -609,8 +609,10 @@ void CommandProcessor::WorkerThreadMain() {
       // Commands, host callbacks, readback and shutdown each signal the event.
       // Keep the Windows alertable wait. This host worker can use a plain
       // wait on POSIX, where alertable waits poll for guest APCs.
+      // A replacement ring can publish the same index as the old ring's read
+      // pointer. Service its generation even if both work signals coalesce.
       while (worker_running_ && !has_pending_fns_.load(std::memory_order_acquire) &&
-             !HasReadBackRequest() &&
+             !HasReadBackRequest() && ring_generation_.load() == ring_generation_seen_ &&
              (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index)) {
         rex::thread::Wait(write_ptr_index_event_.get(), REX_PLATFORM_WIN32);
         write_ptr_index = write_ptr_index_.load();
