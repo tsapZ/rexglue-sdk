@@ -478,13 +478,12 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
   // descriptor and closes it once; the name is removed below.
   oflag |= O_CREAT | O_EXCL;
   auto full_path = MakeShmName(path);
-  int ret = shm_open(full_path.c_str(), oflag, 0777);
+  int ret = shm_open(full_path.c_str(), oflag, 0600);
   if (ret < 0) {
     return kFileMappingHandleInvalid;
   }
-  // All views use this fd. Unlink now so a crash also releases the backing tmpfs.
-  if (shm_unlink(full_path.c_str()) != 0 ||
-      rex_ftruncate64(ret, static_cast<off_t>(length)) != 0) {
+  if (rex_ftruncate64(ret, static_cast<off_t>(length)) != 0) {
+    shm_unlink(full_path.c_str());
     close(ret);
     return kFileMappingHandleInvalid;
   }
@@ -492,7 +491,10 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
   // opens it by name again. Unlinked now, the memory goes back when the process ends, however it
   // ends; before, a run that crashed or quit through _Exit (a closed window) left the whole object
   // in /dev/shm, and once that was full the next start died with SIGBUS (Core of Light #135).
-  shm_unlink(full_path.c_str());
+  if (shm_unlink(full_path.c_str()) != 0) {
+    close(ret);
+    return kFileMappingHandleInvalid;
+  }
   return static_cast<FileMappingHandle>(ret);
 #endif
 }
