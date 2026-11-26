@@ -44,7 +44,9 @@ struct CachedTexture {
   // Resolve version last copied into a cached cropped 2D GPU resolve.
   uint64_t resolved_crop_version = 0;
   uint64_t last_use_submission = 0;
-  std::map<uint32_t, VkImageView> views;
+  // Keyed by format (UNORM and SNORM views share MUTABLE_FORMAT images) and
+  // PackTextureComponentMapping.
+  std::map<uint64_t, VkImageView> views;
   CachedTexture() = default;
   ~CachedTexture();
   CachedTexture(const CachedTexture&) = delete;
@@ -57,11 +59,20 @@ struct CachedTexture {
 struct DrawTexture {
   uint32_t width = 0;
   uint32_t height = 0;
-  // Array layers per level (6 for cube textures, 1 otherwise). Each level in
-  // `levels` stores all layers tightly packed.
+  // Slices of a 3D texture (1 otherwise).
+  uint32_t depth = 1;
+  // Array layers per level (6 for cubes, the stack depth for stacked textures,
+  // 1 otherwise). Each level in `levels` stores all layers (or 3D slices)
+  // tightly packed.
   uint32_t array_layers = 1;
+  // Mip levels of the image; `levels` starts at first_level, which is 1 when
+  // the fetch has no base level.
+  uint32_t level_count = 1;
+  uint32_t first_level = 0;
   VkFormat format = VK_FORMAT_UNDEFINED;
-  // VK_IMAGE_VIEW_TYPE_2D_ARRAY, or VK_IMAGE_VIEW_TYPE_CUBE for cubes.
+  // The image is also sampled through an SNORM view.
+  bool mutable_format = false;
+  // VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_VIEW_TYPE_CUBE or VK_IMAGE_VIEW_TYPE_3D.
   VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
   uint32_t host_swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_0000;
   VkComponentMapping swizzle{};
@@ -114,9 +125,20 @@ struct DrawInput {
   DepthBias depth_bias{};
   std::vector<uint8_t> vertices;
   std::vector<DrawTexture> textures;
+  // Indices into `textures` for the pixel (set 3) and vertex (set 2) shader
+  // texture bindings.
   std::vector<uint32_t> texture_bindings;
+  std::vector<uint32_t> vertex_texture_bindings;
   // Device-lifetime samplers resolved by the command processor's sampler cache.
   std::vector<VkSampler> samplers;
+  std::vector<VkSampler> vertex_samplers;
+  // `textures` index of each fetch constant's unsigned and signed texture, so
+  // both stages share one decode.
+  std::array<int, 64> texture_indices = MakeTextureIndices();
+  // The draw writes guest memory through the shared vertex buffer.
+  bool memexport = false;
+  // No attachments: the draw only memexports from the vertex shader.
+  bool rasterizer_discard = false;
   // When set, the draw has no pixel shader and instead a fragment shader that
   // packs the EDRAM depth-stencil word of a fast clear into an aliased color
   // target; the stencil is written and the format selects the unpacking.
@@ -149,17 +171,29 @@ struct DrawInput {
     vertices.clear();
     textures.clear();
     texture_bindings.clear();
+    vertex_texture_bindings.clear();
     samplers.clear();
+    vertex_samplers.clear();
+    texture_indices = MakeTextureIndices();
+    memexport = false;
+    rasterizer_discard = false;
     edram_depth_clear_color = false;
     edram_clear_stencil = 0;
     edram_clear_format = 0;
+  }
+
+ private:
+  static constexpr std::array<int, 64> MakeTextureIndices() {
+    std::array<int, 64> indices{};
+    indices.fill(-1);
+    return indices;
   }
 };
 
 struct DrawPipelineKey {
   const Shader::Translation* vertex;
   const Shader::Translation* pixel;
-  std::array<uint32_t, 22> state;
+  std::array<uint32_t, 23> state;
   std::array<std::array<uint32_t, 9>, xenos::kMaxColorRenderTargets> colors;
   auto operator<=>(const DrawPipelineKey&) const = default;
 };
@@ -192,7 +226,9 @@ constexpr std::array<uint64_t, SpirvShaderTranslator::kConstantBufferCount>
 struct DrawBindings {
   explicit DrawBindings(const ui::vulkan::VulkanDevice& device) : device(device) {}
   ~DrawBindings();
-  bool Initialize(uint32_t shared_count, uint32_t image_count, uint32_t sampler_count);
+  bool Initialize(uint32_t shared_count, uint32_t vertex_image_count,
+                  uint32_t vertex_sampler_count, uint32_t pixel_image_count,
+                  uint32_t pixel_sampler_count);
   VkDescriptorSet GetOrCreateSharedVertexSet(VkBuffer buffer, uint32_t shared_count);
   // Dynamic constant buffer set of an upload pool page. Pool pages live until
   // the pool is destroyed, so the set is kept as long as these bindings.
@@ -214,7 +250,9 @@ struct DrawBindings {
   std::unordered_map<VkBuffer, size_t> constant_sets;
 };
 
-using DrawBindingCache = std::map<std::array<uint32_t, 3>, std::unique_ptr<DrawBindings>>;
+// Keyed by {shared buffer count, vertex images, vertex samplers, pixel images,
+// pixel samplers}.
+using DrawBindingCache = std::map<std::array<uint32_t, 5>, std::unique_ptr<DrawBindings>>;
 
 class DrawPass {
  public:
@@ -237,6 +275,7 @@ class DrawPass {
   void Record(VkCommandBuffer commands, VkExtent2D extent, DrawRenderState& state);
   void RecordTextureUpload(VkCommandBuffer commands);
   const draw_util::Scissor& scissor() const { return scissor_; }
+  bool rasterizer_discard() const { return rasterizer_discard_; }
 
  private:
   void Release();
@@ -264,6 +303,7 @@ class DrawPass {
     VkImageView fallback_view = VK_NULL_HANDLE;
     VkExtent2D extent{};
     uint32_t array_layers = 1;
+    uint32_t level_count = 1;
     bool upload_cached = false;
     std::vector<VkBufferImageCopy> uploads;
   };
@@ -280,6 +320,7 @@ class DrawPass {
   std::array<uint32_t, 2> stencil_reference_{};
   bool edram_depth_clear_color_ = false;
   std::array<uint32_t, 2> edram_clear_constants_{};
+  bool rasterizer_discard_ = false;
 };
 
 }  // namespace rex::graphics::native

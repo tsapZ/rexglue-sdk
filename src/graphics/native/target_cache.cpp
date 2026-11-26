@@ -7,6 +7,15 @@ namespace rex::graphics::native {
 
 using Translator = SpirvShaderTranslator;
 
+namespace {
+
+template <typename A, typename B>
+bool SameOwner(const A& a, const B& b) {
+  return !a.owner_before(b) && !b.owner_before(a);
+}
+
+}  // namespace
+
 VkFormat NativeTargetCache::GetDepthFormat(xenos::DepthRenderTargetFormat format) const {
   return SelectDepthFormat(format, depth_unorm24_supported_);
 }
@@ -123,10 +132,13 @@ std::shared_ptr<ColorImage> NativeTargetCache::FindTarget(uint32_t tile, uint32_
                                                           VkFormat format,
                                                           VkImageAspectFlags aspects, bool is_64bpp,
                                                           uint32_t edram_tile_count,
-                                                          const std::shared_ptr<ColorImage>& keep) {
+                                                          const std::shared_ptr<ColorImage>& keep,
+                                                          uint32_t used_height) {
   const auto key = std::tuple(tile, pitch, samples, format);
   if (auto existing = targets_.find(key); existing != targets_.end()) {
     existing->second.last_use_submission = clock_.next;
+    ClaimTiles(existing->second, tile, pitch, samples, format, is_64bpp, used_height,
+               edram_tile_count);
     return existing->second.image;
   }
   if (!pitch) {
@@ -159,8 +171,11 @@ std::shared_ptr<ColorImage> NativeTargetCache::FindTarget(uint32_t tile, uint32_
                          format, VkSampleCountFlagBits(1u << uint32_t(samples)), aspects)) {
     return {};
   }
-  // shortcut: separate host images, share overlapping tiles when ownership tracking is added.
-  targets_.emplace(key, CachedImage{image, clock_.next});
+  // ponytail: only same-format, same-sample, same-pitch aliases transfer their
+  // tiles; reinterpreting other formats needs transfer shaders.
+  auto& created = targets_.emplace(key, CachedTarget{{image, clock_.next}}).first->second;
+  // Inherit the aliased tiles first: a fast clear still pending is newer.
+  ClaimTiles(created, tile, pitch, samples, format, is_64bpp, used_height, edram_tile_count);
   if (!is_64bpp) {
     ApplyPendingFastClear(tile, xenos::GetSurfacePitchTiles(pitch, samples, false), samples, image);
   }
@@ -169,6 +184,81 @@ std::shared_ptr<ColorImage> NativeTargetCache::FindTarget(uint32_t tile, uint32_
                                format, image);
   }
   return image;
+}
+
+void NativeTargetCache::ClaimTiles(CachedTarget& target, uint32_t tile, uint32_t pitch,
+                                   xenos::MsaaSamples samples, VkFormat format, bool is_64bpp,
+                                   uint32_t used_height, uint32_t edram_tile_count) {
+  const uint32_t pitch_tiles = xenos::GetSurfacePitchTiles(pitch, samples, is_64bpp);
+  const VkExtent2D tile_extent =
+      GetEdramTileHostExtent(samples, is_64bpp, draw_resolution_scale_x_, draw_resolution_scale_y_);
+  const uint32_t guest_tile_height = tile_extent.height / draw_resolution_scale_y_;
+  if (!used_height || !pitch_tiles || !guest_tile_height || tile >= edram_tile_count) {
+    return;
+  }
+  const uint64_t used_rows = (uint64_t(used_height) + guest_tile_height - 1) / guest_tile_height;
+  const uint32_t end =
+      uint32_t(std::min<uint64_t>(tile + used_rows * pitch_tiles, edram_tile_count));
+  if (target.claimed_epoch == ownership_epoch_ && target.claimed_end >= end) {
+    return;
+  }
+  if (tile_owners_.size() < edram_tile_count) {
+    tile_owners_.resize(edram_tile_count);
+  }
+  const VkExtent2D extent = target.image->extent();
+  bool changed = false;
+  for (uint32_t run_start = tile; run_start < end;) {
+    const TileOwner owner = tile_owners_[run_start];
+    uint32_t run_end = run_start + 1;
+    while (run_end < end && SameOwner(tile_owners_[run_end].image, owner.image)) {
+      ++run_end;
+    }
+    if (SameOwner(owner.image, target.image)) {
+      run_start = run_end;
+      continue;
+    }
+    const auto previous = owner.image.lock();
+    // Whether the source was ever written is only known when the copy is recorded.
+    if (previous && owner.pitch_tiles == pitch_tiles &&
+        owner.samples == samples && owner.format == format && owner.is_64bpp == is_64bpp) {
+      const VkExtent2D source_extent = previous->extent();
+      std::vector<VkImageCopy> copies;
+      for (const auto& rect : ComputeOverlappingEdramTileCopies(owner.base, tile, pitch_tiles,
+                                                                run_start, run_end)) {
+        const uint32_t src_x = rect.src_x * tile_extent.width;
+        const uint32_t src_y = rect.src_y * tile_extent.height;
+        const uint32_t dst_x = rect.dst_x * tile_extent.width;
+        const uint32_t dst_y = rect.dst_y * tile_extent.height;
+        if (src_x >= source_extent.width || src_y >= source_extent.height ||
+            dst_x >= extent.width || dst_y >= extent.height) {
+          continue;
+        }
+        VkImageCopy copy{};
+        copy.srcSubresource = copy.dstSubresource = {target.image->aspects(), 0, 0, 1};
+        copy.srcOffset = {int32_t(src_x), int32_t(src_y), 0};
+        copy.dstOffset = {int32_t(dst_x), int32_t(dst_y), 0};
+        copy.extent = {std::min({rect.width * tile_extent.width, source_extent.width - src_x,
+                                 extent.width - dst_x}),
+                       std::min({rect.height * tile_extent.height, source_extent.height - src_y,
+                                 extent.height - dst_y}),
+                       1};
+        copies.push_back(copy);
+      }
+      if (!copies.empty()) {
+        queue_transfer_(previous, target.image, std::move(copies));
+      }
+    }
+    for (uint32_t i = run_start; i < run_end; ++i) {
+      tile_owners_[i] = {target.image, tile, pitch_tiles, samples, format, is_64bpp};
+    }
+    changed = true;
+    run_start = run_end;
+  }
+  if (changed) {
+    ++ownership_epoch_;
+  }
+  target.claimed_epoch = ownership_epoch_;
+  target.claimed_end = end;
 }
 
 }  // namespace rex::graphics::native

@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstring>
 
+#include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/logging.h>
 #include <rex/ui/vulkan/util.h>
@@ -15,14 +16,38 @@ VkFilter ToFilter(xenos::TextureFilter filter) {
   return filter == xenos::TextureFilter::kLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
 }
 
-VkSamplerAddressMode ToAddressMode(xenos::ClampMode mode) {
-  switch (mode) {
-    case xenos::ClampMode::kRepeat:
-      return VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    case xenos::ClampMode::kMirroredRepeat:
-      return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+// Converts one endian-swapped guest texel (or block) to host bytes.
+void UnpackTexel(const TextureFormatInfo& info, bool is_signed, const uint8_t* guest,
+                 uint8_t* host) {
+  uint32_t texel = 0;
+  std::memcpy(&texel, guest, std::min(info.block_size, uint32_t(sizeof(texel))));
+  switch (info.unpack) {
+    case TextureUnpack::kDepthUnorm24:
+    case TextureUnpack::kDepthFloat24: {
+      const float depth = info.unpack == TextureUnpack::kDepthFloat24
+                              ? xenos::Float20e4To32(texel >> 8)
+                              : float(texel >> 8) / 16777215.0f;
+      std::memcpy(host, &depth, sizeof(depth));
+      return;
+    }
+    case TextureUnpack::kRgba4ToRgba8:
+    case TextureUnpack::kRgb5a1ToRgba8: {
+      const uint32_t rgba8 = info.unpack == TextureUnpack::kRgba4ToRgba8
+                                 ? UnpackRgba4ToRgba8(uint16_t(texel))
+                                 : UnpackRgb5a1ToRgba8(uint16_t(texel));
+      std::memcpy(host, &rgba8, sizeof(rgba8));
+      return;
+    }
+    case TextureUnpack::kR11G11B10ToRgba16:
+    case TextureUnpack::kR10G11B11ToRgba16: {
+      const auto rgba16 = UnpackR11G11B10ToRgba16(
+          texel, info.unpack == TextureUnpack::kR10G11B11ToRgba16, is_signed);
+      std::memcpy(host, rgba16.data(), sizeof(rgba16));
+      return;
+    }
     default:
-      return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+      std::memcpy(host, guest, info.block_size);
+      return;
   }
 }
 
@@ -62,6 +87,7 @@ void NativeTextureCache::ClearSamplers() {
     device_.functions().vkDestroySampler(device_.device(), entry.second.sampler, nullptr);
   }
   samplers_.clear();
+  custom_border_color_samplers_ = 0;
 }
 
 void NativeTextureCache::MarkCachedPages(uint32_t start, uint32_t length) {
@@ -110,7 +136,21 @@ bool NativeTextureCache::InitializeNullTextures() {
   }
   view.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
   view.subresourceRange.layerCount = 6;
-  return vk.vkCreateImageView(device, &view, nullptr, &null_texture_cube_view_) == VK_SUCCESS;
+  if (vk.vkCreateImageView(device, &view, nullptr, &null_texture_cube_view_) != VK_SUCCESS) {
+    return false;
+  }
+  image.flags = 0;
+  image.imageType = VK_IMAGE_TYPE_3D;
+  image.arrayLayers = 1;
+  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+          &device_, image, ui::vulkan::util::MemoryPurpose::kDeviceLocal, null_texture_3d_image_,
+          null_texture_3d_memory_)) {
+    return false;
+  }
+  view.image = null_texture_3d_image_;
+  view.viewType = VK_IMAGE_VIEW_TYPE_3D;
+  view.subresourceRange.layerCount = 1;
+  return vk.vkCreateImageView(device, &view, nullptr, &null_texture_3d_view_) == VK_SUCCESS;
 }
 
 void NativeTextureCache::DestroyNullTextures() {
@@ -120,6 +160,12 @@ void NativeTextureCache::DestroyNullTextures() {
   vk.vkDestroyImageView(device, null_texture_2d_view_, nullptr);
   vk.vkDestroyImage(device, null_texture_image_, nullptr);
   vk.vkFreeMemory(device, null_texture_memory_, nullptr);
+  vk.vkDestroyImageView(device, null_texture_3d_view_, nullptr);
+  vk.vkDestroyImage(device, null_texture_3d_image_, nullptr);
+  vk.vkFreeMemory(device, null_texture_3d_memory_, nullptr);
+  null_texture_3d_view_ = VK_NULL_HANDLE;
+  null_texture_3d_image_ = VK_NULL_HANDLE;
+  null_texture_3d_memory_ = VK_NULL_HANDLE;
   null_texture_cube_view_ = null_texture_2d_view_ = VK_NULL_HANDLE;
   null_texture_image_ = VK_NULL_HANDLE;
   null_texture_memory_ = VK_NULL_HANDLE;
@@ -127,35 +173,45 @@ void NativeTextureCache::DestroyNullTextures() {
 }
 
 void NativeTextureCache::RecordNullTextureInitialization(VkCommandBuffer commands) {
-  if (null_textures_initialized_ || null_texture_image_ == VK_NULL_HANDLE) {
+  if (null_textures_initialized_ || null_texture_image_ == VK_NULL_HANDLE ||
+      null_texture_3d_image_ == VK_NULL_HANDLE) {
     return;
   }
   const auto& vk = device_.functions();
-  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};
-  VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-  barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  barrier.image = null_texture_image_;
-  barrier.subresourceRange = range;
-  barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  const std::array<VkImage, 2> images{null_texture_image_, null_texture_3d_image_};
+  const std::array<uint32_t, 2> layers{6, 1};
+  std::array<VkImageMemoryBarrier, 2> barriers{};
+  for (size_t i = 0; i < images.size(); ++i) {
+    auto& barrier = barriers[i];
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = images[i];
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers[i]};
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  }
   vk.vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                          uint32_t(barriers.size()), barriers.data());
   const VkClearColorValue zero{};
-  vk.vkCmdClearColorImage(commands, null_texture_image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                          &zero, 1, &range);
-  barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-  vk.vkCmdPipelineBarrier(
-      commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
-      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
-      0, nullptr, 1, &barrier);
+  for (auto& barrier : barriers) {
+    vk.vkCmdClearColorImage(commands, barrier.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero,
+                            1, &barrier.subresourceRange);
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  }
+  vk.vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          0, 0, nullptr, 0, nullptr, uint32_t(barriers.size()), barriers.data());
   null_textures_initialized_ = true;
 }
 
-bool NativeTextureCache::ReadTextures(const SpirvShader& shader, DrawInput& input) {
+bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, DrawInput& input) {
   const auto& textures = shader.GetTextureBindingsAfterTranslation();
   const auto& samplers = shader.GetSamplerBindingsAfterTranslation();
   const auto& properties = device_.properties();
@@ -163,48 +219,85 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, DrawInput& inpu
       samplers.size() > properties.maxPerStageDescriptorSamplers) {
     return false;
   }
-
-  std::array<int, 32> indices;
-  indices.fill(-1);
-  for (const auto& binding : textures) {
-    const bool cube = binding.dimension == xenos::FetchOpDimension::kCube;
-    if (!cube && binding.dimension != xenos::FetchOpDimension::k2D) {
+  auto& texture_bindings = vertex ? input.vertex_texture_bindings : input.texture_bindings;
+  auto& sampler_handles = vertex ? input.vertex_samplers : input.samplers;
+  const auto read = [&](uint32_t slot, const xenos::xe_gpu_texture_fetch_t& fetch,
+                        bool signed_variant) {
+    auto& texture = input.textures.emplace_back();
+    if (!ReadTexture(fetch, texture, signed_variant)) {
+      REXGPU_DEBUG(
+          "Native Vulkan texture {} unsupported: format={} dimension={} base={:05X} "
+          "flags={:08X}/{:08X}",
+          slot, uint32_t(fetch.format), uint32_t(fetch.dimension), uint32_t(fetch.base_address),
+          fetch.dword_4, fetch.dword_5);
       return false;
     }
+    input.system.texture_swizzled_signs[slot / 4] |= uint32_t(texture_util::SwizzleSigns(fetch))
+                                                     << ((slot % 4) * 8);
+    if (texture.resolution_scaled) {
+      input.system.textures_resolution_scaled |= uint32_t(1) << slot;
+    }
+    if (!properties.imageViewFormatSwizzle) {
+      PackSystemTextureSwizzle(input.system.texture_swizzles, slot, texture.host_swizzle);
+    }
+    return true;
+  };
+
+  for (const auto& binding : textures) {
     const uint32_t slot = binding.fetch_constant;
     const auto fetch = regs_.GetTextureFetch(slot);
-    // A fetch constant that isn't a usable texture of the fetched dimension
-    // reads as zero on the guest - bind a zero-cleared fallback rather than
-    // dropping the draw. Its signs stay unsigned.
-    const bool use_fallback =
-        ShouldUseFallbackTexture(fetch.type == xenos::FetchConstantType::kTexture,
-                                 (fetch.base_address & 0x1FFFF) != 0, fetch.stacked,
-                                 fetch.dimension == (cube ? xenos::DataDimension::kCube
-                                                          : xenos::DataDimension::k2DOrStacked));
-    if (indices[slot] < 0) {
-      auto& texture = input.textures.emplace_back();
-      if (use_fallback) {
-        texture.fallback_view = cube ? null_texture_cube_view_ : null_texture_2d_view_;
-      } else if (!ReadTexture(fetch, texture)) {
-        REXGPU_DEBUG(
-            "Native Vulkan texture {} unsupported: format={} base={:05X} flags={:08X}/{:08X}", slot,
-            uint32_t(fetch.format), uint32_t(fetch.base_address), fetch.dword_4, fetch.dword_5);
+    uint32_t base_page = 0, mip_page = 0;
+    texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &base_page,
+                                                   &mip_page, nullptr, nullptr);
+    // A fetch constant that isn't a usable texture of the binding's dimension
+    // reads as zero on the guest - bind a zero-cleared fallback of the same
+    // dimension rather than dropping the draw. Its signs stay unsigned.
+    if (ShouldUseFallbackTexture(fetch.type == xenos::FetchConstantType::kTexture,
+                                 base_page || mip_page,
+                                 TextureBindingMatchesDimension(binding.dimension,
+                                                                fetch.dimension))) {
+      input.textures.emplace_back().fallback_view =
+          binding.dimension == xenos::FetchOpDimension::kCube           ? null_texture_cube_view_
+          : binding.dimension == xenos::FetchOpDimension::k3DOrStacked ? null_texture_3d_view_
+                                                                        : null_texture_2d_view_;
+      texture_bindings.push_back(uint32_t(input.textures.size() - 1));
+      continue;
+    }
+    // A signed binding is only sampled for the signed components, and float
+    // formats are signed in their unsigned view already.
+    const TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
+    const bool sampled_signed =
+        binding.is_signed && texture_util::IsAnySignSigned(texture_util::SwizzleSigns(fetch));
+    if (sampled_signed && info.signed_format == VK_FORMAT_UNDEFINED) {
+      REXGPU_DEBUG("Native Vulkan texture {} format {} has no signed host format", slot,
+                   uint32_t(fetch.format));
+      return false;
+    }
+    const bool signed_variant = sampled_signed && info.signed_format != info.format;
+    int& index = input.texture_indices[slot * 2 + (signed_variant ? 1 : 0)];
+    if (index < 0) {
+      if (signed_variant && !info.unpack_depends_on_sign()) {
+        // The unsigned texels, viewed through the SNORM format.
+        int& unsigned_index = input.texture_indices[slot * 2];
+        if (unsigned_index < 0) {
+          if (!read(slot, fetch, false)) {
+            return false;
+          }
+          unsigned_index = int(input.textures.size() - 1);
+        }
+        DrawTexture texture = input.textures[unsigned_index];
+        if (!MakeSignedView(texture, info.signed_format)) {
+          return false;
+        }
+        input.textures.push_back(std::move(texture));
+      } else if (!read(slot, fetch, signed_variant)) {
         return false;
       }
-      if (!use_fallback) {
-        input.system.texture_swizzled_signs[slot / 4] |= uint32_t(texture_util::SwizzleSigns(fetch))
-                                                         << ((slot % 4) * 8);
-        if (texture.resolution_scaled) {
-          input.system.textures_resolution_scaled |= uint32_t(1) << slot;
-        }
-        if (!properties.imageViewFormatSwizzle) {
-          PackSystemTextureSwizzle(input.system.texture_swizzles, slot, texture.host_swizzle);
-        }
-      }
-      indices[slot] = int(input.textures.size() - 1);
+      index = int(input.textures.size() - 1);
     }
-    input.texture_bindings.push_back(uint32_t(indices[slot]));
+    texture_bindings.push_back(uint32_t(index));
   }
+
   for (const auto& sampler : samplers) {
     const auto fetch = regs_.GetTextureFetch(sampler.fetch_constant);
     DrawSampler out;
@@ -219,16 +312,72 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, DrawInput& inpu
                                 : sampler.mip_filter;
     out.mip_mode = mip_filter == xenos::TextureFilter::kLinear ? VK_SAMPLER_MIPMAP_MODE_LINEAR
                                                                : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    out.max_lod = mip_filter == xenos::TextureFilter::kBaseMap ? 0.0f : float(fetch.mip_max_level);
-    out.address_u = ToAddressMode(fetch.clamp_x);
-    out.address_v = ToAddressMode(fetch.clamp_y);
-    const VkSampler handle = GetSampler(out);
+    xenos::ClampMode clamp_x, clamp_y, clamp_z;
+    texture_util::GetClampModesForDimension(fetch, clamp_x, clamp_y, clamp_z);
+    out.address_u = GetSamplerAddressMode(clamp_x, properties.samplerMirrorClampToEdge);
+    out.address_v = GetSamplerAddressMode(clamp_y, properties.samplerMirrorClampToEdge);
+    out.address_w = GetSamplerAddressMode(clamp_z, properties.samplerMirrorClampToEdge);
+    out.border_color = fetch.border_color;
+    uint32_t mip_min = 0, mip_max = 0;
+    texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr,
+                                                   nullptr, &mip_min, &mip_max);
+    // LOD bias is applied by the translated shader, so mipLodBias stays 0.
+    const bool base_map = mip_filter == xenos::TextureFilter::kBaseMap;
+    out.min_lod = float(mip_min);
+    out.max_lod = base_map ? out.min_lod + 0.25f : float(mip_max);
+    const auto aniso = sampler.aniso_filter == xenos::AnisoFilter::kUseFetchConst
+                           ? fetch.aniso_filter
+                           : sampler.aniso_filter;
+    const bool override_eligible =
+        mip_max > mip_min && !base_map && out.min_filter == VK_FILTER_LINEAR &&
+        out.mag_filter == VK_FILTER_LINEAR &&
+        (mip_filter == xenos::TextureFilter::kPoint || mip_filter == xenos::TextureFilter::kLinear);
+    out.max_anisotropy = GetSamplerAnisotropy(
+        aniso, REXCVAR_GET(anisotropic_override), override_eligible,
+        properties.samplerAnisotropy ? properties.maxSamplerAnisotropy : 0.0f);
+    const TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
+    const bool any_signed = texture_util::IsAnySignSigned(texture_util::SwizzleSigns(fetch));
+    const bool linear_filterable =
+        info.format != VK_FORMAT_UNDEFINED && IsLinearFilterable(info.format) &&
+        (!any_signed || info.signed_format == VK_FORMAT_UNDEFINED ||
+         IsLinearFilterable(info.signed_format));
+    const VkSampler handle = GetSampler(NormalizeDrawSampler(out, linear_filterable));
     if (handle == VK_NULL_HANDLE) {
       return false;
     }
-    input.samplers.push_back(handle);
+    sampler_handles.push_back(handle);
   }
   return true;
+}
+
+bool NativeTextureCache::MakeSignedView(DrawTexture& texture, VkFormat signed_format) {
+  // GPU resolves are kept in their unsigned render target format only.
+  if (texture.resolved_image || texture.crop_source || texture.resolved_cube_faces[0]) {
+    return false;
+  }
+  texture.format = signed_format;
+  if (!texture.cached_texture) {
+    // Uploads its own copy of the texels in the signed format.
+    return true;
+  }
+  texture.cached_view = texture.cached_texture->GetOrCreateView(
+      texture.view_type, signed_format, texture.swizzle,
+      texture.view_type == VK_IMAGE_VIEW_TYPE_3D ? 1 : texture.array_layers);
+  // The unsigned texture bound earlier in the draw uploads the shared image.
+  texture.upload_cached = false;
+  return texture.cached_view != VK_NULL_HANDLE;
+}
+
+bool NativeTextureCache::IsLinearFilterable(VkFormat format) {
+  auto [it, inserted] = linear_filterable_.try_emplace(uint32_t(format), false);
+  if (inserted) {
+    VkFormatProperties format_properties{};
+    device_.vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+        device_.physical_device(), format, &format_properties);
+    it->second = (format_properties.optimalTilingFeatures &
+                  VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+  }
+  return it->second;
 }
 
 VkSampler NativeTextureCache::GetSampler(const DrawSampler& key) {
@@ -237,6 +386,7 @@ VkSampler NativeTextureCache::GetSampler(const DrawSampler& key) {
     existing->second.last_use_submission = clock_.next;
     return existing->second.sampler;
   }
+  const auto& properties = device_.properties();
   if (samplers_.size() >= kMaxSamplers) {
     const auto victim =
         SelectRetiredEviction(samplers_, clock_.retired + 1,
@@ -245,23 +395,64 @@ VkSampler NativeTextureCache::GetSampler(const DrawSampler& key) {
       return VK_NULL_HANDLE;
     }
     auto victim_it = samplers_.find(*victim);
+    custom_border_color_samplers_ -= victim_it->second.custom_border_color ? 1 : 0;
     device_.functions().vkDestroySampler(device_.device(), victim_it->second.sampler, nullptr);
     samplers_.erase(victim_it);
   }
   VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  if (properties.nonSeamlessCubeMap && REXCVAR_GET(non_seamless_cube_map)) {
+    info.flags |= VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT;
+  }
   info.minFilter = key.min_filter;
   info.magFilter = key.mag_filter;
   info.mipmapMode = key.mip_mode;
+  info.minLod = key.min_lod;
   info.maxLod = key.max_lod;
   info.addressModeU = key.address_u;
   info.addressModeV = key.address_v;
-  info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  info.addressModeW = key.address_w;
+  if (key.max_anisotropy != 0.0f) {
+    info.anisotropyEnable = VK_TRUE;
+    info.maxAnisotropy = key.max_anisotropy;
+  }
+  // YCbCr black borders are 0.5 in the chroma components, which only a custom
+  // border color can express; out of custom samplers, they're transparent black.
+  VkSamplerCustomBorderColorCreateInfoEXT custom{
+      VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
+  bool custom_border_color = false;
+  switch (key.border_color) {
+    case xenos::BorderColor::k_ABGR_White:
+      info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+      break;
+    case xenos::BorderColor::k_ACBYCR_Black:
+    case xenos::BorderColor::k_ACBCRY_Black:
+      if (properties.customBorderColors &&
+          custom_border_color_samplers_ < properties.maxCustomBorderColorSamplers) {
+        const bool cbycr = key.border_color == xenos::BorderColor::k_ACBYCR_Black;
+        custom.customBorderColor.float32[0] = cbycr ? 0.5f : 0.0f;
+        custom.customBorderColor.float32[1] = cbycr ? 0.0f : 0.5f;
+        custom.customBorderColor.float32[2] = 0.5f;
+        custom.customBorderColor.float32[3] = 0.0f;
+        custom.format = properties.customBorderColorWithoutFormat
+                            ? VK_FORMAT_UNDEFINED
+                            : VK_FORMAT_R32G32B32A32_SFLOAT;
+        info.pNext = &custom;
+        info.borderColor = VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
+        custom_border_color = true;
+        break;
+      }
+      [[fallthrough]];
+    default:
+      info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+      break;
+  }
   VkSampler sampler = VK_NULL_HANDLE;
   if (device_.functions().vkCreateSampler(device_.device(), &info, nullptr, &sampler) !=
       VK_SUCCESS) {
     return VK_NULL_HANDLE;
   }
-  samplers_.emplace(key, CachedSampler{sampler, clock_.next});
+  custom_border_color_samplers_ += custom_border_color ? 1 : 0;
+  samplers_.emplace(key, CachedSampler{sampler, clock_.next, custom_border_color});
   return sampler;
 }
 
@@ -384,120 +575,56 @@ std::shared_ptr<CachedTexture> NativeTextureCache::GetOrCreateCachedTexture(
 }
 
 bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
-                                     DrawTexture& texture) {
+                                     DrawTexture& texture, bool signed_variant) {
+  const TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
+  if (fetch.type != xenos::FetchConstantType::kTexture || info.format == VK_FORMAT_UNDEFINED) {
+    return false;
+  }
   const bool cube = fetch.dimension == xenos::DataDimension::kCube;
-  if (fetch.type != xenos::FetchConstantType::kTexture ||
-      (!cube && fetch.dimension != xenos::DataDimension::k2DOrStacked) || fetch.stacked) {
+  const bool is_3d = fetch.dimension == xenos::DataDimension::k3D;
+  uint32_t width_minus_1, height_minus_1, depth_minus_1;
+  uint32_t base_page, mip_page, mip_min, mip_max;
+  texture_util::GetSubresourcesFromFetchConstant(fetch, &width_minus_1, &height_minus_1,
+                                                 &depth_minus_1, &base_page, &mip_page, &mip_min,
+                                                 &mip_max);
+  texture.width = width_minus_1 + 1;
+  texture.height = height_minus_1 + 1;
+  texture.depth = is_3d ? depth_minus_1 + 1 : 1;
+  // Cube faces and stacked slices are array layers; 3D slices are depth.
+  texture.array_layers = is_3d ? 1 : depth_minus_1 + 1;
+  if ((cube && texture.width != texture.height) || (!base_page && !mip_page)) {
     return false;
   }
-  // IEEE float host formats are natively signed, so a signed guest fetch maps
-  // straight onto them. Integer, UNORM and BC formats would need separate SNORM
-  // views, so those signed fetches are still rejected until they exist.
-  if (!IsFloatTextureFormat(fetch.format) &&
-      (fetch.sign_x == xenos::TextureSign::kSigned || fetch.sign_y == xenos::TextureSign::kSigned ||
-       fetch.sign_z == xenos::TextureSign::kSigned ||
-       fetch.sign_w == xenos::TextureSign::kSigned)) {
-    return false;
-  }
-
-  texture.width = fetch.size_2d.width + 1;
-  texture.height = fetch.size_2d.height + 1;
-  if (cube && texture.width != texture.height) {
-    return false;
-  }
-  texture.array_layers = GetTextureArrayLayers(fetch.dimension);
-  texture.view_type = cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-  uint32_t block_size;
-  uint32_t block_width = 1;
-  bool depth_texture = false;
-  switch (fetch.format) {
-    case xenos::TextureFormat::k_8:
-    case xenos::TextureFormat::k_8_A:
-    case xenos::TextureFormat::k_8_B:
-      texture.format = VK_FORMAT_R8_UNORM;
-      block_size = 1;
-      break;
-    case xenos::TextureFormat::k_8_8:
-      texture.format = VK_FORMAT_R8G8_UNORM;
-      block_size = 2;
-      break;
-    case xenos::TextureFormat::k_5_6_5:
-      texture.format = VK_FORMAT_R5G6B5_UNORM_PACK16;
-      block_size = 2;
-      break;
-    case xenos::TextureFormat::k_32_FLOAT:
-      texture.format = VK_FORMAT_R32_SFLOAT;
-      block_size = 4;
-      break;
-    case xenos::TextureFormat::k_16_16_FLOAT:
-      texture.format = VK_FORMAT_R16G16_SFLOAT;
-      block_size = 4;
-      break;
-    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
-      texture.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-      block_size = 8;
-      break;
-    case xenos::TextureFormat::k_24_8:
-    case xenos::TextureFormat::k_24_8_FLOAT:
-      texture.format = VK_FORMAT_R32_SFLOAT;
-      block_size = 4;
-      depth_texture = true;
-      break;
-    case xenos::TextureFormat::k_2_10_10_10:
-    case xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16:
-      texture.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-      block_size = 4;
-      break;
-    case xenos::TextureFormat::k_8_8_8_8_AS_16_16_16_16:
-    case xenos::TextureFormat::k_8_8_8_8_A:
-    case xenos::TextureFormat::k_8_8_8_8:
-      texture.format = VK_FORMAT_R8G8B8A8_UNORM;
-      block_size = 4;
-      break;
-    case xenos::TextureFormat::k_DXT1_AS_16_16_16_16:
-    case xenos::TextureFormat::k_DXT1:
-      texture.format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
-      block_width = 4;
-      block_size = 8;
-      break;
-    case xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16:
-    case xenos::TextureFormat::k_DXT2_3:
-      texture.format = VK_FORMAT_BC2_UNORM_BLOCK;
-      block_width = 4;
-      block_size = 16;
-      break;
-    case xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16:
-    case xenos::TextureFormat::k_DXT4_5:
-      texture.format = VK_FORMAT_BC3_UNORM_BLOCK;
-      block_width = 4;
-      block_size = 16;
-      break;
-    case xenos::TextureFormat::k_DXN:
-      texture.format = VK_FORMAT_BC5_UNORM_BLOCK;
-      block_width = 4;
-      block_size = 16;
-      break;
-    default:
-      return false;
-  }
+  texture.view_type = cube    ? VK_IMAGE_VIEW_TYPE_CUBE
+                      : is_3d ? VK_IMAGE_VIEW_TYPE_3D
+                              : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+  const bool sign_unpacked = signed_variant && info.unpack_depends_on_sign();
+  texture.format = sign_unpacked ? info.signed_format : info.format;
+  texture.mutable_format = info.needs_signed_view() &&
+                           texture_util::IsAnySignSigned(texture_util::SwizzleSigns(fetch));
+  const uint32_t block_width = info.block_width;
+  const uint32_t block_size = info.block_size;
+  const bool depth_texture = info.unpack == TextureUnpack::kDepthUnorm24 ||
+                             info.unpack == TextureUnpack::kDepthFloat24;
+  // Single 2D or cube level resolves only.
+  const bool resolvable =
+      base_page && !mip_max && !is_3d && (cube || texture.array_layers == 1);
 
   // Replicate the guest components that the format actually stores, matching
   // the Xenos Vulkan host format swizzle: RRRR for one channel, RGGG for two,
   // RGBA otherwise. Block sizes don't map to channels, so use the count.
   const uint32_t channel_count = TextureChannelCount(fetch.format);
-  uint32_t base_page, mip_page, mip_min, mip_max;
-  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &base_page,
-                                                 &mip_page, &mip_min, &mip_max);
-  if (!base_page || mip_min != 0) {
-    return false;
-  }
   const uint32_t address = base_page << 12;
   const uint32_t scaled_width = texture.width * draw_resolution_scale_x_;
   const uint32_t scaled_height = texture.height * draw_resolution_scale_y_;
   const bool is_scaled = draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1;
   const bool use_view_swizzle = device_.properties().imageViewFormatSwizzle;
-  auto resolved = resolved_images_.find(address);
-  if (cube && !mip_max && resolved != resolved_images_.end()) {
+  auto resolved = resolvable ? resolved_images_.find(address) : resolved_images_.end();
+  // ponytail: array resolves stay in their cached layers; 3D textures decode guest memory.
+  if (resolved != resolved_images_.end() && resolved->second.image->array_layers() != 1) {
+    resolved = resolved_images_.end();
+  }
+  if (cube && resolved != resolved_images_.end()) {
     // Some titles render each cube face as a separate small color target and
     // resolve it to its own slice of the guest layout, leaving guest memory
     // zero. Assemble and cache a cube image from those six resolved faces,
@@ -514,7 +641,8 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
     for (uint32_t face = 0; faces_usable && face < kTextureCubeArrayLayers; ++face) {
       const uint32_t face_addr = GetResolvedCubeFaceAddress(address, face_stride, face);
       auto face_resolved = resolved_images_.find(face_addr);
-      if (face_resolved == resolved_images_.end()) {
+      if (face_resolved == resolved_images_.end() ||
+          face_resolved->second.image->array_layers() != 1) {
         faces_usable = false;
         break;
       }
@@ -586,7 +714,7 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
       return true;
     }
   }
-  if (!cube && !mip_max && resolved != resolved_images_.end() &&
+  if (!cube && resolved != resolved_images_.end() &&
       texture.format == resolved->second.image->format()) {
     // A 32bpp 3/4-channel resolve copied with copy_dest_swap keeps the EDRAM
     // red/blue order, while the guest fetch swizzle expects them swapped in
@@ -675,10 +803,14 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
   key.endianness = fetch.endianness;
   key.pitch = fetch.pitch;
   key.mip_max = mip_max;
+  key.depth = texture.depth;
+  key.is_signed = sign_unpacked;
+  key.signed_view = texture.mutable_format;
 
   // A cached texture whose texels are already uploaded can be sampled straight
   // away: the guest layout and the physical page checks only matter when the
   // image is created or decoded for the first time.
+  const uint32_t view_layers = is_3d ? 1 : texture.array_layers;
   std::shared_ptr<CachedTexture> entry;
   auto cached = cached_textures_.find(key);
   if (cached != cached_textures_.end()) {
@@ -687,10 +819,11 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
     entry->last_use_submission = clock_.next;
     if (entry->uploaded) {
       const VkImageView image_view = entry->GetOrCreateView(texture.view_type, texture.format,
-                                                            texture.swizzle, texture.array_layers);
+                                                            texture.swizzle, view_layers);
       if (image_view == VK_NULL_HANDLE) {
         return false;
       }
+      texture.level_count = entry->level_count;
       texture.cached_texture = entry;
       texture.cached_view = image_view;
       texture.upload_cached = false;
@@ -698,14 +831,24 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
     }
   }
 
+  const bool has_base = base_page != 0;
   const auto layout = texture_util::GetGuestTextureLayout(
-      fetch.dimension, fetch.pitch, texture.width, texture.height, 1, fetch.tiled, fetch.format,
-      fetch.packed_mips, true, mip_max);
+      fetch.dimension, fetch.pitch, texture.width, texture.height,
+      is_3d ? texture.depth : texture.array_layers, fetch.tiled, fetch.format, fetch.packed_mips,
+      has_base, mip_max);
 
+  // Without a base level (mip_min_level > 0) level 0 exists in the image but is
+  // never sampled: the sampler's minLod starts at the first stored mip.
   const uint32_t level_count = layout.max_level + 1;
+  const uint32_t first_level = has_base ? 0 : 1;
+  if (first_level > layout.max_level) {
+    return false;
+  }
+  texture.level_count = level_count;
+  texture.first_level = first_level;
   const uint32_t base_length =
-      uint32_t(rex::align(layout.base.level_data_extent_bytes, uint32_t(4)));
-  if (!IsPhysicalRange(address, base_length)) {
+      has_base ? uint32_t(rex::align(layout.base.level_data_extent_bytes, uint32_t(4))) : 0;
+  if (has_base && !IsPhysicalRange(address, base_length)) {
     return false;
   }
   uint32_t mip_start = 0;
@@ -720,16 +863,20 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
 
   if (!entry) {
     VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    image.imageType = VK_IMAGE_TYPE_2D;
+    image.imageType = is_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     image.format = texture.format;
-    image.extent = {texture.width, texture.height, 1};
+    image.extent = {texture.width, texture.height, texture.depth};
     image.mipLevels = level_count;
-    image.arrayLayers = texture.array_layers;
+    image.arrayLayers = view_layers;
     image.samples = VK_SAMPLE_COUNT_1_BIT;
     image.tiling = VK_IMAGE_TILING_OPTIMAL;
     image.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (texture.view_type == VK_IMAGE_VIEW_TYPE_CUBE) {
+    if (cube) {
       image.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    }
+    if (texture.mutable_format) {
+      // Signed components sample the same texels through an SNORM view.
+      image.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
     bool failed = false;
     const size_t size_before = cached_textures_.size();
@@ -742,8 +889,10 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
           created.mip_length = mip_length;
           if (!cached_texture_pages_.empty()) {
             std::lock_guard<std::mutex> lock(pages_mutex_);
-            const auto [base_first, base_count] = GetPhysicalPageRange(address, base_length);
-            SetPageRangeBits(cached_texture_pages_, base_first, base_count);
+            if (base_length) {
+              const auto [base_first, base_count] = GetPhysicalPageRange(address, base_length);
+              SetPageRangeBits(cached_texture_pages_, base_first, base_count);
+            }
             if (mip_length) {
               const auto [mip_first, mip_count] = GetPhysicalPageRange(mip_start, mip_length);
               SetPageRangeBits(cached_texture_pages_, mip_first, mip_count);
@@ -751,7 +900,9 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
           }
           // Watch the guest pages before reading them, so a write between the read and
           // the next frame invalidates this entry.
-          memory_.EnablePhysicalMemoryAccessCallbacks(address, base_length, true, false);
+          if (base_length) {
+            memory_.EnablePhysicalMemoryAccessCallbacks(address, base_length, true, false);
+          }
           if (mip_length) {
             memory_.EnablePhysicalMemoryAccessCallbacks(mip_start, mip_length, true, false);
           }
@@ -766,83 +917,127 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
   }
 
   const bool upload = !entry || !entry->uploaded;
-  if (upload) {
-    constexpr std::array<size_t, 4> byte_xor{0, 1, 3, 2};
-    const size_t swap = byte_xor[uint32_t(fetch.endianness)];
-    for (uint32_t level = 0; level <= layout.max_level; ++level) {
-      const uint32_t level_storage = std::min(level, layout.packed_level);
-      const auto& level_layout = level ? layout.mips[level_storage] : layout.base;
-      const uint64_t level_address =
-          level ? (uint64_t(mip_page) << 12) + layout.mip_offsets_bytes[level_storage] : address;
-      if (level_address >= kPhysicalMemorySize) {
-        return false;
-      }
-      // Array slices are stored within the level, each `array_slice_stride_bytes`
-      // apart, so the last slice's data must be readable as well.
-      const size_t level_read_size =
-          GetTextureLevelReadSize(level_layout.array_slice_stride_bytes,
-                                  level_layout.array_slice_data_extent_bytes, texture.array_layers);
-      const auto source = ReadGuestPhysical(memory_, uint32_t(level_address),
-                                            rex::align(level_read_size, size_t(4)));
-      if (source.empty()) {
-        return false;
-      }
-      uint32_t start_x = 0, start_y = 0, start_z = 0;
-      if (level >= layout.packed_level) {
-        texture_util::GetPackedMipOffset(texture.width, texture.height, 1, fetch.format, level,
-                                         start_x, start_y, start_z);
-      }
-      const uint32_t level_width = std::max(1u, texture.width >> level);
-      const uint32_t level_height = std::max(1u, texture.height >> level);
-      const uint32_t blocks_x = (level_width + block_width - 1) / block_width;
-      const uint32_t blocks_y = (level_height + block_width - 1) / block_width;
-      auto& data = texture.levels.emplace_back(size_t(blocks_x) * blocks_y * block_size *
-                                               texture.array_layers);
-      for (uint32_t slice = 0; slice < texture.array_layers; ++slice) {
-        const size_t slice_base = size_t(slice) * level_layout.array_slice_stride_bytes;
-        // Each face is tiled independently from the origin of its own data.
-        for (uint32_t y = 0; y < blocks_y; ++y) {
-          for (uint32_t x = 0; x < blocks_x; ++x) {
-            const size_t offset =
-                slice_base + (fetch.tiled ? size_t(texture_util::GetTiledOffset2D(
-                                                int32_t(x + start_x), int32_t(y + start_y),
-                                                level_layout.row_pitch_bytes / block_size,
-                                                std::countr_zero(block_size)))
-                                          : size_t(y + start_y) * level_layout.row_pitch_bytes +
-                                                size_t(x + start_x) * block_size);
-            if (offset > source.size() || block_size > source.size() - offset) {
-              return false;
-            }
-            uint8_t* dst =
-                data.data() + ((size_t(slice) * blocks_y + y) * blocks_x + x) * block_size;
-            for (uint32_t i = 0; i < block_size; ++i) {
-              dst[i] = source[(offset + i) ^ swap];
-            }
-            if (depth_texture) {
-              uint32_t packed;
-              std::memcpy(&packed, dst, sizeof(packed));
-              const float depth = fetch.format == xenos::TextureFormat::k_24_8_FLOAT
-                                      ? xenos::Float20e4To32(packed >> 8)
-                                      : float(packed >> 8) / 16777215.0f;
-              std::memcpy(dst, &depth, sizeof(depth));
-            }
-          }
-        }
-      }
-    }
+  if (upload && !DecodeTextureLevels(fetch, info, layout, address, mip_page, signed_variant,
+                                     texture)) {
+    return false;
   }
 
   if (!entry) {
     return true;
   }
-  const VkImageView image_view = entry->GetOrCreateView(texture.view_type, texture.format,
-                                                        texture.swizzle, texture.array_layers);
+  const VkImageView image_view =
+      entry->GetOrCreateView(texture.view_type, texture.format, texture.swizzle, view_layers);
   if (image_view == VK_NULL_HANDLE) {
     return false;
   }
   texture.cached_texture = entry;
   texture.cached_view = image_view;
   texture.upload_cached = upload;
+  return true;
+}
+
+bool NativeTextureCache::DecodeTextureLevels(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                             const TextureFormatInfo& info,
+                                             const texture_util::TextureGuestLayout& layout,
+                                             uint32_t address, uint32_t mip_page,
+                                             bool signed_variant, DrawTexture& texture) {
+  constexpr std::array<size_t, 4> byte_xor{0, 1, 3, 2};
+  const size_t swap = byte_xor[uint32_t(fetch.endianness)];
+  const bool is_3d = fetch.dimension == xenos::DataDimension::k3D;
+  const uint32_t block_width = info.block_width;
+  const uint32_t block_size = info.block_size;
+  const uint32_t host_size = info.host_block_size();
+  const uint32_t bpb_log2 = uint32_t(std::countr_zero(block_size));
+  for (uint32_t level = texture.first_level; level <= layout.max_level; ++level) {
+    const uint32_t level_storage = std::min(level, layout.packed_level);
+    const auto& level_layout = level ? layout.mips[level_storage] : layout.base;
+    const uint64_t level_address =
+        level ? (uint64_t(mip_page) << 12) + layout.mip_offsets_bytes[level_storage] : address;
+    if (level_address >= kPhysicalMemorySize) {
+      return false;
+    }
+    // Array slices are stored within the level, each `array_slice_stride_bytes`
+    // apart, so the last slice's data must be readable as well.
+    const size_t level_read_size =
+        GetTextureLevelReadSize(level_layout.array_slice_stride_bytes,
+                                level_layout.array_slice_data_extent_bytes, texture.array_layers);
+    const auto source =
+        ReadGuestPhysical(memory_, uint32_t(level_address), rex::align(level_read_size, size_t(4)));
+    if (source.empty()) {
+      return false;
+    }
+    uint32_t start_x = 0, start_y = 0, start_z = 0;
+    if (level >= layout.packed_level) {
+      texture_util::GetPackedMipOffset(texture.width, texture.height, texture.depth, fetch.format,
+                                       level, start_x, start_y, start_z);
+    }
+    const uint32_t level_width = std::max(1u, texture.width >> level);
+    const uint32_t level_height = std::max(1u, texture.height >> level);
+    const uint32_t level_depth = std::max(1u, texture.depth >> level);
+    const uint32_t blocks_x = (level_width + block_width - 1) / block_width;
+    const uint32_t blocks_y = (level_height + block_width - 1) / block_width;
+    // Layers of an array, or slices of a 3D level, one after another.
+    const uint32_t slices = is_3d ? level_depth : texture.array_layers;
+    // Decompressed blocks become texel rows of the level's own size.
+    const uint32_t host_x = info.decompresses_blocks() ? level_width : blocks_x;
+    const uint32_t host_y = info.decompresses_blocks() ? level_height : blocks_y;
+    auto& data = texture.levels.emplace_back(size_t(host_x) * host_y * host_size * slices);
+    const uint32_t z_stride_bytes = level_layout.row_pitch_bytes *
+                                    level_layout.z_slice_stride_block_rows;
+    for (uint32_t slice = 0; slice < slices; ++slice) {
+      const size_t slice_base =
+          is_3d ? 0 : size_t(slice) * level_layout.array_slice_stride_bytes;
+      const uint32_t z = is_3d ? slice + start_z : 0;
+      // Each face is tiled independently from the origin of its own data.
+      for (uint32_t y = 0; y < blocks_y; ++y) {
+        for (uint32_t x = 0; x < blocks_x; ++x) {
+          const int32_t gx = int32_t(x + start_x);
+          const int32_t gy = int32_t(y + start_y);
+          size_t offset = slice_base;
+          if (fetch.tiled) {
+            const uint32_t pitch_blocks = level_layout.row_pitch_bytes / block_size;
+            offset += is_3d ? size_t(texture_util::GetTiledOffset3D(
+                                  gx, gy, int32_t(z), pitch_blocks,
+                                  level_layout.z_slice_stride_block_rows, bpb_log2))
+                            : size_t(texture_util::GetTiledOffset2D(gx, gy, pitch_blocks, bpb_log2));
+          } else {
+            offset += size_t(z) * z_stride_bytes + size_t(gy) * level_layout.row_pitch_bytes +
+                      size_t(gx) * block_size;
+          }
+          if (offset > source.size() || block_size > source.size() - offset) {
+            return false;
+          }
+          std::array<uint8_t, 16> block;
+          for (uint32_t i = 0; i < block_size; ++i) {
+            block[i] = source[(offset + i) ^ swap];
+          }
+          uint8_t* const slice_data = data.data() + size_t(slice) * host_x * host_y * host_size;
+          if (info.decompresses_blocks()) {
+            uint64_t bits;
+            std::memcpy(&bits, block.data(), sizeof(bits));
+            const auto alpha = DecodeDxt3aBlock(bits);
+            const auto rg = DecodeCtx1Block(bits);
+            for (uint32_t texel = 0; texel < 16; ++texel) {
+              const uint32_t tx = x * 4 + texel % 4;
+              const uint32_t ty = y * 4 + texel / 4;
+              if (tx >= level_width || ty >= level_height) {
+                continue;
+              }
+              uint8_t* dst = slice_data + (size_t(ty) * host_x + tx) * host_size;
+              if (info.unpack == TextureUnpack::kDxt3aToR8) {
+                *dst = alpha[texel];
+              } else {
+                std::memcpy(dst, &rg[texel], sizeof(rg[texel]));
+              }
+            }
+            continue;
+          }
+          UnpackTexel(info, signed_variant, block.data(),
+                      slice_data + (size_t(y) * host_x + x) * host_size);
+        }
+      }
+    }
+  }
   return true;
 }
 

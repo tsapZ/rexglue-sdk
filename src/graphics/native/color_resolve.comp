@@ -1,11 +1,21 @@
 #version 450
 
+// Copies one sample, or the average of all samples, of a color render target
+// to a layer of a single-sample destination, scaled by 2^copy_dest_exp_bias.
+// Compiled per destination format (FORMAT_*) and source sample count
+// (SINGLE_SAMPLE for 1x sources).
 layout(local_size_x = 8, local_size_y = 8) in;
+#if defined(SINGLE_SAMPLE)
+layout(set = 0, binding = 0) uniform sampler2DArray source_color;
+#else
 layout(set = 0, binding = 0) uniform sampler2DMSArray source_color;
+#endif
 #if defined(FORMAT_RGB10A2)
 layout(rgb10_a2, set = 0, binding = 1) uniform writeonly image2DArray destination;
 #elif defined(FORMAT_RG16F)
 layout(rg16f, set = 0, binding = 1) uniform writeonly image2DArray destination;
+#elif defined(FORMAT_RGBA16F)
+layout(rgba16f, set = 0, binding = 1) uniform writeonly image2DArray destination;
 #elif defined(FORMAT_R32F)
 layout(r32f, set = 0, binding = 1) uniform writeonly image2DArray destination;
 #else
@@ -15,7 +25,10 @@ layout(push_constant) uniform Resolve {
   ivec2 source_offset;
   ivec2 destination_offset;
   ivec2 extent;
+  // Negative to average all samples.
   int sample_index;
+  float exp_bias_scale;
+  int destination_layer;
 } resolve;
 
 void main() {
@@ -24,6 +37,22 @@ void main() {
     return;
   }
   ivec3 source = ivec3(resolve.source_offset + pixel, 0);
-  imageStore(destination, ivec3(resolve.destination_offset + pixel, 0),
-             texelFetch(source_color, source, resolve.sample_index));
+#if defined(SINGLE_SAMPLE)
+  vec4 color = texelFetch(source_color, source, 0);
+#else
+  vec4 color;
+  if (resolve.sample_index < 0) {
+    int samples = textureSamples(source_color);
+    color = vec4(0.0);
+    for (int i = 0; i < samples; ++i) {
+      color += texelFetch(source_color, source, i);
+    }
+    color /= float(samples);
+  } else {
+    color = texelFetch(source_color, source, resolve.sample_index);
+  }
+#endif
+  imageStore(destination,
+             ivec3(resolve.destination_offset + pixel, resolve.destination_layer),
+             color * resolve.exp_bias_scale);
 }

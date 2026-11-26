@@ -14,6 +14,10 @@ namespace {
 
 using Translator = SpirvShaderTranslator;
 
+// Both vertex and pixel shaders sample textures.
+constexpr VkPipelineStageFlags kTextureStages =
+    VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+
 VkShaderModule CreateShaderModule(const ui::vulkan::VulkanDevice& device, const uint32_t* code,
                                   size_t size) {
   VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -52,7 +56,7 @@ CachedTexture::~CachedTexture() {
 
 VkImageView CachedTexture::GetOrCreateView(VkImageViewType view_type, VkFormat format,
                                            VkComponentMapping swizzle, uint32_t array_layers) {
-  const uint32_t view_key = PackTextureComponentMapping(swizzle);
+  const uint64_t view_key = (uint64_t(format) << 32) | PackTextureComponentMapping(swizzle);
   if (auto found = views.find(view_key); found != views.end()) {
     return found->second;
   }
@@ -179,9 +183,14 @@ VkDescriptorSet DrawBindings::GetEmptySet(size_t index) {
   return pools[index]->Get(empty_set_indices[index]);
 }
 
-bool DrawBindings::Initialize(uint32_t shared_count, uint32_t image_count, uint32_t sampler_count) {
-  if (image_count > xenos::kTextureFetchConstantCount ||
-      sampler_count > xenos::kTextureFetchConstantCount) {
+bool DrawBindings::Initialize(uint32_t shared_count, uint32_t vertex_image_count,
+                              uint32_t vertex_sampler_count, uint32_t pixel_image_count,
+                              uint32_t pixel_sampler_count) {
+  // Each fetch constant may have an unsigned and a signed binding per dimension.
+  constexpr uint32_t kMaxImages = xenos::kTextureFetchConstantCount * 4;
+  if (vertex_image_count > kMaxImages || pixel_image_count > kMaxImages ||
+      vertex_sampler_count > xenos::kTextureFetchConstantCount ||
+      pixel_sampler_count > xenos::kTextureFetchConstantCount) {
     return false;
   }
   const auto& vk = device.functions();
@@ -191,16 +200,27 @@ bool DrawBindings::Initialize(uint32_t shared_count, uint32_t image_count, uint3
     constants[i] = {i, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
   }
+  // Pixel shaders memexport through the shared memory binding too.
   const VkDescriptorSetLayoutBinding shared{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, shared_count,
-                                            VK_SHADER_STAGE_VERTEX_BIT, nullptr};
-  std::vector<VkDescriptorSetLayoutBinding> textures(image_count + sampler_count);
-  for (uint32_t i = 0; i < textures.size(); ++i) {
-    textures[i] = {i,
-                   i < image_count ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER,
-                   1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
-  }
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            nullptr};
+  const auto texture_bindings = [](uint32_t image_count, uint32_t sampler_count,
+                                   VkShaderStageFlags stage) {
+    std::vector<VkDescriptorSetLayoutBinding> textures(image_count + sampler_count);
+    for (uint32_t i = 0; i < textures.size(); ++i) {
+      textures[i] = {
+          i, i < image_count ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER, 1,
+          stage, nullptr};
+    }
+    return textures;
+  };
+  const auto vertex_textures =
+      texture_bindings(vertex_image_count, vertex_sampler_count, VK_SHADER_STAGE_VERTEX_BIT);
+  const auto pixel_textures =
+      texture_bindings(pixel_image_count, pixel_sampler_count, VK_SHADER_STAGE_FRAGMENT_BIT);
   const std::array<std::span<const VkDescriptorSetLayoutBinding>, 4> bindings{
-      std::span(&shared, 1), constants, {}, textures};
+      std::span(&shared, 1), constants, vertex_textures, pixel_textures};
   for (size_t i = 0; i < layouts.size(); ++i) {
     VkDescriptorSetLayoutCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -305,7 +325,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
                           VkBuffer shared_vertex_buffer) {
   const auto& vk = device_->functions();
   const VkDevice device = device_->device();
-  const bool has_textures = !input.texture_bindings.empty() || !input.samplers.empty();
+
   textures_.resize(input.textures.size());
   blend_constants_ = input.blend_constants;
   viewport_ = input.viewport;
@@ -320,14 +340,17 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   index_count_ = uint32_t(indices.size());
   edram_depth_clear_color_ = input.edram_depth_clear_color;
   edram_clear_constants_ = {input.edram_clear_stencil, input.edram_clear_format};
+  rasterizer_discard_ = input.rasterizer_discard;
 
-  const uint32_t image_count = uint32_t(input.texture_bindings.size());
-  const uint32_t sampler_count = uint32_t(input.samplers.size());
-  const std::array binding_key{shared_buffer_count, image_count, sampler_count};
+  const std::array binding_key{shared_buffer_count, uint32_t(input.vertex_texture_bindings.size()),
+                               uint32_t(input.vertex_samplers.size()),
+                               uint32_t(input.texture_bindings.size()),
+                               uint32_t(input.samplers.size())};
   auto found = binding_cache.find(binding_key);
   if (found == binding_cache.end()) {
     auto layout = std::make_unique<DrawBindings>(*device_);
-    if (!layout->Initialize(shared_buffer_count, image_count, sampler_count)) {
+    if (!layout->Initialize(binding_key[0], binding_key[1], binding_key[2], binding_key[3],
+                            binding_key[4])) {
       return false;
     }
     found = binding_cache.emplace(binding_key, std::move(layout)).first;
@@ -386,13 +409,17 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   size = index_offset_ + indices.size_bytes();
   for (size_t i = 0; i < textures_.size(); ++i) {
     const auto& input_texture = input.textures[i];
-    for (uint32_t level = 0; level < input_texture.levels.size(); ++level) {
+    const bool is_3d = input_texture.view_type == VK_IMAGE_VIEW_TYPE_3D;
+    for (uint32_t index = 0; index < input_texture.levels.size(); ++index) {
+      const uint32_t level = input_texture.first_level + index;
       auto& copy = textures_[i].uploads.emplace_back();
       copy.bufferOffset = rex::align(size, VkDeviceSize(16));
-      copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, input_texture.array_layers};
+      copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0,
+                               is_3d ? 1 : input_texture.array_layers};
       copy.imageExtent = {std::max(1u, input_texture.width >> level),
-                          std::max(1u, input_texture.height >> level), 1};
-      size = copy.bufferOffset + input_texture.levels[level].size();
+                          std::max(1u, input_texture.height >> level),
+                          is_3d ? std::max(1u, input_texture.depth >> level) : 1};
+      size = copy.bufferOffset + input_texture.levels[index].size();
     }
   }
   size = ComputeDynamicUboRequiredSize(constant_offsets, kDynamicConstantBufferRanges, size);
@@ -507,7 +534,10 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     texture.cached = input_texture.cached_texture;
     texture.upload_cached = input_texture.upload_cached;
     texture.fallback_view = input_texture.fallback_view;
-    texture.array_layers = texture.resolved ? 1 : input_texture.array_layers;
+    texture.array_layers = texture.resolved || input_texture.view_type == VK_IMAGE_VIEW_TYPE_3D
+                               ? 1
+                               : input_texture.array_layers;
+    texture.level_count = input_texture.level_count;
     texture.extent = {input_texture.width, input_texture.height};
     // The fallback view is a 1x1 zero-cleared image owned by the command
     // processor, so this pass neither allocates nor destroys anything for it.
@@ -530,11 +560,12 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       }
       continue;
     }
-    const uint32_t level_count = std::max(1u, uint32_t(texture.uploads.size()));
+    const uint32_t level_count = std::max(1u, input_texture.level_count);
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    info.imageType = VK_IMAGE_TYPE_2D;
+    info.imageType =
+        input_texture.view_type == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     info.format = input_texture.format;
-    info.extent = {input_texture.width, input_texture.height, 1};
+    info.extent = {input_texture.width, input_texture.height, input_texture.depth};
     info.mipLevels = level_count;
     info.arrayLayers = texture.array_layers;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -558,42 +589,52 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       return false;
     }
   }
-  if (has_textures) {
-    // Up to 32 textures and 32 samplers are written per draw; keep the descriptor
-    // data on the stack rather than allocating two vectors for every draw.
+  // Set 2 holds the vertex shader textures, set 3 the pixel shader ones.
+  const auto write_textures = [&](VkDescriptorSet set, std::span<const uint32_t> bindings,
+                                  std::span<const VkSampler> samplers) {
+    const size_t total = bindings.size() + samplers.size();
+    if (!total) {
+      return;
+    }
+    // Keep the descriptor data on the stack for the common binding counts.
     constexpr size_t kInlineImageInfos = 64;
-    const size_t total = size_t(image_count) + sampler_count;
     std::array<VkDescriptorImageInfo, kInlineImageInfos> inline_image_infos{};
     std::array<VkWriteDescriptorSet, kInlineImageInfos> inline_image_writes{};
     std::vector<VkDescriptorImageInfo> heap_image_infos;
     std::vector<VkWriteDescriptorSet> heap_image_writes;
-    VkDescriptorImageInfo* image_infos;
-    VkWriteDescriptorSet* image_writes;
-    if (total <= kInlineImageInfos) {
-      image_infos = inline_image_infos.data();
-      image_writes = inline_image_writes.data();
-    } else {
+    VkDescriptorImageInfo* image_infos = inline_image_infos.data();
+    VkWriteDescriptorSet* image_writes = inline_image_writes.data();
+    if (total > kInlineImageInfos) {
       heap_image_infos.resize(total);
       heap_image_writes.resize(total);
       image_infos = heap_image_infos.data();
       image_writes = heap_image_writes.data();
     }
     uint32_t info_count = 0;
-    for (uint32_t texture_index : input.texture_bindings) {
+    for (uint32_t texture_index : bindings) {
       image_infos[info_count++] = {VK_NULL_HANDLE, textures_[texture_index].view,
                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     }
-    for (VkSampler sampler : input.samplers) {
+    for (VkSampler sampler : samplers) {
       image_infos[info_count++] = {sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     }
     for (uint32_t i = 0; i < info_count; ++i) {
-      image_writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets_[3], i, 0, 1,
-                         i < image_count ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
-                                         : VK_DESCRIPTOR_TYPE_SAMPLER,
-                         &image_infos[i]};
+      image_writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                         nullptr,
+                         set,
+                         i,
+                         0,
+                         1,
+                         i < bindings.size() ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+                                             : VK_DESCRIPTOR_TYPE_SAMPLER,
+                         &image_infos[i],
+                         nullptr,
+                         nullptr};
     }
     vk.vkUpdateDescriptorSets(device, info_count, image_writes, 0, nullptr);
-  }
+  };
+  write_textures(sets_[2], input.vertex_texture_bindings, input.vertex_samplers);
+  write_textures(sets_[3], input.texture_bindings, input.samplers);
 
   const auto& depth = input.depth_stencil;
   const auto& front = depth.front;
@@ -621,7 +662,8 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
                        uint32_t(back.compareOp),
                        shared_buffer_count,
                        input.edram_depth_clear_color,
-                       uint32_t(input.depth_clamp_enable)},
+                       uint32_t(input.depth_clamp_enable),
+                       uint32_t(input.rasterizer_discard)},
                       {}};
   for (uint32_t i = 0; i < input.color_count; ++i) {
     const auto& color = input.blend[i];
@@ -672,6 +714,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
   raster.polygonMode = VK_POLYGON_MODE_FILL;
   raster.depthClampEnable = input.depth_clamp_enable ? VK_TRUE : VK_FALSE;
+  raster.rasterizerDiscardEnable = input.rasterizer_discard ? VK_TRUE : VK_FALSE;
   raster.depthBiasEnable = depth_bias_enable_ ? VK_TRUE : VK_FALSE;
   raster.frontFace = input.front_face;
   raster.cullMode = input.cull;
@@ -729,8 +772,7 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
     }
     if (texture.resolved) {
       texture.resolved->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                   VK_ACCESS_SHADER_READ_BIT);
+                                   kTextureStages, VK_ACCESS_SHADER_READ_BIT);
       continue;
     }
     // A cached image uploaded by an earlier draw in this batch is already in the
@@ -749,9 +791,7 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
     barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
     barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
-                                texture.crop_source || resolved_faces
-                                    ? 1u
-                                    : uint32_t(texture.uploads.size()),
+                                texture.crop_source || resolved_faces ? 1u : texture.level_count,
                                 0, texture.array_layers};
     // A cached GPU-resolved cube or crop may have been sampled or written earlier
     // in the same command buffer, so wait for prior shader reads and transfers
@@ -760,7 +800,7 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
         texture.cached && (resolved_faces || texture.crop_source != nullptr);
     const VkPipelineStageFlags src_stage =
         cached_resolve_upload
-            ? (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT)
+            ? (kTextureStages | VK_PIPELINE_STAGE_TRANSFER_BIT)
             : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     barrier.srcAccessMask = cached_resolve_upload ? VK_ACCESS_TRANSFER_WRITE_BIT : 0;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -779,8 +819,7 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
       texture.crop_source->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                      VK_ACCESS_SHADER_READ_BIT);
+                                      kTextureStages, VK_ACCESS_SHADER_READ_BIT);
     } else if (resolved_faces) {
       // Each face lives in its own resolve image at up to one resolve-alignment
       // unit larger than the face, so crop its top-left corner into the matching
@@ -798,8 +837,8 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
         copy.extent = {texture.extent.width, texture.extent.height, 1};
         vk.vkCmdCopyImage(commands, face_image->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                           image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-        face_image->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        face_image->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kTextureStages,
+                               VK_ACCESS_SHADER_READ_BIT);
       }
     } else {
       vk.vkCmdCopyBufferToImage(commands, buffer_, image, barrier.newLayout,
@@ -809,15 +848,15 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
     barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vk.vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                            &barrier);
+    vk.vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, kTextureStages, 0, 0,
+                            nullptr, 0, nullptr, 1, &barrier);
   }
 }
 
 void DrawPass::Record(VkCommandBuffer commands, VkExtent2D extent, DrawRenderState& state) {
-  if (!viewport_.xy_extent[0] || !viewport_.xy_extent[1] || scissor_.offset[0] >= extent.width ||
-      scissor_.offset[1] >= extent.height) {
+  if (!rasterizer_discard_ &&
+      (!viewport_.xy_extent[0] || !viewport_.xy_extent[1] || scissor_.offset[0] >= extent.width ||
+       scissor_.offset[1] >= extent.height)) {
     return;
   }
   const auto& vk = device_->functions();

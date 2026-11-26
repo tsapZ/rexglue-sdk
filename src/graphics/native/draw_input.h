@@ -145,6 +145,12 @@ struct DrawSampler {
   float max_lod = 0.0f;
   VkSamplerAddressMode address_u = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   VkSamplerAddressMode address_v = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  VkSamplerAddressMode address_w = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  // Guest border color, only meaningful with a border address mode.
+  xenos::BorderColor border_color = xenos::BorderColor::k_ABGR_Black;
+  float min_lod = 0.0f;
+  // 0 when anisotropic filtering is disabled.
+  float max_anisotropy = 0.0f;
   auto operator<=>(const DrawSampler&) const = default;
 };
 
@@ -152,9 +158,16 @@ struct DrawSampler {
 // same bucket regardless of any padding in the struct.
 struct DrawSamplerHash {
   size_t operator()(const DrawSampler& key) const noexcept {
-    const std::array<uint32_t, 6> fields{
-        uint32_t(key.min_filter), uint32_t(key.mag_filter), uint32_t(key.mip_mode),
-        std::bit_cast<uint32_t>(key.max_lod), uint32_t(key.address_u), uint32_t(key.address_v)};
+    const std::array<uint32_t, 10> fields{uint32_t(key.min_filter),
+                                          uint32_t(key.mag_filter),
+                                          uint32_t(key.mip_mode),
+                                          std::bit_cast<uint32_t>(key.max_lod),
+                                          uint32_t(key.address_u),
+                                          uint32_t(key.address_v),
+                                          uint32_t(key.address_w),
+                                          uint32_t(key.border_color),
+                                          std::bit_cast<uint32_t>(key.min_lod),
+                                          std::bit_cast<uint32_t>(key.max_anisotropy)};
     return size_t(XXH3_64bits(fields.data(), sizeof(fields)));
   }
 };
@@ -175,6 +188,13 @@ struct GuestTextureKey {
   xenos::Endian endianness = xenos::Endian::kNone;
   uint32_t pitch = 0;
   uint32_t mip_max = 0;
+  // 3D texture depth (1 otherwise).
+  uint32_t depth = 1;
+  // Only set for formats whose CPU unpacking depends on the sign.
+  bool is_signed = false;
+  // Created with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT for an SNORM view, only
+  // when signed components are fetched, so other images keep compression.
+  bool signed_view = false;
   auto operator<=>(const GuestTextureKey&) const = default;
 };
 
@@ -182,10 +202,21 @@ struct GuestTextureKey {
 // the following enum can never make two identical keys hash differently.
 struct GuestTextureKeyHash {
   size_t operator()(const GuestTextureKey& key) const noexcept {
-    const std::array<uint32_t, 12> fields{
-        key.base_page,      key.mip_page,       key.width,          key.height,
-        key.array_layers,   uint32_t(key.format), uint32_t(key.dimension), key.tiled,
-        key.packed_mips,    uint32_t(key.endianness), key.pitch,     key.mip_max};
+    const std::array<uint32_t, 15> fields{key.base_page,
+                                          key.mip_page,
+                                          key.width,
+                                          key.height,
+                                          key.array_layers,
+                                          uint32_t(key.format),
+                                          uint32_t(key.dimension),
+                                          key.tiled,
+                                          key.packed_mips,
+                                          uint32_t(key.endianness),
+                                          key.pitch,
+                                          key.mip_max,
+                                          key.depth,
+                                          key.is_signed,
+                                          key.signed_view};
     return size_t(XXH3_64bits(fields.data(), sizeof(fields)));
   }
 };
@@ -218,12 +249,25 @@ constexpr uint32_t TextureChannelCount(xenos::TextureFormat format) {
     case xenos::TextureFormat::k_32_FLOAT:
     case xenos::TextureFormat::k_24_8:
     case xenos::TextureFormat::k_24_8_FLOAT:
+    case xenos::TextureFormat::k_16:
+    case xenos::TextureFormat::k_16_EXPAND:
+    case xenos::TextureFormat::k_16_FLOAT:
+    case xenos::TextureFormat::k_DXT3A:
+    case xenos::TextureFormat::k_DXT5A:
       return 1;
     case xenos::TextureFormat::k_8_8:
+    case xenos::TextureFormat::k_16_16:
+    case xenos::TextureFormat::k_16_16_EXPAND:
     case xenos::TextureFormat::k_16_16_FLOAT:
+    case xenos::TextureFormat::k_32_32_FLOAT:
     case xenos::TextureFormat::k_DXN:
+    case xenos::TextureFormat::k_CTX1:
       return 2;
     case xenos::TextureFormat::k_5_6_5:
+    case xenos::TextureFormat::k_10_11_11:
+    case xenos::TextureFormat::k_10_11_11_AS_16_16_16_16:
+    case xenos::TextureFormat::k_11_11_10:
+    case xenos::TextureFormat::k_11_11_10_AS_16_16_16_16:
       return 3;
     default:
       return 4;
@@ -300,22 +344,319 @@ constexpr uint32_t PackTextureComponentMapping(VkComponentMapping mapping) {
          ((uint32_t(mapping.b) & 0xFF) << 16) | ((uint32_t(mapping.a) & 0xFF) << 24);
 }
 
-// IEEE floating-point host formats are natively signed, so a signed guest fetch
-// maps directly onto them without a separate SNORM view.
-constexpr bool IsFloatTextureFormat(xenos::TextureFormat format) {
-  return format == xenos::TextureFormat::k_32_FLOAT ||
-         format == xenos::TextureFormat::k_16_16_FLOAT ||
-         format == xenos::TextureFormat::k_16_16_16_16_FLOAT;
+// How guest texels become host texels on the CPU before the upload.
+enum class TextureUnpack : uint8_t {
+  // The host format stores the guest blocks as they are.
+  kCopy,
+  // 24-bit depth in the high bits of each texel, to R32_SFLOAT.
+  kDepthUnorm24,
+  kDepthFloat24,
+  kRgba4ToRgba8,
+  kRgb5a1ToRgba8,
+  // Unsigned or signed (by the sign variant) normalized 16-bit RGBA, alpha 1.
+  kR11G11B10ToRgba16,
+  kR10G11B11ToRgba16,
+  // 4x4 blocks decoded to texels.
+  kDxt3aToR8,
+  kCtx1ToRg8,
+};
+
+struct TextureFormatInfo {
+  // Host format sampled for unsigned components; VK_FORMAT_UNDEFINED when the
+  // guest format is unsupported.
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  // Host format sampled for signed components: the same image viewed with a
+  // compatible format (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT), or a separately
+  // unpacked image when the unpacking depends on the sign. VK_FORMAT_UNDEFINED
+  // when signed fetches can't be represented.
+  VkFormat signed_format = VK_FORMAT_UNDEFINED;
+  // Texels along each side of a guest block, and its size in bytes.
+  uint32_t block_width = 1;
+  uint32_t block_size = 0;
+  TextureUnpack unpack = TextureUnpack::kCopy;
+
+  // Whether signed components need a differently unpacked image.
+  constexpr bool unpack_depends_on_sign() const {
+    return unpack == TextureUnpack::kR11G11B10ToRgba16 ||
+           unpack == TextureUnpack::kR10G11B11ToRgba16;
+  }
+  // Whether signed components need an image view with another format.
+  constexpr bool needs_signed_view() const {
+    return signed_format != VK_FORMAT_UNDEFINED && signed_format != format &&
+           !unpack_depends_on_sign();
+  }
+  // Host bytes per texel, or per block for block-compressed host formats.
+  constexpr uint32_t host_block_size() const {
+    switch (unpack) {
+      case TextureUnpack::kDepthUnorm24:
+      case TextureUnpack::kDepthFloat24:
+      case TextureUnpack::kRgba4ToRgba8:
+      case TextureUnpack::kRgb5a1ToRgba8:
+        return 4;
+      case TextureUnpack::kR11G11B10ToRgba16:
+      case TextureUnpack::kR10G11B11ToRgba16:
+        return 8;
+      case TextureUnpack::kDxt3aToR8:
+        return 1;
+      case TextureUnpack::kCtx1ToRg8:
+        return 2;
+      default:
+        return block_size;
+    }
+  }
+  // Whether the host image is uncompressed although the guest blocks are 4x4.
+  constexpr bool decompresses_blocks() const {
+    return unpack == TextureUnpack::kDxt3aToR8 || unpack == TextureUnpack::kCtx1ToRg8;
+  }
+};
+
+// Host format and CPU conversion of a guest texture format, matching the host
+// formats of the Xenos Vulkan backend.
+constexpr TextureFormatInfo GetTextureFormatInfo(xenos::TextureFormat format) {
+  using F = xenos::TextureFormat;
+  using U = TextureUnpack;
+  switch (format) {
+    case F::k_8:
+    case F::k_8_A:
+    case F::k_8_B:
+      return {VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SNORM, 1, 1};
+    case F::k_1_5_5_5:
+      return {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_UNDEFINED, 1, 2, U::kRgb5a1ToRgba8};
+    case F::k_5_6_5:
+      return {VK_FORMAT_R5G6B5_UNORM_PACK16, VK_FORMAT_UNDEFINED, 1, 2};
+    case F::k_8_8_8_8:
+    case F::k_8_8_8_8_A:
+    case F::k_8_8_8_8_AS_16_16_16_16:
+      return {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SNORM, 1, 4};
+    case F::k_2_10_10_10:
+    case F::k_2_10_10_10_AS_16_16_16_16:
+      return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_UNDEFINED, 1, 4};
+    case F::k_8_8:
+      return {VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_SNORM, 1, 2};
+    case F::k_4_4_4_4:
+      return {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_UNDEFINED, 1, 2, U::kRgba4ToRgba8};
+    case F::k_10_11_11:
+    case F::k_10_11_11_AS_16_16_16_16:
+      return {VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_SNORM, 1, 4,
+              U::kR11G11B10ToRgba16};
+    case F::k_11_11_10:
+    case F::k_11_11_10_AS_16_16_16_16:
+      return {VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_SNORM, 1, 4,
+              U::kR10G11B11ToRgba16};
+    case F::k_DXT1:
+    case F::k_DXT1_AS_16_16_16_16:
+      return {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_UNDEFINED, 4, 8};
+    case F::k_DXT2_3:
+    case F::k_DXT2_3_AS_16_16_16_16:
+      return {VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_UNDEFINED, 4, 16};
+    case F::k_DXT4_5:
+    case F::k_DXT4_5_AS_16_16_16_16:
+      return {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_UNDEFINED, 4, 16};
+    case F::k_24_8:
+      return {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT, 1, 4, U::kDepthUnorm24};
+    case F::k_24_8_FLOAT:
+      return {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT, 1, 4, U::kDepthFloat24};
+    case F::k_16:
+      return {VK_FORMAT_R16_UNORM, VK_FORMAT_R16_SNORM, 1, 2};
+    case F::k_16_16:
+      return {VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16_SNORM, 1, 4};
+    case F::k_16_16_16_16:
+      return {VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_SNORM, 1, 8};
+    case F::k_16_EXPAND:
+    case F::k_16_FLOAT:
+      return {VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16_SFLOAT, 1, 2};
+    case F::k_16_16_EXPAND:
+    case F::k_16_16_FLOAT:
+      return {VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R16G16_SFLOAT, 1, 4};
+    case F::k_16_16_16_16_EXPAND:
+    case F::k_16_16_16_16_FLOAT:
+      return {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT, 1, 8};
+    case F::k_32_FLOAT:
+      return {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT, 1, 4};
+    case F::k_32_32_FLOAT:
+      return {VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32_SFLOAT, 1, 8};
+    case F::k_32_32_32_32_FLOAT:
+      return {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT, 1, 16};
+    case F::k_DXN:
+      return {VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_BC5_SNORM_BLOCK, 4, 16};
+    case F::k_DXT5A:
+      return {VK_FORMAT_BC4_UNORM_BLOCK, VK_FORMAT_BC4_SNORM_BLOCK, 4, 8};
+    case F::k_DXT3A:
+      return {VK_FORMAT_R8_UNORM, VK_FORMAT_UNDEFINED, 4, 8, U::kDxt3aToR8};
+    case F::k_CTX1:
+      return {VK_FORMAT_R8G8_UNORM, VK_FORMAT_UNDEFINED, 4, 8, U::kCtx1ToRg8};
+    default:
+      return {};
+  }
+}
+
+// Replicates the high bits of an n-bit unsigned normalized value into 16 bits.
+constexpr uint16_t ExpandUnorm16(uint32_t value, uint32_t bits) {
+  value &= (1u << bits) - 1;
+  uint32_t result = value << (16 - bits);
+  for (uint32_t shift = bits; shift < 16; shift += bits) {
+    result |= value << (16 - bits) >> shift;
+  }
+  return uint16_t(result);
+}
+
+// An n-bit two's complement normalized value as 16-bit SNORM, with both of
+// the most negative values -1.0 (Xenos XeSNorm10To16/XeSNorm11To16).
+constexpr uint16_t ExpandSnorm16(uint32_t value, uint32_t bits) {
+  value &= (1u << bits) - 1;
+  const uint32_t sign = value >> (bits - 1);
+  if (value == 1u << (bits - 1)) {
+    ++value;
+  }
+  uint32_t magnitude = ((value ^ (sign ? (1u << bits) - 1 : 0u)) + sign) & ((1u << bits) - 1);
+  // The (bits - 1)-bit magnitude replicated into 15 bits like UNORM.
+  magnitude = ExpandUnorm16(magnitude, bits - 1) >> 1;
+  return uint16_t(((magnitude ^ (sign ? 0xFFFFu : 0u)) + sign) & 0xFFFF);
+}
+
+// k_4_4_4_4 (R in the low bits) to R8G8B8A8.
+constexpr uint32_t UnpackRgba4ToRgba8(uint16_t texel) {
+  uint32_t result = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    result |= ((uint32_t(texel) >> (i * 4)) & 0xF) * 0x11 << (i * 8);
+  }
+  return result;
+}
+
+// k_1_5_5_5 (R in the low bits, A in the top bit) to R8G8B8A8.
+constexpr uint32_t UnpackRgb5a1ToRgba8(uint16_t texel) {
+  uint32_t result = (texel >> 15) ? 0xFF000000u : 0u;
+  for (uint32_t i = 0; i < 3; ++i) {
+    result |= uint32_t(ExpandUnorm16(texel >> (i * 5), 5) >> 8) << (i * 8);
+  }
+  return result;
+}
+
+// k_10_11_11 (R11 G11 B10 from the low bits) or k_11_11_10 (R10 G11 B11) to
+// four 16-bit normalized components with alpha 1, as the Xenos load shaders.
+constexpr std::array<uint16_t, 4> UnpackR11G11B10ToRgba16(uint32_t texel, bool r10g11b11,
+                                                         bool is_signed) {
+  const std::array<uint32_t, 3> bits =
+      r10g11b11 ? std::array<uint32_t, 3>{10, 11, 11} : std::array<uint32_t, 3>{11, 11, 10};
+  std::array<uint16_t, 4> result{0, 0, 0, uint16_t(is_signed ? 0x7FFF : 0xFFFF)};
+  uint32_t shift = 0;
+  for (uint32_t i = 0; i < 3; ++i) {
+    const uint32_t value = texel >> shift;
+    result[i] = is_signed ? ExpandSnorm16(value, bits[i]) : ExpandUnorm16(value, bits[i]);
+    shift += bits[i];
+  }
+  return result;
+}
+
+// Decodes a k_DXT3A block (4 bits per texel, row by row) to 16 R8 texels.
+constexpr std::array<uint8_t, 16> DecodeDxt3aBlock(uint64_t block) {
+  std::array<uint8_t, 16> texels{};
+  for (uint32_t i = 0; i < 16; ++i) {
+    texels[i] = uint8_t(((block >> (i * 4)) & 0xF) * 0x11);
+  }
+  return texels;
+}
+
+// Decodes a k_CTX1 block (bytes X0 Y0 X1 Y1, then 2 bits per texel selecting
+// endpoint 0, endpoint 1 or the 2:1 and 1:2 blends) to 16 R8G8 texels.
+constexpr std::array<uint16_t, 16> DecodeCtx1Block(uint64_t block) {
+  const std::array<uint32_t, 2> end0{uint32_t(block & 0xFF), uint32_t((block >> 8) & 0xFF)};
+  const std::array<uint32_t, 2> end1{uint32_t((block >> 16) & 0xFF),
+                                     uint32_t((block >> 24) & 0xFF)};
+  // Weight of endpoint 1 (in thirds) for each index.
+  constexpr std::array<uint32_t, 4> weights{0, 3, 1, 2};
+  std::array<uint16_t, 16> texels{};
+  for (uint32_t i = 0; i < 16; ++i) {
+    const uint32_t weight = weights[(block >> (32 + i * 2)) & 3];
+    uint32_t texel = 0;
+    for (uint32_t c = 0; c < 2; ++c) {
+      texel |= ((end0[c] * (3 - weight) + end1[c] * weight) / 3) << (c * 8);
+    }
+    texels[i] = uint16_t(texel);
+  }
+  return texels;
 }
 
 // A fetch constant that cannot produce texels - not a texture fetch, no base
-// level, stacked, or a resource dimension the shader doesn't fetch as - reads as
+// or mip level, or a resource dimension the binding doesn't sample - reads as
 // zero on the guest, so bind a zero-cleared fallback view rather than rejecting
 // the draw. Valid textures that merely use unsupported formats or unreadable
 // memory are still rejected so real errors stay visible.
-constexpr bool ShouldUseFallbackTexture(bool fetch_is_texture, bool has_base_level, bool stacked,
+constexpr bool ShouldUseFallbackTexture(bool fetch_is_texture, bool has_levels,
                                         bool dimension_matches) {
-  return !fetch_is_texture || !has_base_level || stacked || !dimension_matches;
+  return !fetch_is_texture || !has_levels || !dimension_matches;
+}
+
+// Whether a binding of the shader's fetch dimension samples a texture of the
+// guest data dimension: 1D and stacked 2D textures are bound as 2D arrays,
+// and a k3DOrStacked fetch has separate 2D array and 3D bindings.
+constexpr bool TextureBindingMatchesDimension(xenos::FetchOpDimension binding,
+                                              xenos::DataDimension data) {
+  switch (binding) {
+    case xenos::FetchOpDimension::kCube:
+      return data == xenos::DataDimension::kCube;
+    case xenos::FetchOpDimension::k3DOrStacked:
+      return data == xenos::DataDimension::k3D;
+    default:
+      return data == xenos::DataDimension::k1D || data == xenos::DataDimension::k2DOrStacked;
+  }
+}
+
+// Host address mode for a guest clamp mode: no Vulkan equivalent of the
+// halfway modes, and mirrored clamps only to the edge (if supported).
+constexpr VkSamplerAddressMode GetSamplerAddressMode(xenos::ClampMode mode,
+                                                     bool mirror_clamp_to_edge) {
+  switch (mode) {
+    case xenos::ClampMode::kRepeat:
+      return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    case xenos::ClampMode::kMirroredRepeat:
+      return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    case xenos::ClampMode::kMirrorClampToEdge:
+    case xenos::ClampMode::kMirrorClampToHalfway:
+    case xenos::ClampMode::kMirrorClampToBorder:
+      return mirror_clamp_to_edge ? VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE
+                                  : VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    case xenos::ClampMode::kClampToBorder:
+      return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    default:
+      return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  }
+}
+
+// Host anisotropy for a guest filter (0 for disabled): anisotropic_override
+// forces it on trilinear/bilinear mipmapped textures, as the Xenos backend
+// does, and the device limit caps it.
+constexpr float GetSamplerAnisotropy(xenos::AnisoFilter filter, int32_t anisotropic_override,
+                                     bool override_eligible, float device_max_anisotropy) {
+  if (anisotropic_override > -1 && anisotropic_override < 6 && override_eligible) {
+    filter = xenos::AnisoFilter(anisotropic_override);
+  }
+  if (filter == xenos::AnisoFilter::kDisabled || filter > xenos::AnisoFilter::kMax_16_1 ||
+      device_max_anisotropy < 1.0f) {
+    return 0.0f;
+  }
+  return std::min(float(1u << (uint32_t(filter) - 1)), std::min(device_max_anisotropy, 16.0f));
+}
+
+// Linear filtering and anisotropy forced off for a host format that can't be
+// linearly filtered, and anisotropy forcing linear filtering otherwise.
+constexpr DrawSampler NormalizeDrawSampler(DrawSampler sampler, bool linear_filterable) {
+  if (!linear_filterable) {
+    sampler.min_filter = sampler.mag_filter = VK_FILTER_NEAREST;
+    sampler.mip_mode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sampler.max_anisotropy = 0.0f;
+  } else if (sampler.max_anisotropy != 0.0f) {
+    sampler.min_filter = sampler.mag_filter = VK_FILTER_LINEAR;
+    sampler.mip_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  }
+  const bool border = sampler.address_u == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
+                      sampler.address_v == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
+                      sampler.address_w == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+  if (!border) {
+    // The color is unused, so samplers differing only in it are the same.
+    sampler.border_color = xenos::BorderColor::k_ABGR_Black;
+  }
+  return sampler;
 }
 
 // Resolve offsets and sizes are 8x8-aligned, so a cached resolve can be up to
@@ -1032,6 +1373,63 @@ constexpr std::pair<uint32_t, uint32_t> GetSparseGranuleRange(uint64_t address, 
   const uint64_t first = address / granule_size;
   const uint64_t last = (address + size - 1) / granule_size;
   return {uint32_t(first), uint32_t(last - first + 1)};
+}
+
+// A rectangle of EDRAM tiles (in tile units) to copy between two host images
+// of targets with the same pitch, sample count and format that alias the same
+// guest tiles.
+struct EdramTileCopy {
+  uint32_t src_x;
+  uint32_t src_y;
+  uint32_t dst_x;
+  uint32_t dst_y;
+  uint32_t width;
+  uint32_t height;
+  auto operator<=>(const EdramTileCopy&) const = default;
+};
+
+// Rectangles covering the guest tiles [overlap_start, overlap_end) shared by a
+// target at src_base and one at dst_base, both pitch_tiles wide. Runs of tiles
+// map to rows that may wrap at different columns in the two targets, and
+// consecutive rows with the same columns merge.
+inline std::vector<EdramTileCopy> ComputeOverlappingEdramTileCopies(uint32_t src_base,
+                                                                   uint32_t dst_base,
+                                                                   uint32_t pitch_tiles,
+                                                                   uint32_t overlap_start,
+                                                                   uint32_t overlap_end) {
+  std::vector<EdramTileCopy> copies;
+  if (!pitch_tiles || overlap_start >= overlap_end || overlap_start < src_base ||
+      overlap_start < dst_base) {
+    return copies;
+  }
+  for (uint32_t tile = overlap_start; tile < overlap_end;) {
+    const uint32_t src = tile - src_base;
+    const uint32_t dst = tile - dst_base;
+    const uint32_t run = std::min({overlap_end - tile, pitch_tiles - src % pitch_tiles,
+                                   pitch_tiles - dst % pitch_tiles});
+    const EdramTileCopy row{src % pitch_tiles, src / pitch_tiles, dst % pitch_tiles,
+                            dst / pitch_tiles, run, 1};
+    auto* last = copies.empty() ? nullptr : &copies.back();
+    if (last && last->src_x == row.src_x && last->dst_x == row.dst_x && last->width == row.width &&
+        last->src_y + last->height == row.src_y && last->dst_y + last->height == row.dst_y) {
+      ++last->height;
+    } else {
+      copies.push_back(row);
+    }
+    tile += run;
+  }
+  return copies;
+}
+
+// Host pixels of one EDRAM tile of a target: 80x16 samples, half as wide for
+// 64bpp formats and 4x MSAA, half as tall for 2x and 4x MSAA.
+constexpr VkExtent2D GetEdramTileHostExtent(xenos::MsaaSamples samples, bool is_64bpp,
+                                            uint32_t scale_x, uint32_t scale_y) {
+  const uint32_t width = xenos::kEdramTileWidthSamples >>
+                         ((samples >= xenos::MsaaSamples::k4X ? 1 : 0) + (is_64bpp ? 1 : 0));
+  const uint32_t height =
+      xenos::kEdramTileHeightSamples >> (samples >= xenos::MsaaSamples::k2X ? 1 : 0);
+  return {width * scale_x, height * scale_y};
 }
 
 }  // namespace rex::graphics::native

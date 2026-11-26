@@ -30,9 +30,11 @@ class ColorImage {
   ColorImage(const ColorImage&) = delete;
   ColorImage& operator=(const ColorImage&) = delete;
 
+  // array_layers > 1 for resolves into slices of an array destination.
   bool Initialize(VkExtent2D extent, VkFormat format = kFormat,
                   VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT,
-                  VkImageAspectFlags aspects = VK_IMAGE_ASPECT_COLOR_BIT);
+                  VkImageAspectFlags aspects = VK_IMAGE_ASPECT_COLOR_BIT,
+                  uint32_t array_layers = 1);
   void Transition(VkCommandBuffer commands, VkImageLayout layout, VkPipelineStageFlags stage,
                   VkAccessFlags access);
   void Clear(VkCommandBuffer commands, const VkClearColorValue& color);
@@ -48,6 +50,7 @@ class ColorImage {
   // until destruction, so callers must not destroy it.
   VkImageView GetSampledView(VkComponentMapping swizzle);
   VkExtent2D extent() const { return extent_; }
+  uint32_t array_layers() const { return array_layers_; }
   void MarkResolved() { unpublished_resolve_ = true; }
   bool TakeResolvedOutput() { return std::exchange(unpublished_resolve_, false); }
   bool initialized() const { return layout_ != VK_IMAGE_LAYOUT_UNDEFINED; }
@@ -59,6 +62,7 @@ class ColorImage {
   VmaAllocator allocator_;
   VmaAllocation allocation_ = VK_NULL_HANDLE;
   VkExtent2D extent_{};
+  uint32_t array_layers_ = 1;
   VkFormat format_ = kFormat;
   VkSampleCountFlagBits samples_ = VK_SAMPLE_COUNT_1_BIT;
   VkImageAspectFlags aspects_ = VK_IMAGE_ASPECT_COLOR_BIT;

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <rex/graphics/pipeline/shader/spirv.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/system/xmemory.h>
 #include <rex/ui/vulkan/device.h>
@@ -69,7 +70,8 @@ class NativeTextureCache {
   // Clears the fallback textures and moves them to the shader-read layout once,
   // before any draw that may sample them.
   void RecordNullTextureInitialization(VkCommandBuffer commands);
-  bool ReadTextures(const SpirvShader& shader, DrawInput& input);
+  // Reads the textures and samplers a vertex or pixel shader binds.
+  bool ReadTextures(const SpirvShader& shader, bool vertex, DrawInput& input);
 
   void InvalidateTextures(uint32_t start, uint32_t length);
   void InvalidateResolvedTextures(uint32_t start, uint32_t length);
@@ -93,6 +95,7 @@ class NativeTextureCache {
   struct CachedSampler {
     VkSampler sampler = VK_NULL_HANDLE;
     uint64_t last_use_submission = 0;
+    bool custom_border_color = false;
   };
   struct CachedTextureEntry {
     std::shared_ptr<CachedTexture> texture;
@@ -103,7 +106,17 @@ class NativeTextureCache {
   static constexpr size_t kMaxResolvedCubes = 64;
   static constexpr size_t kMaxResolvedCrops = 64;
 
-  bool ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch, DrawTexture& texture);
+  // signed_variant: the texels for signed components, for formats whose
+  // unpacking depends on the sign.
+  bool ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch, DrawTexture& texture,
+                   bool signed_variant);
+  bool DecodeTextureLevels(const xenos::xe_gpu_texture_fetch_t& fetch,
+                           const TextureFormatInfo& info,
+                           const texture_util::TextureGuestLayout& layout, uint32_t address,
+                           uint32_t mip_page, bool signed_variant, DrawTexture& texture);
+  // Turns a copy of an unsigned texture into its view for signed components.
+  bool MakeSignedView(DrawTexture& texture, VkFormat signed_format);
+  bool IsLinearFilterable(VkFormat format);
   VkSampler GetSampler(const DrawSampler& key);
   bool InitializeNullTextures();
   void DestroyNullTextures();
@@ -126,7 +139,12 @@ class NativeTextureCache {
   VkDeviceMemory null_texture_memory_ = VK_NULL_HANDLE;
   VkImageView null_texture_2d_view_ = VK_NULL_HANDLE;
   VkImageView null_texture_cube_view_ = VK_NULL_HANDLE;
+  VkImage null_texture_3d_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory null_texture_3d_memory_ = VK_NULL_HANDLE;
+  VkImageView null_texture_3d_view_ = VK_NULL_HANDLE;
   bool null_textures_initialized_ = false;
+  std::unordered_map<uint32_t, bool> linear_filterable_;
+  uint32_t custom_border_color_samplers_ = 0;
   std::unordered_map<uint32_t, CachedResolve> resolved_images_;
   std::optional<uint32_t> presented_resolve_address_;
   std::unordered_map<DrawSampler, CachedSampler, DrawSamplerHash> samplers_;

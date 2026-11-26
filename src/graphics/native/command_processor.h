@@ -61,6 +61,7 @@ class NativeCommandProcessor : public CommandProcessor {
     uint32_t color_count;
     // Index into the passes recorded with the same commands.
     size_t pass_index;
+    bool memexport = false;
   };
   struct QueuedResolve {
     std::shared_ptr<ColorImage> source;
@@ -74,8 +75,11 @@ class NativeCommandProcessor : public CommandProcessor {
     uint32_t depth_sample = 0;
     float depth_scale = 1.0f;
     size_t color_descriptor = SIZE_MAX;
-    uint32_t color_sample = 0;
+    // Negative to average all samples.
+    int32_t color_sample = 0;
     bool format_convert = false;
+    float exp_bias_scale = 1.0f;
+    uint32_t destination_layer = 0;
   };
   struct QueuedDepthClear {
     std::shared_ptr<ColorImage> target;
@@ -88,8 +92,14 @@ class NativeCommandProcessor : public CommandProcessor {
     VkDeviceSize dst_offset = 0;
     VkDeviceSize size = 0;
   };
-  using FrameCommand =
-      std::variant<QueuedDraw, QueuedResolve, QueuedDepthClear, QueuedBufferUpload>;
+  // EDRAM tiles an aliasing target left behind, copied into the target now using them.
+  struct QueuedTileTransfer {
+    std::shared_ptr<ColorImage> source;
+    std::shared_ptr<ColorImage> destination;
+    std::vector<VkImageCopy> copies;
+  };
+  using FrameCommand = std::variant<QueuedDraw, QueuedResolve, QueuedDepthClear,
+                                    QueuedBufferUpload, QueuedTileTransfer>;
   using PendingFastClear = NativeTargetCache::PendingFastClear;
   using PendingColorFastClear = NativeTargetCache::PendingColorFastClear;
   using CachedResolve = NativeTextureCache::CachedResolve;
@@ -112,9 +122,10 @@ class NativeCommandProcessor : public CommandProcessor {
   std::pair<uint32_t, uint32_t> MemoryInvalidationCallback(uint32_t physical_address_start,
                                                            uint32_t length, bool exact_range);
 
+  // used_height: guest rows about to be drawn or resolved (see NativeTargetCache).
   std::shared_ptr<ColorImage> FindTarget(uint32_t tile, uint32_t pitch, xenos::MsaaSamples samples,
                                          VkFormat format, VkImageAspectFlags aspects,
-                                         bool is_64bpp = false);
+                                         bool is_64bpp = false, uint32_t used_height = 0);
   void QueueReplayDraw(const DrawInput& input, std::span<const uint32_t> indices,
                        const Shader::Translation& vertex, const Shader::Translation* pixel,
                        uint32_t rt_index, const std::shared_ptr<ColorImage>& image);
@@ -126,10 +137,14 @@ class NativeCommandProcessor : public CommandProcessor {
   void RecordBufferUploads(std::span<const FrameCommand> commands);
   void RecordResolve(const QueuedResolve& resolve);
   void RecordDepthClear(const QueuedDepthClear& clear);
+  void RecordTileTransfer(const QueuedTileTransfer& transfer);
   bool CaptureResolveImage(ColorImage& image, VkOffset2D src_offset, VkExtent2D src_extent,
                            std::vector<uint8_t>& pixels_out);
   bool ReadBackResolve(const draw_util::ResolveInfo& copy, uint32_t address, uint32_t pitch,
                        const QueuedResolve& resolve);
+  // Copies memexported ranges from the shared vertex buffer back to guest
+  // memory, waiting for the GPU.
+  bool ReadBackMemexport(std::span<const draw_util::MemExportRange> ranges);
   bool RenderGuestOutput(ui::Presenter::GuestOutputRefreshContext& context, VkExtent2D extent,
                          uint32_t frontbuffer_address);
 

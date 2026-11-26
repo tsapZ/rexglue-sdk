@@ -37,6 +37,10 @@ namespace {
 
 using Translator = SpirvShaderTranslator;
 
+// Vertex fetches read the shared vertex buffer; vertex and pixel shader memexports write it.
+constexpr VkPipelineStageFlags kSharedMemoryShaderStages =
+    VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+
 std::optional<VkPrimitiveTopology> GetTopology(xenos::PrimitiveType type) {
   switch (type) {
     case xenos::PrimitiveType::kTriangleList:
@@ -306,6 +310,10 @@ bool NativeCommandProcessor::SetupContext() {
              const Shader::Translation& vertex, const Shader::Translation* pixel,
              uint32_t rt_index, const std::shared_ptr<ColorImage>& image) {
         QueueReplayDraw(input, indices, vertex, pixel, rt_index, image);
+      },
+      [this](const std::shared_ptr<ColorImage>& source,
+             const std::shared_ptr<ColorImage>& destination, std::vector<VkImageCopy> copies) {
+        pending_.emplace_back(QueuedTileTransfer{source, destination, std::move(copies)});
       });
   if (!texture_cache_->Initialize(shared_vertex_ != nullptr)) {
     ShutdownContext();
@@ -650,15 +658,17 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   const auto topology = GetTopology(prim_type);
   const auto depth_control = draw_util::GetNormalizedDepthControl(regs);
-  const bool use_depth = depth_control.z_enable || depth_control.stencil_enable;
-  const bool use_color = mode == xenos::EdramMode::kColorDepth && color_mask;
+  // Without a surface pitch nothing is rasterized; a vertex shader may still memexport.
+  const bool has_pitch = dimensions.surface_pitch != 0;
+  const bool use_depth = has_pitch && (depth_control.z_enable || depth_control.stencil_enable);
+  const bool use_color = has_pitch && mode == xenos::EdramMode::kColorDepth && color_mask;
   const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
   const bool float_depth = depth_info.depth_format == xenos::DepthRenderTargetFormat::kD24FS8;
   if (!use_color && !use_depth && !candidate_vs.memexport_eM_written()) {
     return true;
   }
-  if (!topology || !index_count || !dimensions.surface_pitch ||
-      dimensions.msaa_samples > xenos::MsaaSamples::k4X || (use_color && !active_pixel_shader_)) {
+  if (!topology || !index_count || dimensions.msaa_samples > xenos::MsaaSamples::k4X ||
+      (use_color && !active_pixel_shader_)) {
     return false;
   }
 
@@ -687,7 +697,13 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     string::StringBuffer disassembly;
     ps->AnalyzeUcode(disassembly);
   }
-  if (vs.memexport_eM_written() || (ps && ps->memexport_eM_written())) {
+  const auto& properties = vulkan_device_->properties();
+  const bool vs_memexport = vs.memexport_eM_written() != 0;
+  const bool ps_memexport = ps && ps->memexport_eM_written() != 0;
+  const bool memexport = vs_memexport || ps_memexport;
+  if ((vs_memexport && !properties.vertexPipelineStoresAndAtomics) ||
+      (ps_memexport && !properties.fragmentStoresAndAtomics) || (memexport && !shared_vertex_)) {
+    REXGPU_DEBUG("Native Vulkan: memexport draw unsupported on this device");
     return false;
   }
 
@@ -703,7 +719,6 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   } else if (point) {
     host_vertex_type = Shader::HostVertexShaderType::kPointListAsTriangleStrip;
   }
-  const auto& properties = vulkan_device_->properties();
   const auto clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   const auto ucp = GetUserClipPlaneConfig(clip_cntl, properties.shaderClipDistance,
                                           properties.shaderCullDistance);
@@ -736,8 +751,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if ((!vertex.is_translated() && !translator_->TranslateAnalyzedShader(vertex)) ||
       (pixel && ((!pixel->is_translated() && !translator_->TranslateAnalyzedShader(*pixel)) ||
                  !pixel->is_valid())) ||
-      !vertex.is_valid() || !vs.GetTextureBindingsAfterTranslation().empty() ||
-      !vs.GetSamplerBindingsAfterTranslation().empty()) {
+      !vertex.is_valid()) {
     return false;
   }
 
@@ -820,9 +834,12 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     input.blend_constants[channel] = regs.Get<float>(XE_GPU_REG_RB_BLEND_RED + uint32_t(channel));
   }
   DrainMemoryInvalidations();
-  if (ps && !texture_cache_->ReadTextures(*ps, input)) {
+  if (!texture_cache_->ReadTextures(vs, true, input) ||
+      (ps && !texture_cache_->ReadTextures(*ps, false, input))) {
     return false;
   }
+  input.memexport = memexport;
+  input.rasterizer_discard = !use_color && !use_depth;
   draw_util::GetHostViewportInfo(regs, draw_resolution_scale_x_, draw_resolution_scale_y_, false,
                                  properties.maxViewportDimensions[0],
                                  properties.maxViewportDimensions[1], true, depth_control,
@@ -832,8 +849,15 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   input.scissor.offset[1] *= draw_resolution_scale_y_;
   input.scissor.extent[0] *= draw_resolution_scale_x_;
   input.scissor.extent[1] *= draw_resolution_scale_y_;
-  if (!input.viewport.xy_extent[0] || !input.viewport.xy_extent[1] || !input.scissor.extent[0] ||
-      !input.scissor.extent[1]) {
+  if (input.rasterizer_discard) {
+    // Only the vertex shader's memexport runs; keep valid dynamic state.
+    input.viewport.xy_offset[0] = input.viewport.xy_offset[1] = 0;
+    input.viewport.xy_extent[0] = input.viewport.xy_extent[1] = 1;
+    input.scissor = {};
+    input.scissor.extent[0] = input.scissor.extent[1] = 1;
+  } else if (!memexport &&
+             (!input.viewport.xy_extent[0] || !input.viewport.xy_extent[1] ||
+              !input.scissor.extent[0] || !input.scissor.extent[1])) {
     return true;
   }
   const auto transform = regs.Get<reg::PA_CL_VTE_CNTL>();
@@ -943,9 +967,32 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (!use_shared_vertices && input.vertices.empty()) {
     input.vertices.resize(sizeof(uint32_t));
   }
+  // Memexport writes the shared vertex buffer, so the guest data it partially
+  // overwrites must be there first.
+  std::vector<draw_util::MemExportRange> memexport_ranges;
+  if (memexport) {
+    if (!use_shared_vertices) {
+      return false;
+    }
+    if (vs_memexport) {
+      draw_util::AddMemExportRanges(regs, vs, memexport_ranges);
+    }
+    if (ps_memexport) {
+      draw_util::AddMemExportRanges(regs, *ps, memexport_ranges);
+    }
+    for (const auto& range : memexport_ranges) {
+      if (!EnsureSharedVertexRange(range.base_address_dwords << 2, range.size_bytes)) {
+        return false;
+      }
+    }
+  }
 
   QueuedDraw draw{};
   const auto layout = ActiveEdramLayout();
+  // Guest rows the draw may touch, for EDRAM tile ownership.
+  const uint32_t used_height =
+      (input.scissor.offset[1] + input.scissor.extent[1] + draw_resolution_scale_y_ - 1) /
+      draw_resolution_scale_y_;
   const uint32_t writes =
       use_color ? draw_util::GetNormalizedColorMask(regs, ps->writes_color_targets()) : 0;
   std::array<bool, xenos::kMaxColorRenderTargets> bound_rt{};
@@ -967,7 +1014,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     const uint32_t rt_tile = layout.DecodeBase(target.value);
     const bool rt_is_64bpp = xenos::IsColorRenderTargetFormat64bpp(target.color_format);
     draw.colors[i] = FindTarget(rt_tile, dimensions.surface_pitch, dimensions.msaa_samples,
-                                format, VK_IMAGE_ASPECT_COLOR_BIT, rt_is_64bpp);
+                                format, VK_IMAGE_ASPECT_COLOR_BIT, rt_is_64bpp, used_height);
     if (!draw.colors[i]) {
       return false;
     }
@@ -988,14 +1035,16 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       input.system.flags |= Translator::kSysFlag_ConvertColor0ToGamma << i;
     }
   }
-  if (!input.color_count && !use_depth) {
+  if (!input.color_count && !use_depth && !memexport) {
     return true;
   }
   draw.color_count = input.color_count;
+  draw.memexport = memexport;
   if (use_depth) {
     draw.depth = FindTarget(layout.DecodeBase(depth_info.value), dimensions.surface_pitch,
                             dimensions.msaa_samples, input.depth_format,
-                            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+                            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, false,
+                            used_height);
     if (!draw.depth) {
       return false;
     }
@@ -1017,6 +1066,23 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       if (texture.resolved_crop_version != 0) {
         texture.cached_texture->resolved_crop_version = texture.resolved_crop_version;
       }
+    }
+  }
+  if (memexport) {
+    // The shared vertex buffer now holds the newest data of these ranges, and
+    // anything decoded from the guest copies is stale. Unknown destinations
+    // (dynamic stream constants) conservatively invalidate every texture.
+    if (memexport_ranges.empty()) {
+      texture_cache_->InvalidateTextures(0, kPhysicalMemorySize);
+      texture_cache_->InvalidateResolvedTextures(0, kPhysicalMemorySize);
+    }
+    for (const auto& range : memexport_ranges) {
+      texture_cache_->InvalidateTextures(range.base_address_dwords << 2, range.size_bytes);
+      texture_cache_->InvalidateResolvedTextures(range.base_address_dwords << 2, range.size_bytes);
+    }
+    if (IsReadbackMemexportEnabled(false) && !memexport_ranges.empty() &&
+        !ReadBackMemexport(memexport_ranges)) {
+      return false;
     }
   }
 
@@ -1180,9 +1246,10 @@ std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, ui
                                                                xenos::MsaaSamples samples,
                                                                VkFormat format,
                                                                VkImageAspectFlags aspects,
-                                                               bool is_64bpp) {
+                                                               bool is_64bpp,
+                                                               uint32_t used_height) {
   return target_cache_->FindTarget(tile, pitch, samples, format, aspects, is_64bpp,
-                                   ActiveEdramLayout().tile_count, presented_);
+                                   ActiveEdramLayout().tile_count, presented_, used_height);
 }
 
 void NativeCommandProcessor::QueueReplayDraw(const DrawInput& input,
@@ -1248,6 +1315,11 @@ bool NativeCommandProcessor::IssueCopy() {
     if (!rect) {
       return false;
     }
+    // Claims the cleared rows (a hit now, so only the ownership is updated).
+    FindTarget(copy.depth_original_base, surface_info.surface_pitch, surface_info.msaa_samples,
+               target_cache_->GetDepthFormat(depth_format),
+               VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, false,
+               (rect->y + rect->height + draw_resolution_scale_y_ - 1) / draw_resolution_scale_y_);
     const uint32_t packed_depth = copy.rb_depth_clear >> 8;
     const float depth_value = depth_format == xenos::DepthRenderTargetFormat::kD24FS8
                                   ? xenos::Float20e4To32(packed_depth) * 0.5f
@@ -1259,16 +1331,25 @@ bool NativeCommandProcessor::IssueCopy() {
   }
   const auto samples = surface_info.msaa_samples;
   const auto selection = copy.copy_dest_coordinate_info.copy_sample_select;
-  const bool average_all =
-      cmd_resolve_image_ &&
-      ((samples == xenos::MsaaSamples::k2X && selection == xenos::CopySampleSelect::k01) ||
-       (samples == xenos::MsaaSamples::k4X && selection == xenos::CopySampleSelect::k0123));
+  const bool average_selection =
+      (samples == xenos::MsaaSamples::k2X && selection == xenos::CopySampleSelect::k01) ||
+      (samples == xenos::MsaaSamples::k4X && selection == xenos::CopySampleSelect::k0123);
+  const bool average_all = cmd_resolve_image_ && average_selection;
   const bool depth = copy.IsCopyingDepth();
   const VkFormat color_format =
       ColorTargetFormat(xenos::ColorRenderTargetFormat(copy.color_edram_info.format));
   const bool single_sample = !depth && samples != xenos::MsaaSamples::k1X &&
-                             color_format != VK_FORMAT_R16G16B16A16_SFLOAT &&
                              xenos::IsSingleCopySampleSelected(selection);
+  // Slices of an array destination are layers of one cached resolve image.
+  constexpr uint32_t kResolveArrayLayers = 8;
+  const bool dest_array = copy.copy_dest_info.copy_dest_array != 0;
+  const int32_t exp_bias = depth ? 0 : copy.copy_dest_info.copy_dest_exp_bias;
+  // The compute resolve picks one sample or averages them, and applies the exp
+  // bias and the destination layer.
+  const bool compute_resolve =
+      !depth && color_format != VK_FORMAT_UNDEFINED &&
+      (single_sample || exp_bias != 0 || dest_array) &&
+      (samples == xenos::MsaaSamples::k1X || single_sample || average_selection);
   const VkFormat output_format =
       depth ? VK_FORMAT_R32_SFLOAT : CopyColorFormat(copy.copy_dest_info.copy_dest_format);
   const uint32_t resolve_address = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
@@ -1279,10 +1360,11 @@ bool NativeCommandProcessor::IssueCopy() {
                                       copy.copy_dest_info.copy_dest_format) &&
       (output_format == VK_FORMAT_R8_UNORM ? r8_resolve_blit_ : rg8_resolve_blit_);
   if ((!depth &&
-       ((samples != xenos::MsaaSamples::k1X && !average_all && !single_sample) ||
-        color_format == VK_FORMAT_UNDEFINED || (color_format != output_format && !format_convert) ||
-        copy.copy_dest_info.copy_dest_exp_bias)) ||
-      copy.copy_dest_info.copy_dest_array || !IsPhysicalRange(resolve_address, 1) ||
+       ((samples != xenos::MsaaSamples::k1X && !average_all && !compute_resolve) ||
+        color_format == VK_FORMAT_UNDEFINED ||
+        (color_format != output_format && (!format_convert || compute_resolve)) ||
+        ((exp_bias != 0 || dest_array) && !compute_resolve))) ||
+      (depth && dest_array) || !IsPhysicalRange(resolve_address, 1) ||
       copy.copy_dest_extent_start < resolve_address ||
       !IsPhysicalRange(copy.copy_dest_extent_start, copy.copy_dest_extent_length)) {
     if (depth_clear) {
@@ -1323,6 +1405,17 @@ bool NativeCommandProcessor::IssueCopy() {
   if (!rect) {
     return false;
   }
+  // Claims the resolved rows (a hit now, so only the ownership is updated).
+  const uint32_t resolve_height =
+      (rect->y + rect->height + draw_resolution_scale_y_ - 1) / draw_resolution_scale_y_;
+  if (depth) {
+    FindTarget(copy.depth_original_base, surface_info.surface_pitch, samples,
+               target_cache_->GetDepthFormat(depth_format),
+               VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, false, resolve_height);
+  } else {
+    FindTarget(copy.color_original_base, surface_info.surface_pitch, samples, color_format,
+               VK_IMAGE_ASPECT_COLOR_BIT, color_is_64bpp, resolve_height);
+  }
   const VkExtent2D extent{rect->width, rect->height};
 
   const uint32_t dest_info = copy.copy_dest_info.value;
@@ -1342,7 +1435,9 @@ bool NativeCommandProcessor::IssueCopy() {
   VkOffset2D destination_offset{};
   uint32_t dest_resolve_address = resolve_address;
   uint32_t dest_pitch_to_store = dest_pitch;
-  if (existing != resolved_images().end() && existing->second.image->format() == output_format) {
+  const uint32_t dest_layers = dest_array ? kResolveArrayLayers : 1;
+  if (existing != resolved_images().end() && existing->second.image->format() == output_format &&
+      existing->second.image->array_layers() == dest_layers) {
     const auto existing_extent = existing->second.image->extent();
     if (!has_offset && existing_extent.width == target_extent.width &&
         existing_extent.height == target_extent.height) {
@@ -1361,7 +1456,7 @@ bool NativeCommandProcessor::IssueCopy() {
       }
     }
   }
-  if (!destination && dest_pitch_reg.copy_dest_pitch != 0) {
+  if (!destination && dest_pitch_reg.copy_dest_pitch != 0 && !dest_array) {
     const uint32_t bpp_log2 = GetResolveBytesPerBlockLog2(output_format);
     uint64_t best_version = 0;
     for (const auto& [base_addr, entry] : resolved_images()) {
@@ -1428,13 +1523,14 @@ bool NativeCommandProcessor::IssueCopy() {
       texture_cache_->RebuildCachedTexturePages();
     }
     destination = std::make_shared<ColorImage>(*vulkan_device_, vma_allocator_);
-    if (!destination->Initialize(target_extent, output_format)) {
+    if (!destination->Initialize(target_extent, output_format, VK_SAMPLE_COUNT_1_BIT,
+                                 VK_IMAGE_ASPECT_COLOR_BIT, dest_layers)) {
       return false;
     }
   }
   const size_t depth_descriptor = depth ? depth_resolve_->Allocate() : SIZE_MAX;
-  const size_t color_descriptor = single_sample ? color_resolve_->Allocate() : SIZE_MAX;
-  if ((depth && depth_descriptor == SIZE_MAX) || (single_sample && color_descriptor == SIZE_MAX)) {
+  const size_t color_descriptor = compute_resolve ? color_resolve_->Allocate() : SIZE_MAX;
+  if ((depth && depth_descriptor == SIZE_MAX) || (compute_resolve && color_descriptor == SIZE_MAX)) {
     return false;
   }
   texture_cache_->InvalidateTextures(copy.copy_dest_extent_start, copy.copy_dest_extent_length);
@@ -1466,7 +1562,8 @@ bool NativeCommandProcessor::IssueCopy() {
       copy.copy_dest_info.copy_dest_format == xenos::ColorFormat::k_8_8_8_8 &&
       copy.copy_dest_info.copy_dest_number ==
           xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction &&
-      !copy.copy_dest_info.copy_dest_swap && uint32_t(copy.copy_dest_info.copy_dest_endian) <= 3;
+      !copy.copy_dest_info.copy_dest_swap && !dest_array &&
+      uint32_t(copy.copy_dest_info.copy_dest_endian) <= 3;
   const uint32_t copy_dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>().copy_dest_pitch;
   const ResolveRectangle guest_rect{
       copy.copy_dest_x, copy.copy_dest_y,
@@ -1506,8 +1603,12 @@ bool NativeCommandProcessor::IssueCopy() {
                     depth_sample,
                     depth_format == xenos::DepthRenderTargetFormat::kD24FS8 ? 2.0f : 1.0f,
                     color_descriptor,
-                    single_sample ? GetResolveSampleIndex(samples, selection) : 0,
-                    format_convert});
+                    single_sample ? int32_t(GetResolveSampleIndex(samples, selection))
+                    : average_selection ? -1
+                                        : 0,
+                    format_convert,
+                    std::ldexp(1.0f, exp_bias),
+                    dest_array ? copy.copy_dest_info.copy_dest_slice : 0u});
   if (depth_clear) {
     pending_.emplace_back(std::move(*depth_clear));
   }
@@ -1582,6 +1683,80 @@ bool NativeCommandProcessor::CaptureResolveImage(ColorImage& image, VkOffset2D s
     return false;
   }
   pixels_out.assign(mapped.begin(), mapped.end());
+  return true;
+}
+
+bool NativeCommandProcessor::ReadBackMemexport(
+    std::span<const draw_util::MemExportRange> ranges) {
+  uint64_t total_size = 0;
+  for (const auto& range : ranges) {
+    total_size += range.size_bytes;
+  }
+  if (!total_size) {
+    return true;
+  }
+  const auto& vk = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device_, total_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, buffer, memory)) {
+    REXLOG_ERROR("Native Vulkan: could not create a {} byte memexport readback buffer",
+                 total_size);
+    return false;
+  }
+  const auto release = [&] {
+    vk.vkDestroyBuffer(device, buffer, nullptr);
+    vk.vkFreeMemory(device, memory, nullptr);
+  };
+  if (!BeginCommands()) {
+    release();
+    return false;
+  }
+  RecordPending();
+  std::vector<VkBufferCopy> copies;
+  VkDeviceSize offset = 0;
+  for (const auto& range : ranges) {
+    copies.push_back({VkDeviceSize(range.base_address_dwords) << 2, offset, range.size_bytes});
+    offset += range.size_bytes;
+  }
+  vk.vkCmdCopyBuffer(command_buffer_, shared_vertex_->buffer(), buffer, uint32_t(copies.size()),
+                     copies.data());
+  VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.buffer = buffer;
+  barrier.size = VK_WHOLE_SIZE;
+  vk.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+  void* mapped = nullptr;
+  const VkMappedMemoryRange whole{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, memory, 0,
+                                  VK_WHOLE_SIZE};
+  if (!SubmitCommands() || !RetireAllSubmissions() ||
+      vk.vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+    release();
+    return false;
+  }
+  vk.vkInvalidateMappedMemoryRanges(device, 1, &whole);
+  // The CPU writes guest memory directly, bypassing the access watches; the
+  // shared vertex buffer already holds the same bytes.
+  const auto* bytes = static_cast<const uint8_t*>(mapped);
+  for (const auto& range : ranges) {
+    const uint32_t address = range.base_address_dwords << 2;
+    const auto access = IsPhysicalRange(address, range.size_bytes)
+                            ? memory_->GetPhysicalHeap()->QueryRangeAccess(
+                                  address, address + range.size_bytes - 1)
+                            : memory::PageAccess::kNoAccess;
+    if (access == memory::PageAccess::kReadWrite ||
+        access == memory::PageAccess::kExecuteReadWrite) {
+      std::memcpy(memory_->TranslatePhysical(address), bytes, range.size_bytes);
+    }
+    bytes += range.size_bytes;
+  }
+  vk.vkUnmapMemory(device, memory);
+  release();
   return true;
 }
 
@@ -1719,7 +1894,19 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
     rendering.pDepthAttachment = rendering.pStencilAttachment = &depth;
   }
   if (attachment_extent.width == UINT32_MAX) {
-    attachment_extent = {};
+    // Memexport-only draws have no attachments.
+    attachment_extent = draw.memexport ? VkExtent2D{1, 1} : VkExtent2D{};
+  }
+  if (draw.memexport) {
+    // Earlier draws reading the memory this one writes must be done.
+    VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = shared_vertex_->buffer();
+    barrier.size = VK_WHOLE_SIZE;
+    vk.vkCmdPipelineBarrier(command_buffer_, kSharedMemoryShaderStages, kSharedMemoryShaderStages,
+                            0, 0, nullptr, 1, &barrier, 0, nullptr);
   }
   rendering.renderArea.extent = attachment_extent;
   if (!needs_full_clear) {
@@ -1739,6 +1926,19 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
                                                                      attachment_extent, state);
   }
   vk.vkCmdEndRendering(command_buffer_);
+  if (draw.memexport) {
+    // Make the exported data visible to later draws, copies and readback.
+    VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = shared_vertex_->buffer();
+    barrier.size = VK_WHOLE_SIZE;
+    vk.vkCmdPipelineBarrier(command_buffer_, kSharedMemoryShaderStages,
+                            kSharedMemoryShaderStages | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                            nullptr, 1, &barrier, 0, nullptr);
+  }
 }
 
 void NativeCommandProcessor::RecordDepthClear(const QueuedDepthClear& clear) {
@@ -1763,6 +1963,31 @@ void NativeCommandProcessor::RecordDepthClear(const QueuedDepthClear& clear) {
   rendering.pDepthAttachment = rendering.pStencilAttachment = &depth;
   vk.vkCmdBeginRendering(command_buffer_, &rendering);
   vk.vkCmdEndRendering(command_buffer_);
+}
+
+void NativeCommandProcessor::RecordTileTransfer(const QueuedTileTransfer& transfer) {
+  auto& destination = *transfer.destination;
+  if (!transfer.source->initialized()) {
+    // Nothing was ever drawn to the aliased tiles.
+    return;
+  }
+  if (!destination.initialized()) {
+    // Unowned EDRAM outside the copied tiles reads as zero bits.
+    if (destination.aspects() & VK_IMAGE_ASPECT_DEPTH_BIT) {
+      RecordDepthClear({transfer.destination, {{0, 0}, destination.extent()}, {0.0f, 0}});
+    } else {
+      destination.Clear(command_buffer_, {});
+    }
+  }
+  constexpr auto transfer_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  transfer.source->Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                              transfer_stage, VK_ACCESS_TRANSFER_READ_BIT);
+  destination.Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, transfer_stage,
+                         VK_ACCESS_TRANSFER_WRITE_BIT);
+  vulkan_device_->functions().vkCmdCopyImage(
+      command_buffer_, transfer.source->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      destination.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(transfer.copies.size()),
+      transfer.copies.data());
 }
 
 void NativeCommandProcessor::RecordResolve(const QueuedResolve& resolve) {
@@ -1795,7 +2020,9 @@ void NativeCommandProcessor::RecordResolve(const QueuedResolve& resolve) {
     color_resolve_->Record(command_buffer_, resolve.color_descriptor, resolve.source->view(),
                            resolve.destination->view(), {resolve.source_offset, resolve.extent},
                            resolve.destination_offset, resolve.color_sample,
-                           resolve.destination->format());
+                           resolve.destination->format(),
+                           resolve.source->samples() != VK_SAMPLE_COUNT_1_BIT,
+                           resolve.exp_bias_scale, resolve.destination_layer);
   } else {
     constexpr auto transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
     resolve.source->Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, transfer,
@@ -2005,14 +2232,15 @@ bool NativeCommandProcessor::BeginCommands() {
 void NativeCommandProcessor::RecordBufferUploads(std::span<const FrameCommand> commands) {
   const auto& vk = vulkan_device_->functions();
   VkBufferMemoryBarrier pre{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-  pre.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  pre.srcAccessMask =
+      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
   pre.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   pre.srcQueueFamilyIndex = pre.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   pre.buffer = shared_vertex_->buffer();
   pre.offset = 0;
   pre.size = VK_WHOLE_SIZE;
   vk.vkCmdPipelineBarrier(command_buffer_,
-                          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          kSharedMemoryShaderStages | VK_PIPELINE_STAGE_TRANSFER_BIT,
                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &pre, 0, nullptr);
   for (const auto& command : commands) {
     const auto& upload = std::get<QueuedBufferUpload>(command);
@@ -2021,13 +2249,13 @@ void NativeCommandProcessor::RecordBufferUploads(std::span<const FrameCommand> c
   }
   VkBufferMemoryBarrier post{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
   post.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  post.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  post.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
   post.srcQueueFamilyIndex = post.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   post.buffer = shared_vertex_->buffer();
   post.offset = 0;
   post.size = VK_WHOLE_SIZE;
   vk.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 0, nullptr, 1, &post, 0, nullptr);
+                          kSharedMemoryShaderStages, 0, 0, nullptr, 1, &post, 0, nullptr);
 }
 
 size_t NativeCommandProcessor::RecordPending() {
@@ -2039,9 +2267,12 @@ size_t NativeCommandProcessor::RecordPending() {
     const auto& command = pending_[first];
     if (const auto* draw = std::get_if<QueuedDraw>(&command)) {
       size_t end = first + 1;
-      for (; end < pending_.size(); ++end) {
+      // A memexport draw is recorded alone, so the barriers around it can be
+      // outside the render pass.
+      for (; end < pending_.size() && !draw->memexport; ++end) {
         const auto* next = std::get_if<QueuedDraw>(&pending_[end]);
-        if (!next || next->colors != draw->colors || next->depth != draw->depth) {
+        if (!next || next->memexport || next->colors != draw->colors ||
+            next->depth != draw->depth) {
           break;
         }
       }
@@ -2060,6 +2291,8 @@ size_t NativeCommandProcessor::RecordPending() {
     } else {
       if (const auto* resolve = std::get_if<QueuedResolve>(&command)) {
         RecordResolve(*resolve);
+      } else if (const auto* transfer = std::get_if<QueuedTileTransfer>(&command)) {
+        RecordTileTransfer(*transfer);
       } else {
         RecordDepthClear(std::get<QueuedDepthClear>(command));
       }

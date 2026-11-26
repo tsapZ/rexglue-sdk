@@ -268,26 +268,29 @@ TEST_CASE("Native texture channel counts drive swizzle replication", "[gpu][nati
   CHECK(k565_swizzle.a == VK_COMPONENT_SWIZZLE_R);
 }
 
-TEST_CASE("Native signed fetches only pass through float formats", "[gpu][native]") {
+TEST_CASE("Native signed fetches use the same view only for float formats", "[gpu][native]") {
   using xenos::TextureFormat;
-  CHECK(native::IsFloatTextureFormat(TextureFormat::k_32_FLOAT));
-  CHECK(native::IsFloatTextureFormat(TextureFormat::k_16_16_FLOAT));
-  CHECK(native::IsFloatTextureFormat(TextureFormat::k_16_16_16_16_FLOAT));
-  CHECK_FALSE(native::IsFloatTextureFormat(TextureFormat::k_8_8_8_8));
-  CHECK_FALSE(native::IsFloatTextureFormat(TextureFormat::k_8_8));
-  CHECK_FALSE(native::IsFloatTextureFormat(TextureFormat::k_DXN));
-  CHECK_FALSE(native::IsFloatTextureFormat(TextureFormat::k_2_10_10_10));
+  for (const auto format : {TextureFormat::k_32_FLOAT, TextureFormat::k_16_16_FLOAT,
+                            TextureFormat::k_16_16_16_16_FLOAT}) {
+    const auto info = native::GetTextureFormatInfo(format);
+    CHECK(info.signed_format == info.format);
+    CHECK_FALSE(info.needs_signed_view());
+  }
+  CHECK(native::GetTextureFormatInfo(TextureFormat::k_8_8_8_8).needs_signed_view());
+  CHECK(native::GetTextureFormatInfo(TextureFormat::k_8_8).needs_signed_view());
+  CHECK(native::GetTextureFormatInfo(TextureFormat::k_DXN).needs_signed_view());
+  CHECK(native::GetTextureFormatInfo(TextureFormat::k_2_10_10_10).signed_format ==
+        VK_FORMAT_UNDEFINED);
 }
 
 TEST_CASE("Native invalid fetches bind a zero-cleared fallback", "[gpu][native]") {
-  // Only a real texture of the fetched dimension with a base level avoids the
-  // fallback.
-  CHECK_FALSE(native::ShouldUseFallbackTexture(true, true, false, true));
+  // Only a real texture of the binding's dimension with a level to sample
+  // avoids the fallback; stacked textures are real textures now.
+  CHECK_FALSE(native::ShouldUseFallbackTexture(true, true, true));
   // Anything the guest would read as zero takes the fallback instead.
-  CHECK(native::ShouldUseFallbackTexture(false, true, false, true));
-  CHECK(native::ShouldUseFallbackTexture(true, false, false, true));
-  CHECK(native::ShouldUseFallbackTexture(true, true, true, true));
-  CHECK(native::ShouldUseFallbackTexture(true, true, false, false));
+  CHECK(native::ShouldUseFallbackTexture(false, true, true));
+  CHECK(native::ShouldUseFallbackTexture(true, false, true));
+  CHECK(native::ShouldUseFallbackTexture(true, true, false));
   // Unsupported formats or unreadable memory still reject, and those never
   // reach this decision because ReadTexture fails first - the checks above only
   // cover the pre-ReadTexture fallback conditions.

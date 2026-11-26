@@ -57,7 +57,7 @@ VkImageView ColorImage::GetSampledView(VkComponentMapping swizzle) {
   info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
   info.format = format_;
   info.components = swizzle;
-  info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, array_layers_};
   VkImageView view = VK_NULL_HANDLE;
   if (device_.functions().vkCreateImageView(device_.device(), &info, nullptr, &view) !=
       VK_SUCCESS) {
@@ -68,10 +68,11 @@ VkImageView ColorImage::GetSampledView(VkComponentMapping swizzle) {
 }
 
 bool ColorImage::Initialize(VkExtent2D extent, VkFormat format, VkSampleCountFlagBits samples,
-                            VkImageAspectFlags aspects) {
+                            VkImageAspectFlags aspects, uint32_t array_layers) {
   const auto& properties = device_.properties();
   if (!extent.width || !extent.height || extent.width > properties.maxImageDimension2D ||
-      extent.height > properties.maxImageDimension2D) {
+      extent.height > properties.maxImageDimension2D || !array_layers ||
+      array_layers > properties.maxImageArrayLayers) {
     return false;
   }
   VkImageCreateInfo info{};
@@ -80,7 +81,7 @@ bool ColorImage::Initialize(VkExtent2D extent, VkFormat format, VkSampleCountFla
   info.format = format;
   info.extent = {extent.width, extent.height, 1};
   info.mipLevels = 1;
-  info.arrayLayers = 1;
+  info.arrayLayers = array_layers;
   info.samples = samples;
   info.tiling = VK_IMAGE_TILING_OPTIMAL;
   info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -90,8 +91,14 @@ bool ColorImage::Initialize(VkExtent2D extent, VkFormat format, VkSampleCountFla
   } else {
     info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
   }
-  if (format == VK_FORMAT_R32_SFLOAT) {
-    info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+  // Compute resolves write single-sample color images as storage images.
+  if ((aspects & VK_IMAGE_ASPECT_COLOR_BIT) && samples == VK_SAMPLE_COUNT_1_BIT) {
+    VkFormatProperties format_properties{};
+    device_.vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+        device_.physical_device(), format, &format_properties);
+    if (format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+      info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    }
   }
   if (!CreateDeviceImage(device_, allocator_, info, image_, memory_, allocation_)) {
     return false;
@@ -101,11 +108,12 @@ bool ColorImage::Initialize(VkExtent2D extent, VkFormat format, VkSampleCountFla
   view_info.image = image_;
   view_info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
   view_info.format = format;
-  view_info.subresourceRange = {aspects, 0, 1, 0, 1};
+  view_info.subresourceRange = {aspects, 0, 1, 0, array_layers};
   if (device_.functions().vkCreateImageView(device_.device(), &view_info, nullptr, &view_) !=
       VK_SUCCESS) {
     return false;
   }
+  view_info.subresourceRange.layerCount = 1;
   if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
     view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
     view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -121,6 +129,7 @@ bool ColorImage::Initialize(VkExtent2D extent, VkFormat format, VkSampleCountFla
     }
   }
   extent_ = extent;
+  array_layers_ = array_layers;
   format_ = format;
   samples_ = samples;
   aspects_ = aspects;
@@ -141,7 +150,7 @@ void ColorImage::Transition(VkCommandBuffer commands, VkImageLayout layout,
   barrier.newLayout = layout;
   barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.image = image_;
-  barrier.subresourceRange = {aspects_, 0, 1, 0, 1};
+  barrier.subresourceRange = {aspects_, 0, 1, 0, array_layers_};
   device_.functions().vkCmdPipelineBarrier(commands, stage_, stage, 0, 0, nullptr, 0, nullptr, 1,
                                            &barrier);
   access_ = access;
@@ -152,7 +161,7 @@ void ColorImage::Transition(VkCommandBuffer commands, VkImageLayout layout,
 void ColorImage::Clear(VkCommandBuffer commands, const VkClearColorValue& color) {
   Transition(commands, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
              VK_ACCESS_TRANSFER_WRITE_BIT);
-  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, array_layers_};
   device_.functions().vkCmdClearColorImage(commands, image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                            &color, 1, &range);
 }

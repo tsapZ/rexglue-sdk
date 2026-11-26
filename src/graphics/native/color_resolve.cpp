@@ -13,20 +13,31 @@ struct ResolveConstants {
   VkOffset2D source_offset;
   VkOffset2D destination_offset;
   VkExtent2D extent;
-  uint32_t sample;
+  int32_t sample;
+  float exp_bias_scale;
+  uint32_t destination_layer;
 };
 
-size_t GetPipelineIndex(VkFormat format) {
+size_t GetPipelineIndex(VkFormat format, bool multisampled) {
+  size_t index;
   switch (format) {
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
-      return 1;
+      index = 1;
+      break;
     case VK_FORMAT_R16G16_SFLOAT:
-      return 2;
+      index = 2;
+      break;
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+      index = 3;
+      break;
     case VK_FORMAT_R32_SFLOAT:
-      return 3;
+      index = 4;
+      break;
     default:
-      return 0;
+      index = 0;
+      break;
   }
+  return index * 2 + (multisampled ? 0 : 1);
 }
 
 struct ShaderCode {
@@ -34,11 +45,17 @@ struct ShaderCode {
   size_t size;
 };
 
-constexpr std::array<ShaderCode, 4> kShaderCodes{{
+constexpr std::array<ShaderCode, 10> kShaderCodes{{
     {kColorResolveRgba8, sizeof(kColorResolveRgba8)},
+    {kColorResolveRgba81x, sizeof(kColorResolveRgba81x)},
     {kColorResolveRgb10a2, sizeof(kColorResolveRgb10a2)},
+    {kColorResolveRgb10a21x, sizeof(kColorResolveRgb10a21x)},
     {kColorResolveRg16f, sizeof(kColorResolveRg16f)},
+    {kColorResolveRg16f1x, sizeof(kColorResolveRg16f1x)},
+    {kColorResolveRgba16f, sizeof(kColorResolveRgba16f)},
+    {kColorResolveRgba16f1x, sizeof(kColorResolveRgba16f1x)},
     {kColorResolveR32f, sizeof(kColorResolveR32f)},
+    {kColorResolveR32f1x, sizeof(kColorResolveR32f1x)},
 }};
 
 }  // namespace
@@ -101,7 +118,8 @@ bool ColorResolve::Initialize() {
 
 void ColorResolve::Record(VkCommandBuffer commands, size_t descriptor, VkImageView source,
                           VkImageView destination, VkRect2D rectangle,
-                          VkOffset2D destination_offset, uint32_t sample, VkFormat format) {
+                          VkOffset2D destination_offset, int32_t sample, VkFormat format,
+                          bool multisampled, float exp_bias_scale, uint32_t destination_layer) {
   const auto& vk = device_.functions();
   const auto set = descriptors_->Get(descriptor);
   const VkDescriptorImageInfo src{sampler_, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -114,10 +132,11 @@ void ColorResolve::Record(VkCommandBuffer commands, size_t descriptor, VkImageVi
   }};
   vk.vkUpdateDescriptorSets(device_.device(), uint32_t(writes.size()), writes.data(), 0, nullptr);
   vk.vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE,
-                       pipelines_[GetPipelineIndex(format)]);
+                       pipelines_[GetPipelineIndex(format, multisampled)]);
   vk.vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &set,
                              0, nullptr);
-  const ResolveConstants constants{rectangle.offset, destination_offset, rectangle.extent, sample};
+  const ResolveConstants constants{rectangle.offset, destination_offset, rectangle.extent,
+                                   sample,           exp_bias_scale,     destination_layer};
   vk.vkCmdPushConstants(commands, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                         sizeof(constants), &constants);
   vk.vkCmdDispatch(commands, (rectangle.extent.width + 7) / 8, (rectangle.extent.height + 7) / 8,
