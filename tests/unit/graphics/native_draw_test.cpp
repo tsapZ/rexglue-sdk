@@ -7,6 +7,7 @@
 #include <rex/graphics/pipeline/texture/util.h>
 
 #include "../../../src/graphics/native/draw_input.h"
+#include "../../../src/graphics/native/resolve_guest_memory.h"
 
 using namespace rex::graphics;
 
@@ -980,4 +981,126 @@ TEST_CASE("Native tiled resolve offset inverse matches GetTiledOffset2D", "[gpu]
   CHECK_FALSE(native::TryGetTiledResolveOffset2D(0x200u, 1920u, 1u, x, y));
   CHECK_FALSE(native::TryGetTiledResolveOffset2D(0x400u, 1920u, 2u, x, y));
   CHECK_FALSE(native::TryGetTiledResolveOffset2D(0x1000u, 1920u, 3u, x, y));
+}
+
+TEST_CASE("Native tiled RGBA8 resolve readback scatters and bounds-checks guest memory",
+          "[gpu][native]") {
+  constexpr uint32_t kPitch = 64;
+  const native::ResolveRectangle rect{8, 16, 4, 2};
+  const uint32_t upper_bound =
+      texture_util::GetTiledAddressUpperBound2D(rect.x + rect.width, rect.y + rect.height, kPitch, 2);
+  REQUIRE(upper_bound > 0);
+
+  std::vector<uint8_t> pixels(size_t(rect.width) * rect.height * 4);
+  for (uint32_t y = 0; y < rect.height; ++y) {
+    for (uint32_t x = 0; x < rect.width; ++x) {
+      const size_t idx = (size_t(y) * rect.width + x) * 4;
+      pixels[idx + 0] = uint8_t(0x10 + x);
+      pixels[idx + 1] = uint8_t(0x20 + y);
+      pixels[idx + 2] = uint8_t(0x30 + x + y);
+      pixels[idx + 3] = 0xAA;
+    }
+  }
+
+  std::vector<uint8_t> guest(upper_bound + 16, 0xCC);
+  REQUIRE(native::StoreTiledResolveRgba8(guest, kPitch, rect, xenos::Endian128::k8in32, pixels));
+  for (uint32_t y = 0; y < rect.height; ++y) {
+    for (uint32_t x = 0; x < rect.width; ++x) {
+      const size_t tiled_off = size_t(
+          texture_util::GetTiledOffset2D(int32_t(rect.x + x), int32_t(rect.y + y), kPitch, 2));
+      uint32_t stored = 0;
+      std::memcpy(&stored, guest.data() + tiled_off, sizeof(stored));
+      const size_t idx = (size_t(y) * rect.width + x) * 4;
+      uint32_t expected = 0;
+      std::memcpy(&expected, pixels.data() + idx, sizeof(expected));
+      expected = xenos::GpuSwap(expected, xenos::Endian::k8in32);
+      CHECK(stored == expected);
+    }
+  }
+  for (size_t i = upper_bound; i < guest.size(); ++i) {
+    CHECK(guest[i] == 0xCC);
+  }
+
+  // A 1-byte-short buffer must be rejected without modifying any guest byte.
+  std::vector<uint8_t> short_guest(upper_bound - 1, 0x55);
+  CHECK_FALSE(
+      native::StoreTiledResolveRgba8(short_guest, kPitch, rect, xenos::Endian128::k8in32, pixels));
+  for (uint8_t byte : short_guest) {
+    CHECK(byte == 0x55);
+  }
+
+  // Out-of-range pitch, rect, endian, and pixel span sizes must be rejected.
+  CHECK_FALSE(
+      native::StoreTiledResolveRgba8(guest, 0, rect, xenos::Endian128::k8in32, pixels));
+  CHECK_FALSE(native::StoreTiledResolveRgba8(guest, kPitch, {kPitch, 0, 4, 2},
+                                             xenos::Endian128::k8in32, pixels));
+  CHECK_FALSE(native::StoreTiledResolveRgba8(guest, kPitch, rect, xenos::Endian128(4), pixels));
+  CHECK_FALSE(native::StoreTiledResolveRgba8(guest, kPitch, rect, xenos::Endian128::k8in32,
+                                             std::span(pixels).first(pixels.size() - 4)));
+}
+
+TEST_CASE("Native portability texture swizzles pack for shader fallback", "[gpu][native]") {
+  const uint32_t host_565 =
+      native::MakeHostTextureSwizzle(xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA, 3, true);
+  // k_5_6_5 swaps R/B and replicates the 3rd channel into A: B(2), G(1), R(0), R(0).
+  CHECK(host_565 == (2u | (1u << 3) | (0u << 6) | (0u << 9)));
+
+  const auto view_swizzle = native::MakeTextureComponentMappingFromHostSwizzle(host_565, true);
+  CHECK(view_swizzle.r == VK_COMPONENT_SWIZZLE_B);
+  CHECK(view_swizzle.g == VK_COMPONENT_SWIZZLE_G);
+  CHECK(view_swizzle.b == VK_COMPONENT_SWIZZLE_R);
+  CHECK(view_swizzle.a == VK_COMPONENT_SWIZZLE_R);
+
+  const auto identity_swizzle = native::MakeTextureComponentMappingFromHostSwizzle(host_565, false);
+  CHECK(identity_swizzle.r == VK_COMPONENT_SWIZZLE_IDENTITY);
+  CHECK(identity_swizzle.g == VK_COMPONENT_SWIZZLE_IDENTITY);
+  CHECK(identity_swizzle.b == VK_COMPONENT_SWIZZLE_IDENTITY);
+  CHECK(identity_swizzle.a == VK_COMPONENT_SWIZZLE_IDENTITY);
+
+  uint32_t words[16]{};
+  native::PackSystemTextureSwizzle(words, 0, 0x688u);
+  native::PackSystemTextureSwizzle(words, 1, host_565);
+  CHECK((words[0] & 0xFFFu) == 0x688u);
+  CHECK(((words[0] >> 12) & 0xFFFu) == host_565);
+}
+
+TEST_CASE("Native depth bias, user clip planes, and clear helpers", "[gpu][native]") {
+  const float slope = 2.0f;
+  const float offset = 0.0005f;
+  const auto bias_unorm = native::ScaleHostDepthBias(
+      slope, offset, xenos::DepthRenderTargetFormat::kD24S8, 2, 3);
+  CHECK(bias_unorm.constant_factor ==
+        Catch::Approx(offset * draw_util::kD3D10PolygonOffsetFactorUnorm24));
+  CHECK(bias_unorm.slope_factor ==
+        Catch::Approx(slope * xenos::kPolygonOffsetScaleSubpixelUnit * 3.0f));
+
+  const auto bias_float = native::ScaleHostDepthBias(
+      slope, offset, xenos::DepthRenderTargetFormat::kD24FS8, 1, 1);
+  CHECK(bias_float.constant_factor ==
+        Catch::Approx(offset * draw_util::kD3D10PolygonOffsetFactorFloat24));
+
+  reg::PA_CL_CLIP_CNTL clip{};
+  clip.ucp_ena = 0b001101;
+  const auto ucp_clip = native::GetUserClipPlaneConfig(clip, true, true);
+  CHECK(ucp_clip.enabled_mask == 0b001101u);
+  CHECK(ucp_clip.count == 3u);
+  CHECK_FALSE(ucp_clip.cull_only);
+
+  const auto ucp_fallback_cull = native::GetUserClipPlaneConfig(clip, false, true);
+  CHECK(ucp_fallback_cull.count == 3u);
+  CHECK(ucp_fallback_cull.cull_only);
+
+  clip.clip_disable = 1;
+  CHECK(native::GetUserClipPlaneConfig(clip, true, true).count == 0u);
+
+  CHECK(native::CoversFullExtent({{0, 0}, {1280, 720}}, {1280, 720}));
+  CHECK_FALSE(native::CoversFullExtent({{0, 0}, {1280, 720}}, {1280, 2048}));
+  CHECK_FALSE(native::CoversFullExtent({{8, 0}, {1272, 720}}, {1280, 720}));
+
+  std::vector<uint32_t> scratch{99, 100};
+  native::FillQuadStripIndices(2, scratch);
+  CHECK(scratch == std::vector<uint32_t>{0, 1, 2, 3, UINT32_MAX, 4, 5, 6, 7});
+
+  CHECK(native::ClampResolutionScaleAxis(3, 1920, 4096) == 2u);
+  CHECK(native::ClampResolutionScaleAxis(3, 1280, 4096) == 3u);
 }
