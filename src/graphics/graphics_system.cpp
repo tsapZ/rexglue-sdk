@@ -13,10 +13,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 #include <rex/cvar.h>
@@ -167,7 +169,10 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         system::X_VIDEO_MODE video_mode;
         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
         const double video_mode_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
-        uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
+        using HostClock = std::chrono::steady_clock;
+        constexpr auto kRateCheckInterval = std::chrono::milliseconds(20);
+        const uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
+        const uint64_t host_tick_frequency = chrono::Clock::QueryHostTickFrequency();
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
           // If frame_rate_limit asks for more than the configured video_mode_refresh_rate, raise
@@ -188,12 +193,22 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
               std::max(refresh_rate_hz, std::min(REXCVAR_GET(guest_vblank_rate), 1000.0));
           const uint64_t interval_ticks =
               std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
-          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+          const auto host_now = HostClock::now();
+          const uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
+          // Convert the time left on the guest clock to a host deadline. Retain the
+          // guest-tick phase after a late wake, and re-read live rate changes at least
+          // once per normal console frame.
+          const auto [guest_ticks, host_ticks] = chrono::Clock::guest_tick_ratio();
+          const uint64_t remaining_ticks = interval_ticks - (current_time - last_frame_time);
+          const auto remaining = std::chrono::duration<double>(
+              double(remaining_ticks) * double(host_ticks) /
+              (double(guest_ticks) * double(host_tick_frequency)));
+          const auto delay = std::min(remaining, std::chrono::duration<double>(kRateCheckInterval));
+          std::this_thread::sleep_until(host_now + std::chrono::ceil<HostClock::duration>(delay));
         }
         return 0;
       }));
@@ -206,15 +221,16 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
 }
 
 void GraphicsSystem::Shutdown() {
-  if (command_processor_) {
-    command_processor_->Shutdown();
-    command_processor_.reset();
-  }
-
   if (vsync_worker_thread_) {
     vsync_worker_running_ = false;
     vsync_worker_thread_->Wait(0, 0, 0, nullptr);
     vsync_worker_thread_.reset();
+  }
+
+  // MarkVblank uses the command processor until the worker has exited.
+  if (command_processor_) {
+    command_processor_->Shutdown();
+    command_processor_.reset();
   }
 
   if (presenter_) {
