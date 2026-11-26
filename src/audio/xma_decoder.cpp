@@ -256,11 +256,13 @@ uint32_t XmaDecoder::ReadRegister(uint32_t addr) {
       break;
     }
     default:
-      const auto register_info = register_file_.GetRegisterInfo(r);
-      if (register_info) {
-        REXAPU_DEBUG("XMA: Read from unhandled register ({:04X}, {})", r, register_info->name);
-      } else {
-        REXAPU_DEBUG("XMA: Read from unknown register ({:04X})", r);
+      if (REXCVAR_GET(log_noisy)) {
+        const auto register_info = register_file_.GetRegisterInfo(r);
+        if (register_info) {
+          REXAPU_DEBUG("XMA: Read from unhandled register ({:04X}, {})", r, register_info->name);
+        } else {
+          REXAPU_DEBUG("XMA: Read from unknown register ({:04X})", r);
+        }
       }
       break;
   }
@@ -335,21 +337,14 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
         context.Clear();
       }
     }
-  } else {
-    // 0601h (1804h) is written to with 0x02000000 and 0x03000000 around a lock
-    // operation
-    switch (r) {
-      default: {
-        const auto register_info = register_file_.GetRegisterInfo(r);
-        if (register_info) {
-          REXAPU_DEBUG("XMA: Write to unhandled register ({:04X}, {}): {:08X}", r,
-                       register_info->name, value);
-        } else {
-          REXAPU_DEBUG("XMA: Write to unknown register ({:04X}): {:08X}", r, value);
-        }
-        break;
-      }
-#pragma warning(suppress : 4065)
+  } else if (REXCVAR_GET(log_noisy)) {
+    // 0601h (1804h) is written around a lock operation.
+    const auto register_info = register_file_.GetRegisterInfo(r);
+    if (register_info) {
+      REXAPU_DEBUG("XMA: Write to unhandled register ({:04X}, {}): {:08X}", r,
+                   register_info->name, value);
+    } else {
+      REXAPU_DEBUG("XMA: Write to unknown register ({:04X}): {:08X}", r, value);
     }
   }
 }

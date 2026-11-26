@@ -283,9 +283,10 @@ set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 set(SDL_OPENGL OFF CACHE BOOL "" FORCE)
 set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
 
-# Disable dummy drivers
+# Headless benchmarks can explicitly select SDL's real-time-paced null sink.
+option(REXGLUE_BENCHMARK_DUMMY_AUDIO "Include SDL dummy audio for benchmarks" OFF)
 set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
-set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
+set(SDL_DUMMYAUDIO ${REXGLUE_BENCHMARK_DUMMY_AUDIO} CACHE BOOL "" FORCE)
 set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
 # Linux video and audio backends. Both video drivers are always built so the
