@@ -49,10 +49,12 @@ class NativeTextureCache {
   };
   static constexpr size_t kMaxResolvedImages = 256;
 
-  NativeTextureCache(const ui::vulkan::VulkanDevice& device, memory::Memory& memory,
-                     const RegisterFile& regs, const SubmissionClock& clock,
-                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y)
+  NativeTextureCache(const ui::vulkan::VulkanDevice& device, VmaAllocator allocator,
+                     memory::Memory& memory, const RegisterFile& regs,
+                     const SubmissionClock& clock, uint32_t draw_resolution_scale_x,
+                     uint32_t draw_resolution_scale_y)
       : device_(device),
+        allocator_(allocator),
         memory_(memory),
         regs_(regs),
         clock_(clock),
@@ -112,6 +114,7 @@ class NativeTextureCache {
                                                           OnCreated&& on_created, bool& failed);
 
   const ui::vulkan::VulkanDevice& device_;
+  VmaAllocator allocator_;
   memory::Memory& memory_;
   const RegisterFile& regs_;
   const SubmissionClock& clock_;

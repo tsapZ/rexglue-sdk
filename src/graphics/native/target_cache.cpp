@@ -154,7 +154,7 @@ std::shared_ptr<ColorImage> NativeTargetCache::FindTarget(uint32_t tile, uint32_
   }
   const uint32_t height = GetTargetHeight(pitch, samples, edram_tile_count,
                                           max_height / draw_resolution_scale_y_, is_64bpp);
-  auto image = std::make_shared<ColorImage>(device_);
+  auto image = std::make_shared<ColorImage>(device_, allocator_);
   if (!image->Initialize({pitch * draw_resolution_scale_x_, height * draw_resolution_scale_y_},
                          format, VkSampleCountFlagBits(1u << uint32_t(samples)), aspects)) {
     return {};

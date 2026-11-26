@@ -4,6 +4,37 @@
 
 namespace rex::graphics::native {
 
+bool CreateDeviceImage(const ui::vulkan::VulkanDevice& device, VmaAllocator allocator,
+                       const VkImageCreateInfo& info, VkImage& image, VkDeviceMemory& memory,
+                       VmaAllocation& allocation) {
+  image = VK_NULL_HANDLE;
+  memory = VK_NULL_HANDLE;
+  allocation = VK_NULL_HANDLE;
+  if (allocator == VK_NULL_HANDLE) {
+    return ui::vulkan::util::CreateDedicatedAllocationImage(
+        &device, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image, memory);
+  }
+  VmaAllocationCreateInfo allocation_info{};
+  allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+  if (vmaCreateImage(allocator, &info, &allocation_info, &image, &allocation, nullptr) !=
+      VK_SUCCESS) {
+    image = VK_NULL_HANDLE;
+    allocation = VK_NULL_HANDLE;
+    return false;
+  }
+  return true;
+}
+
+void DestroyDeviceImage(const ui::vulkan::VulkanDevice& device, VmaAllocator allocator,
+                        VkImage image, VkDeviceMemory memory, VmaAllocation allocation) {
+  if (allocation != VK_NULL_HANDLE) {
+    vmaDestroyImage(allocator, image, allocation);
+    return;
+  }
+  device.functions().vkDestroyImage(device.device(), image, nullptr);
+  device.functions().vkFreeMemory(device.device(), memory, nullptr);
+}
+
 ColorImage::~ColorImage() {
   const auto& vk = device_.functions();
   for (const auto& entry : sampled_views_) {
@@ -11,8 +42,7 @@ ColorImage::~ColorImage() {
   }
   vk.vkDestroyImageView(device_.device(), view_, nullptr);
   vk.vkDestroyImageView(device_.device(), depth_view_, nullptr);
-  vk.vkDestroyImage(device_.device(), image_, nullptr);
-  vk.vkFreeMemory(device_.device(), memory_, nullptr);
+  DestroyDeviceImage(device_, allocator_, image_, memory_, allocation_);
 }
 
 VkImageView ColorImage::GetSampledView(VkComponentMapping swizzle) {
@@ -63,8 +93,7 @@ bool ColorImage::Initialize(VkExtent2D extent, VkFormat format, VkSampleCountFla
   if (format == VK_FORMAT_R32_SFLOAT) {
     info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
   }
-  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-          &device_, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image_, memory_)) {
+  if (!CreateDeviceImage(device_, allocator_, info, image_, memory_, allocation_)) {
     return false;
   }
   VkImageViewCreateInfo view_info{};

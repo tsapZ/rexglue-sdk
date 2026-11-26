@@ -145,6 +145,8 @@ class NativeCommandProcessor : public CommandProcessor {
     VkCommandPool command_pool = VK_NULL_HANDLE;
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
+    // Signaled by the sparse binds this slot's submission waits for.
+    VkSemaphore sparse_bind_semaphore = VK_NULL_HANDLE;
     bool submitted = false;
     uint64_t submission = 0;
     std::vector<FrameCommand> commands;
@@ -165,6 +167,7 @@ class NativeCommandProcessor : public CommandProcessor {
   void SavePipelineCache();
 
   ui::vulkan::VulkanDevice* vulkan_device_ = nullptr;
+  VmaAllocator vma_allocator_ = VK_NULL_HANDLE;
   PFN_vkGetPipelineCacheData get_pipeline_cache_data_ = nullptr;
   PFN_vkMergePipelineCaches merge_pipeline_caches_ = nullptr;
   std::filesystem::path pipeline_cache_path_;

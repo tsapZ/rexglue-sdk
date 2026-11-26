@@ -47,8 +47,7 @@ CachedTexture::~CachedTexture() {
   for (const auto& entry : views) {
     vk.vkDestroyImageView(handle, entry.second, nullptr);
   }
-  vk.vkDestroyImage(handle, image, nullptr);
-  vk.vkFreeMemory(handle, memory, nullptr);
+  DestroyDeviceImage(*device, allocator, image, memory, allocation);
 }
 
 VkImageView CachedTexture::GetOrCreateView(VkImageViewType view_type, VkFormat format,
@@ -233,7 +232,8 @@ bool DrawBindings::Initialize(uint32_t shared_count, uint32_t image_count, uint3
   return vk.vkCreatePipelineLayout(handle, &info, nullptr, &pipeline_layout) == VK_SUCCESS;
 }
 
-DrawPass::DrawPass(DrawPass&& other) noexcept : device_(other.device_) {
+DrawPass::DrawPass(DrawPass&& other) noexcept
+    : device_(other.device_), allocator_(other.allocator_) {
   *this = std::move(other);
 }
 
@@ -243,6 +243,7 @@ DrawPass& DrawPass::operator=(DrawPass&& other) noexcept {
   }
   Release();
   device_ = other.device_;
+  allocator_ = other.allocator_;
   bindings_ = std::exchange(other.bindings_, nullptr);
   set_indices_ = std::exchange(other.set_indices_, {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
   sets_ = other.sets_;
@@ -285,8 +286,7 @@ void DrawPass::Release() {
     if (texture.fallback_view == VK_NULL_HANDLE && !texture.cached && !texture.resolved) {
       vk.vkDestroyImageView(device, texture.view, nullptr);
     }
-    vk.vkDestroyImage(device, texture.image, nullptr);
-    vk.vkFreeMemory(device, texture.memory, nullptr);
+    DestroyDeviceImage(*device_, allocator_, texture.image, texture.memory, texture.allocation);
   }
   textures_.clear();
   if (buffer_memory_) {
@@ -544,9 +544,8 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     if (input_texture.view_type == VK_IMAGE_VIEW_TYPE_CUBE) {
       info.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     }
-    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-            device_, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, texture.image,
-            texture.memory)) {
+    if (!CreateDeviceImage(*device_, allocator_, info, texture.image, texture.memory,
+                           texture.allocation)) {
       return false;
     }
     VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};

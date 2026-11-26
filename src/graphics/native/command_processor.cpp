@@ -214,6 +214,8 @@ bool NativeCommandProcessor::SetupContext() {
                                                &depth_unorm24_properties);
   const bool depth_unorm24_supported = (depth_unorm24_properties.optimalTilingFeatures &
                                          kUsedDepthFormatFeatures) == kUsedDepthFormatFeatures;
+  // Images are sub-allocated; without VMA they fall back to dedicated allocations.
+  vma_allocator_ = ui::vulkan::CreateVmaAllocator(vulkan_device_, true);
   get_pipeline_cache_data_ = reinterpret_cast<PFN_vkGetPipelineCacheData>(
       instance.vkGetDeviceProcAddr(device, "vkGetPipelineCacheData"));
   merge_pipeline_caches_ = reinterpret_cast<PFN_vkMergePipelineCaches>(
@@ -222,6 +224,7 @@ bool NativeCommandProcessor::SetupContext() {
   pool.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
   pool.queueFamilyIndex = vulkan_device_->queue_family_graphics_compute();
   if (pool.queueFamilyIndex == UINT32_MAX) {
+    ShutdownContext();
     return false;
   }
   for (auto& frame : frames_) {
@@ -229,7 +232,10 @@ bool NativeCommandProcessor::SetupContext() {
     buffer.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     buffer.commandBufferCount = 1;
     const VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    const VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     if (vk.vkCreateCommandPool(device, &pool, nullptr, &frame.command_pool) != VK_SUCCESS ||
+        vk.vkCreateSemaphore(device, &semaphore, nullptr, &frame.sparse_bind_semaphore) !=
+            VK_SUCCESS ||
         (buffer.commandPool = frame.command_pool,
          vk.vkAllocateCommandBuffers(device, &buffer, &frame.command_buffer) != VK_SUCCESS) ||
         vk.vkCreateFence(device, &fence, nullptr, &frame.fence) != VK_SUCCESS) {
@@ -285,15 +291,16 @@ bool NativeCommandProcessor::SetupContext() {
       kPhysicalMemorySize >> translator_->GetSharedMemoryStorageBufferCountLog2();
   if (vulkan_device_->properties().maxStorageBufferRange >= shared_segment_size) {
     shared_vertex_ = std::make_unique<SharedVertexMemory>(*vulkan_device_);
-    if (!shared_vertex_->Initialize()) {
+    if (!shared_vertex_->Initialize(REXCVAR_GET(vulkan_sparse_shared_memory))) {
       shared_vertex_.reset();
     }
   }
-  texture_cache_ = std::make_unique<NativeTextureCache>(*vulkan_device_, *memory_, *register_file_,
+  texture_cache_ = std::make_unique<NativeTextureCache>(*vulkan_device_, vma_allocator_, *memory_,
+                                                        *register_file_,
                                                         clock_, draw_resolution_scale_x_,
                                                         draw_resolution_scale_y_);
   target_cache_ = std::make_unique<NativeTargetCache>(
-      *vulkan_device_, clock_, draw_resolution_scale_x_, draw_resolution_scale_y_,
+      *vulkan_device_, vma_allocator_, clock_, draw_resolution_scale_x_, draw_resolution_scale_y_,
       depth_unorm24_supported,
       [this](const DrawInput& input, std::span<const uint32_t> indices,
              const Shader::Translation& vertex, const Shader::Translation* pixel,
@@ -359,8 +366,14 @@ void NativeCommandProcessor::ShutdownContext() {
   translator_.reset();
   active_vertex_shader_ = active_pixel_shader_ = nullptr;
   shaders_.clear();
+  if (vma_allocator_ != VK_NULL_HANDLE) {
+    // Every image is gone: frames, caches, targets and resolves are released.
+    vmaDestroyAllocator(vma_allocator_);
+    vma_allocator_ = VK_NULL_HANDLE;
+  }
   for (auto& frame : frames_) {
     vk.vkDestroyFence(device, frame.fence, nullptr);
+    vk.vkDestroySemaphore(device, frame.sparse_bind_semaphore, nullptr);
     vk.vkDestroyCommandPool(device, frame.command_pool, nullptr);
     frame = {};
   }
@@ -1195,7 +1208,7 @@ size_t NativeCommandProcessor::AddPendingPass(const DrawInput& input,
                                               const Shader::Translation& vertex,
                                               const Shader::Translation* pixel,
                                               VkBuffer shared_vertex_buffer) {
-  auto& pass = pending_passes_.emplace_back(*vulkan_device_);
+  auto& pass = pending_passes_.emplace_back(*vulkan_device_, vma_allocator_);
   const uint32_t shared_count = uint32_t(1) << translator_->GetSharedMemoryStorageBufferCountLog2();
   if (!pass.Initialize(input, indices, vertex, pixel, shared_count, pipeline_cache_, pipelines_,
                        draw_bindings_, *draw_uploads_, clock_.next, shared_vertex_buffer)) {
@@ -1414,7 +1427,7 @@ bool NativeCommandProcessor::IssueCopy() {
       texture_cache_->PruneResolvedDependents();
       texture_cache_->RebuildCachedTexturePages();
     }
-    destination = std::make_shared<ColorImage>(*vulkan_device_);
+    destination = std::make_shared<ColorImage>(*vulkan_device_, vma_allocator_);
     if (!destination->Initialize(target_extent, output_format)) {
       return false;
     }
@@ -1522,7 +1535,7 @@ bool NativeCommandProcessor::CaptureResolveImage(ColorImage& image, VkOffset2D s
   }
   std::optional<ColorImage> downsampled;
   if (scaled) {
-    downsampled.emplace(*vulkan_device_);
+    downsampled.emplace(*vulkan_device_, vma_allocator_);
     if (!downsampled->Initialize(guest_extent, ColorImage::kFormat)) {
       return false;
     }
@@ -2063,20 +2076,30 @@ bool NativeCommandProcessor::SubmitCommands() {
     return false;
   }
   draw_uploads_->FlushWrites();
-  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-  submit.commandBufferCount = 1;
-  submit.pCommandBuffers = &command_buffer_;
-  VkResult result;
-  {
+  auto& frame = frames_[current_frame_];
+  // Granules committed while recording are bound before the commands using them run.
+  bool wait_for_binds = false;
+  VkResult result =
+      shared_vertex_ ? shared_vertex_->FlushBinds(frame.sparse_bind_semaphore, wait_for_binds)
+                     : VK_SUCCESS;
+  if (result == VK_SUCCESS) {
+    constexpr VkPipelineStageFlags kBindWaitStages = VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                                     VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.waitSemaphoreCount = wait_for_binds ? 1 : 0;
+    submit.pWaitSemaphores = &frame.sparse_bind_semaphore;
+    submit.pWaitDstStageMask = &kBindWaitStages;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &command_buffer_;
     auto queue = vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
-    result = vk.vkQueueSubmit(queue.queue(), 1, &submit, frames_[current_frame_].fence);
+    result = vk.vkQueueSubmit(queue.queue(), 1, &submit, frame.fence);
   }
   if (result != VK_SUCCESS) {
     if (result == VK_ERROR_DEVICE_LOST)
       graphics_system_->OnHostGpuLossFromAnyThread(true);
     return false;
   }
-  auto& frame = frames_[current_frame_];
   frame.submission = clock_.next++;
   frame.submitted = true;
   for (const auto& command : pending_) {

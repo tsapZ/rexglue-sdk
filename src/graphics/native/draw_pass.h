@@ -23,8 +23,10 @@ namespace rex::graphics::native {
 // GPU work is still queued after the cache evicts or invalidates the entry.
 struct CachedTexture {
   const ui::vulkan::VulkanDevice* device = nullptr;
+  VmaAllocator allocator = VK_NULL_HANDLE;
   VkImage image = VK_NULL_HANDLE;
   VkDeviceMemory memory = VK_NULL_HANDLE;
+  VmaAllocation allocation = VK_NULL_HANDLE;
   // Guest physical byte ranges covered by the decoded texels.
   uint32_t base_start = 0;
   uint32_t base_length = 0;
@@ -216,7 +218,8 @@ using DrawBindingCache = std::map<std::array<uint32_t, 3>, std::unique_ptr<DrawB
 
 class DrawPass {
  public:
-  explicit DrawPass(const ui::vulkan::VulkanDevice& device) : device_(&device) {}
+  DrawPass(const ui::vulkan::VulkanDevice& device, VmaAllocator allocator)
+      : device_(&device), allocator_(allocator) {}
   ~DrawPass();
   // Movable so frames store passes flat; a moved-from pass owns nothing.
   DrawPass(DrawPass&& other) noexcept;
@@ -239,6 +242,7 @@ class DrawPass {
   void Release();
 
   const ui::vulkan::VulkanDevice* device_;
+  VmaAllocator allocator_;
   DrawBindings* bindings_ = nullptr;
   // Sets this pass allocated and frees; shared and cached sets stay SIZE_MAX.
   std::array<size_t, 4> set_indices_{SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
@@ -255,6 +259,7 @@ class DrawPass {
     std::shared_ptr<CachedTexture> cached;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkImageView fallback_view = VK_NULL_HANDLE;
     VkExtent2D extent{};

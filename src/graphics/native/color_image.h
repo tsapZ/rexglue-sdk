@@ -5,15 +5,26 @@
 #include <utility>
 
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/mem_alloc.h>
 
 #include "draw_input.h"
 
 namespace rex::graphics::native {
 
+// A device-local image sub-allocated from `allocator`, or with a dedicated
+// allocation when the allocator is VK_NULL_HANDLE (VMA unavailable).
+bool CreateDeviceImage(const ui::vulkan::VulkanDevice& device, VmaAllocator allocator,
+                       const VkImageCreateInfo& info, VkImage& image, VkDeviceMemory& memory,
+                       VmaAllocation& allocation);
+void DestroyDeviceImage(const ui::vulkan::VulkanDevice& device, VmaAllocator allocator,
+                        VkImage image, VkDeviceMemory memory, VmaAllocation allocation);
+
 // A host image representing an EDRAM attachment or resolved texture.
 class ColorImage {
  public:
-  explicit ColorImage(const ui::vulkan::VulkanDevice& device) : device_(device) {}
+  explicit ColorImage(const ui::vulkan::VulkanDevice& device,
+                      VmaAllocator allocator = VK_NULL_HANDLE)
+      : device_(device), allocator_(allocator) {}
   ~ColorImage();
 
   ColorImage(const ColorImage&) = delete;
@@ -45,6 +56,8 @@ class ColorImage {
 
  private:
   const ui::vulkan::VulkanDevice& device_;
+  VmaAllocator allocator_;
+  VmaAllocation allocation_ = VK_NULL_HANDLE;
   VkExtent2D extent_{};
   VkFormat format_ = kFormat;
   VkSampleCountFlagBits samples_ = VK_SAMPLE_COUNT_1_BIT;

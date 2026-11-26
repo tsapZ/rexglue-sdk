@@ -370,11 +370,11 @@ std::shared_ptr<CachedTexture> NativeTextureCache::GetOrCreateCachedTexture(
   }
   auto entry = std::make_shared<CachedTexture>();
   entry->device = &device_;
+  entry->allocator = allocator_;
   entry->level_count = image_info.mipLevels;
   entry->last_use_submission = clock_.next;
-  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-          &device_, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, entry->image,
-          entry->memory)) {
+  if (!CreateDeviceImage(device_, allocator_, image_info, entry->image, entry->memory,
+                         entry->allocation)) {
     failed = true;
     return {};
   }

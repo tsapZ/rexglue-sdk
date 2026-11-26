@@ -45,10 +45,12 @@ class NativeTargetCache {
                          uint32_t rt_index, const std::shared_ptr<ColorImage>& image)>;
   using TargetKey = std::tuple<uint32_t, uint32_t, xenos::MsaaSamples, VkFormat>;
 
-  NativeTargetCache(const ui::vulkan::VulkanDevice& device, const SubmissionClock& clock,
-                    uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
-                    bool depth_unorm24_supported, QueueDraw queue_draw)
+  NativeTargetCache(const ui::vulkan::VulkanDevice& device, VmaAllocator allocator,
+                    const SubmissionClock& clock, uint32_t draw_resolution_scale_x,
+                    uint32_t draw_resolution_scale_y, bool depth_unorm24_supported,
+                    QueueDraw queue_draw)
       : device_(device),
+        allocator_(allocator),
         clock_(clock),
         draw_resolution_scale_x_(draw_resolution_scale_x),
         draw_resolution_scale_y_(draw_resolution_scale_y),
@@ -114,6 +116,7 @@ class NativeTargetCache {
                                   VkFormat format, const std::shared_ptr<ColorImage>& image);
 
   const ui::vulkan::VulkanDevice& device_;
+  VmaAllocator allocator_;
   const SubmissionClock& clock_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;

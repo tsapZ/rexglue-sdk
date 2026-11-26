@@ -1014,4 +1014,24 @@ inline std::span<const uint8_t> GetPipelineCacheFileData(
   return data;
 }
 
+// Sparse binding granule of the shared vertex buffer: 4 MiB commits at most
+// 128 allocations for the 512 MiB buffer, rounded up to the sparse alignment.
+constexpr uint64_t kSparseVertexGranuleSize = 4 * 1024 * 1024;
+constexpr uint64_t ComputeSparseGranuleSize(uint64_t alignment,
+                                            uint64_t preferred = kSparseVertexGranuleSize) {
+  alignment = std::max<uint64_t>(alignment, 1);
+  return (std::max(preferred, alignment) + alignment - 1) / alignment * alignment;
+}
+
+// First granule and granule count covering [address, address + size).
+constexpr std::pair<uint32_t, uint32_t> GetSparseGranuleRange(uint64_t address, uint64_t size,
+                                                              uint64_t granule_size) {
+  if (!size || !granule_size) {
+    return {0, 0};
+  }
+  const uint64_t first = address / granule_size;
+  const uint64_t last = (address + size - 1) / granule_size;
+  return {uint32_t(first), uint32_t(last - first + 1)};
+}
+
 }  // namespace rex::graphics::native
