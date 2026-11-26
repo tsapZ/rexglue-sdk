@@ -33,6 +33,8 @@ class NativeCommandProcessor : public CommandProcessor {
   ~NativeCommandProcessor() override;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t width, uint32_t height) override;
+  void ClearCaches() override;
+  void InvalidateGpuMemory() override;
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
@@ -42,6 +44,8 @@ class NativeCommandProcessor : public CommandProcessor {
  protected:
   bool SetupContext() override;
   void ShutdownContext() override;
+  bool ReadBackResolvedRange(uint32_t address, uint32_t length, uint32_t bits_per_pixel,
+                             bool scaled, uint32_t clip_start, uint32_t clip_end) override;
 
  private:
   std::span<const uint8_t> ReadPhysical(uint32_t address, size_t size);
@@ -102,7 +106,6 @@ class NativeCommandProcessor : public CommandProcessor {
     const Shader::Translation* vertex = nullptr;
     const Shader::Translation* pixel = nullptr;
     uint32_t rt_index = 0;
-    bool is_64bpp = false;
   };
 
   struct CachedImage {
@@ -114,6 +117,12 @@ class NativeCommandProcessor : public CommandProcessor {
     uint32_t dest_pitch;
     uint64_t version = 0;
     bool tiled_destination = false;
+    uint32_t guest_start = 0;
+    uint32_t guest_length = 0;
+    ResolveRectangle last_rect{};
+    uint32_t copy_dest_pitch = 0;
+    xenos::Endian128 endian = xenos::Endian128::kNone;
+    bool rgba8_readback_valid = false;
   };
   struct CachedSampler {
     VkSampler sampler = VK_NULL_HANDLE;
@@ -133,9 +142,16 @@ class NativeCommandProcessor : public CommandProcessor {
   VkSampler GetSampler(const DrawSampler& key);
   void DrainMemoryInvalidations();
   void InvalidateTextures(uint32_t start, uint32_t length);
+  void InvalidateResolvedTextures(uint32_t start, uint32_t length);
+  void PruneResolvedDependents();
   void RebuildCachedTexturePages();
   void InvalidateSharedVertices(uint32_t start, uint32_t length);
   bool EnsureSharedVertexRange(uint32_t address, uint32_t size);
+  template <typename EntryMap, typename Key, typename OnCreated>
+  std::shared_ptr<CachedTexture> GetOrCreateCachedTexture(EntryMap& cache, size_t max_entries,
+                                                          const Key& key,
+                                                          const VkImageCreateInfo& image_info,
+                                                          OnCreated&& on_created, bool& failed);
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);
   std::pair<uint32_t, uint32_t> MemoryInvalidationCallback(uint32_t physical_address_start,
@@ -144,6 +160,7 @@ class NativeCommandProcessor : public CommandProcessor {
   std::shared_ptr<ColorImage> FindTarget(uint32_t tile, uint32_t pitch, xenos::MsaaSamples samples,
                                          VkFormat format, VkImageAspectFlags aspects,
                                          bool is_64bpp = false);
+  DrawInput RescaleFastClearInput(const DrawInput& base, xenos::MsaaSamples samples) const;
   // Replays an aliased 4x-MSAA fast clear onto a 1x/2x target that already
   // exists (depth or color), appending the queued draw to pending_.
   void ReplayAliasedFastClear(const PendingFastClear& clear, const std::shared_ptr<ColorImage>& image,
@@ -167,6 +184,8 @@ class NativeCommandProcessor : public CommandProcessor {
   void RecordBufferUploads(std::span<const FrameCommand> commands);
   void RecordResolve(const QueuedResolve& resolve);
   void RecordDepthClear(const QueuedDepthClear& clear);
+  bool CaptureResolveImage(ColorImage& image, VkOffset2D src_offset, VkExtent2D src_extent,
+                           std::vector<uint8_t>& pixels_out);
   bool ReadBackResolve(const draw_util::ResolveInfo& copy, uint32_t address, uint32_t pitch,
                        const QueuedResolve& resolve);
   bool RenderGuestOutput(ui::Presenter::GuestOutputRefreshContext& context, VkExtent2D extent,
@@ -221,8 +240,9 @@ class NativeCommandProcessor : public CommandProcessor {
   void* memory_invalidation_handle_ = nullptr;
   std::vector<FrameCommand> pending_;
   std::vector<FrameCommand> in_flight_;
-  // Reused by IssueDraw so decoding guest indices does not allocate per draw.
+  // Reused by IssueDraw so decoding guest indices and building DrawInput do not allocate per draw.
   std::vector<uint32_t> scratch_indices_;
+  DrawInput scratch_input_;
   std::unique_ptr<ImageReadback> in_flight_readback_;
   std::shared_ptr<ColorImage> presented_;
   // Physical front buffer address of the last presented resolve. Kept across

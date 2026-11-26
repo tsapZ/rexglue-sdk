@@ -13,24 +13,6 @@ namespace {
 
 using Translator = SpirvShaderTranslator;
 
-VkShaderModule CreateShaderModule(const ui::vulkan::VulkanDevice& device,
-                                  const Shader::Translation& translation) {
-  const auto& binary = translation.translated_binary();
-  if (binary.empty() || binary.size() % sizeof(uint32_t)) {
-    return VK_NULL_HANDLE;
-  }
-  std::vector<uint32_t> code(binary.size() / sizeof(uint32_t));
-  std::memcpy(code.data(), binary.data(), binary.size());
-  VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-  info.codeSize = binary.size();
-  info.pCode = code.data();
-  VkShaderModule module = VK_NULL_HANDLE;
-  return device.functions().vkCreateShaderModule(device.device(), &info, nullptr, &module) ==
-                 VK_SUCCESS
-             ? module
-             : VK_NULL_HANDLE;
-}
-
 VkShaderModule CreateShaderModule(const ui::vulkan::VulkanDevice& device, const uint32_t* code,
                                   size_t size) {
   VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -41,6 +23,16 @@ VkShaderModule CreateShaderModule(const ui::vulkan::VulkanDevice& device, const 
                  VK_SUCCESS
              ? module
              : VK_NULL_HANDLE;
+}
+
+VkShaderModule CreateShaderModule(const ui::vulkan::VulkanDevice& device,
+                                  const Shader::Translation& translation) {
+  const auto& binary = translation.translated_binary();
+  if (binary.empty() || binary.size() % sizeof(uint32_t)) {
+    return VK_NULL_HANDLE;
+  }
+  return CreateShaderModule(device, reinterpret_cast<const uint32_t*>(binary.data()),
+                            binary.size());
 }
 
 }  // namespace
@@ -56,6 +48,27 @@ CachedTexture::~CachedTexture() {
   }
   vk.vkDestroyImage(handle, image, nullptr);
   vk.vkFreeMemory(handle, memory, nullptr);
+}
+
+VkImageView CachedTexture::GetOrCreateView(VkImageViewType view_type, VkFormat format,
+                                           VkComponentMapping swizzle, uint32_t array_layers) {
+  const uint32_t view_key = PackTextureComponentMapping(swizzle);
+  if (auto found = views.find(view_key); found != views.end()) {
+    return found->second;
+  }
+  VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  info.image = image;
+  info.viewType = view_type;
+  info.format = format;
+  info.components = swizzle;
+  info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, level_count, 0, array_layers};
+  VkImageView image_view = VK_NULL_HANDLE;
+  if (device->functions().vkCreateImageView(device->device(), &info, nullptr, &image_view) !=
+      VK_SUCCESS) {
+    return VK_NULL_HANDLE;
+  }
+  views.emplace(view_key, image_view);
+  return image_view;
 }
 
 DrawBindings::~DrawBindings() {
@@ -110,6 +123,10 @@ VkDescriptorSet DrawBindings::GetOrCreateSharedVertexSet(VkBuffer buffer, uint32
 }
 
 bool DrawBindings::Initialize(uint32_t shared_count, uint32_t image_count, uint32_t sampler_count) {
+  if (image_count > xenos::kTextureFetchConstantCount ||
+      sampler_count > xenos::kTextureFetchConstantCount) {
+    return false;
+  }
   const auto& vk = device.functions();
   const auto handle = device.device();
   std::array<VkDescriptorSetLayoutBinding, Translator::kConstantBufferCount> constants{};
@@ -193,6 +210,13 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   blend_constants_ = input.blend_constants;
   viewport_ = input.viewport;
   scissor_ = input.scissor;
+  depth_bias_enable_ = input.depth_format != VK_FORMAT_UNDEFINED;
+  depth_bias_ = input.depth_bias;
+  stencil_enable_ = input.depth_stencil.stencilTestEnable != VK_FALSE;
+  stencil_compare_mask_ = {input.depth_stencil.front.compareMask,
+                           input.depth_stencil.back.compareMask};
+  stencil_write_mask_ = {input.depth_stencil.front.writeMask, input.depth_stencil.back.writeMask};
+  stencil_reference_ = {input.depth_stencil.front.reference, input.depth_stencil.back.reference};
   index_count_ = uint32_t(indices.size());
   edram_depth_clear_color_ = input.edram_depth_clear_color;
   edram_clear_constants_ = {input.edram_clear_stencil, input.edram_clear_format};
@@ -466,16 +490,10 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
                        uint32_t(front.passOp),
                        uint32_t(front.depthFailOp),
                        uint32_t(front.compareOp),
-                       front.compareMask,
-                       front.writeMask,
-                       front.reference,
                        uint32_t(back.failOp),
                        uint32_t(back.passOp),
                        uint32_t(back.depthFailOp),
                        uint32_t(back.compareOp),
-                       back.compareMask,
-                       back.writeMask,
-                       back.reference,
                        shared_buffer_count,
                        input.edram_depth_clear_color,
                        uint32_t(input.depth_clamp_enable)},
@@ -529,6 +547,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
   raster.polygonMode = VK_POLYGON_MODE_FILL;
   raster.depthClampEnable = input.depth_clamp_enable ? VK_TRUE : VK_FALSE;
+  raster.depthBiasEnable = depth_bias_enable_ ? VK_TRUE : VK_FALSE;
   raster.frontFace = input.front_face;
   raster.cullMode = input.cull;
   raster.lineWidth = 1.0f;
@@ -539,8 +558,11 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
   blend.attachmentCount = input.color_count;
   blend.pAttachments = input.blend.data();
-  const std::array dynamic_states{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                  VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+  const std::array dynamic_states{
+      VK_DYNAMIC_STATE_VIEWPORT,           VK_DYNAMIC_STATE_SCISSOR,
+      VK_DYNAMIC_STATE_DEPTH_BIAS,         VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+      VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+      VK_DYNAMIC_STATE_STENCIL_REFERENCE};
   VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
   dynamic.dynamicStateCount = uint32_t(dynamic_states.size());
   dynamic.pDynamicStates = dynamic_states.data();
@@ -688,7 +710,32 @@ void DrawPass::Record(VkCommandBuffer commands, VkExtent2D extent) {
                              0, uint32_t(sets_.size()), sets_.data(), 0, nullptr);
   vk.vkCmdSetViewport(commands, 0, 1, &viewport);
   vk.vkCmdSetScissor(commands, 0, 1, &scissor);
+  if (depth_bias_enable_) {
+    vk.vkCmdSetDepthBias(commands, depth_bias_.constant_factor, 0.0f, depth_bias_.slope_factor);
+  }
   vk.vkCmdSetBlendConstants(commands, blend_constants_.data());
+  if (stencil_enable_) {
+    const bool split_stencil = device_.properties().separateStencilMaskRef;
+    if (!split_stencil || stencil_compare_mask_[0] == stencil_compare_mask_[1]) {
+      vk.vkCmdSetStencilCompareMask(commands, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                    stencil_compare_mask_[0]);
+    } else {
+      vk.vkCmdSetStencilCompareMask(commands, VK_STENCIL_FACE_FRONT_BIT, stencil_compare_mask_[0]);
+      vk.vkCmdSetStencilCompareMask(commands, VK_STENCIL_FACE_BACK_BIT, stencil_compare_mask_[1]);
+    }
+    if (!split_stencil || stencil_write_mask_[0] == stencil_write_mask_[1]) {
+      vk.vkCmdSetStencilWriteMask(commands, VK_STENCIL_FACE_FRONT_AND_BACK, stencil_write_mask_[0]);
+    } else {
+      vk.vkCmdSetStencilWriteMask(commands, VK_STENCIL_FACE_FRONT_BIT, stencil_write_mask_[0]);
+      vk.vkCmdSetStencilWriteMask(commands, VK_STENCIL_FACE_BACK_BIT, stencil_write_mask_[1]);
+    }
+    if (!split_stencil || stencil_reference_[0] == stencil_reference_[1]) {
+      vk.vkCmdSetStencilReference(commands, VK_STENCIL_FACE_FRONT_AND_BACK, stencil_reference_[0]);
+    } else {
+      vk.vkCmdSetStencilReference(commands, VK_STENCIL_FACE_FRONT_BIT, stencil_reference_[0]);
+      vk.vkCmdSetStencilReference(commands, VK_STENCIL_FACE_BACK_BIT, stencil_reference_[1]);
+    }
+  }
   vk.vkCmdBindIndexBuffer(commands, buffer_, index_offset_, VK_INDEX_TYPE_UINT32);
   if (edram_depth_clear_color_) {
     vk.vkCmdPushConstants(commands, bindings_->pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,

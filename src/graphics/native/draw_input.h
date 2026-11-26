@@ -13,6 +13,7 @@
 #include <xxhash.h>
 
 #include <rex/graphics/edram_layout.h>
+#include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
@@ -228,32 +229,67 @@ constexpr uint32_t TextureChannelCount(xenos::TextureFormat format) {
   }
 }
 
-// Component mapping for sampling a guest texture. One- and two-channel formats
+// Host 12-bit texture swizzle word matching SpirvShaderTranslator's
+// SystemConstants::texture_swizzles encoding. One- and two-channel formats
 // replicate the stored components into the unused ones, matching the Xenos
 // Vulkan host format swizzle. 32bpp 3/4-channel resolves copied with
 // copy_dest_swap store red and blue swapped, which the guest fetch swizzle
 // (0x60A BGRA or 0xA0A BGR1) normally undoes - swap_red_blue applies that swap
 // here for cached resolves that keep the EDRAM RGBA order.
+constexpr uint32_t MakeHostTextureSwizzle(uint32_t fetch_swizzle, uint32_t channel_count,
+                                          bool swap_red_blue) {
+  const uint32_t first = channel_count >= 3 && swap_red_blue ? 2u : 0u;
+  const uint32_t third = channel_count >= 3 && swap_red_blue ? 0u : 2u;
+  const std::array<uint32_t, 8> swizzles{
+      first,
+      channel_count == 1 ? 0u : 1u,
+      channel_count == 1 ? 0u : channel_count == 2 ? 1u : third,
+      channel_count == 1 ? 0u : channel_count == 2 ? 1u : channel_count == 3 ? third : 3u,
+      uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_0),
+      uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_1),
+      uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_0),
+      uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_0)};
+  return swizzles[fetch_swizzle & 7] | (swizzles[(fetch_swizzle >> 3) & 7] << 3) |
+         (swizzles[(fetch_swizzle >> 6) & 7] << 6) |
+         (swizzles[(fetch_swizzle >> 9) & 7] << 9);
+}
+
+// Component mapping for sampling a guest texture. When imageViewFormatSwizzle
+// is unavailable, returns all-IDENTITY because SpirvShaderTranslator performs
+// the swizzle in the shader from SystemConstants::texture_swizzles.
+constexpr VkComponentMapping MakeTextureComponentMappingFromHostSwizzle(
+    uint32_t host_swizzle, bool image_view_format_swizzle = true) {
+  if (!image_view_format_swizzle) {
+    return {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+            VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+  }
+  constexpr std::array<VkComponentSwizzle, 8> map{
+      VK_COMPONENT_SWIZZLE_R,    VK_COMPONENT_SWIZZLE_G,    VK_COMPONENT_SWIZZLE_B,
+      VK_COMPONENT_SWIZZLE_A,    VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE,
+      VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO};
+  return {map[host_swizzle & 7], map[(host_swizzle >> 3) & 7], map[(host_swizzle >> 6) & 7],
+          map[(host_swizzle >> 9) & 7]};
+}
+
 constexpr VkComponentMapping MakeTextureComponentMapping(uint32_t fetch_swizzle,
                                                         uint32_t channel_count,
-                                                        bool swap_red_blue) {
-  const VkComponentSwizzle r = VK_COMPONENT_SWIZZLE_R;
-  const VkComponentSwizzle g = VK_COMPONENT_SWIZZLE_G;
-  const VkComponentSwizzle b = VK_COMPONENT_SWIZZLE_B;
-  const VkComponentSwizzle a = VK_COMPONENT_SWIZZLE_A;
-  const VkComponentSwizzle first = channel_count >= 3 && swap_red_blue ? b : r;
-  const VkComponentSwizzle third = channel_count >= 3 && swap_red_blue ? r : b;
-  const std::array<VkComponentSwizzle, 8> swizzles{
-      first,
-      channel_count == 1 ? r : g,
-      channel_count == 1 ? r : channel_count == 2 ? g : third,
-      channel_count == 1 ? r : channel_count == 2 ? g : channel_count == 3 ? third : a,
-      VK_COMPONENT_SWIZZLE_ZERO,
-      VK_COMPONENT_SWIZZLE_ONE,
-      VK_COMPONENT_SWIZZLE_ZERO,
-      VK_COMPONENT_SWIZZLE_ZERO};
-  return {swizzles[fetch_swizzle & 7], swizzles[(fetch_swizzle >> 3) & 7],
-          swizzles[(fetch_swizzle >> 6) & 7], swizzles[(fetch_swizzle >> 9) & 7]};
+                                                        bool swap_red_blue,
+                                                        bool image_view_format_swizzle = true) {
+  return MakeTextureComponentMappingFromHostSwizzle(
+      MakeHostTextureSwizzle(fetch_swizzle, channel_count, swap_red_blue),
+      image_view_format_swizzle);
+}
+
+// Packs a 12-bit host swizzle into SpirvShaderTranslator::SystemConstants::texture_swizzles.
+constexpr void PackSystemTextureSwizzle(uint32_t (&texture_swizzles)[16], uint32_t slot,
+                                        uint32_t host_swizzle) {
+  if (slot >= 32) {
+    return;
+  }
+  uint32_t& word = texture_swizzles[slot >> 1];
+  const uint32_t shift = 12 * (slot & 1);
+  const uint32_t mask = uint32_t(0xFFF) << shift;
+  word = (word & ~mask) | ((host_swizzle & 0xFFF) << shift);
 }
 
 // Packs a component mapping into one 32-bit cache key. Every swizzle value the
@@ -406,8 +442,8 @@ inline bool DecodeDmaIndices(std::span<const uint8_t> source, xenos::IndexFormat
 }
 
 // The translator expands each guest rectangle or point to four host vertices.
-inline std::vector<uint32_t> QuadStripIndices(uint32_t primitive_count) {
-  std::vector<uint32_t> indices;
+inline void FillQuadStripIndices(uint32_t primitive_count, std::vector<uint32_t>& indices) {
+  indices.clear();
   indices.reserve(5 * primitive_count);
   for (uint32_t primitive = 0; primitive < primitive_count; ++primitive) {
     if (primitive) {
@@ -417,6 +453,11 @@ inline std::vector<uint32_t> QuadStripIndices(uint32_t primitive_count) {
       indices.push_back(primitive * 4 + corner);
     }
   }
+}
+
+inline std::vector<uint32_t> QuadStripIndices(uint32_t primitive_count) {
+  std::vector<uint32_t> indices;
+  FillQuadStripIndices(primitive_count, indices);
   return indices;
 }
 
@@ -747,6 +788,77 @@ constexpr VkExtent2D GetSwapOutputExtent(VkExtent2D requested,
   }
   return {std::min(requested.width, resolved->width),
           std::min(requested.height, resolved->height)};
+}
+
+// Host Vulkan depth bias factors converted from Xenos absolute polygon offset
+// registers, matching the Xenos Vulkan backend.
+struct DepthBias {
+  float constant_factor = 0.0f;
+  float slope_factor = 0.0f;
+};
+
+constexpr DepthBias ScaleHostDepthBias(float slope, float offset,
+                                       xenos::DepthRenderTargetFormat depth_format,
+                                       uint32_t scale_x = 1, uint32_t scale_y = 1) {
+  return {offset * (depth_format == xenos::DepthRenderTargetFormat::kD24S8
+                        ? draw_util::kD3D10PolygonOffsetFactorUnorm24
+                        : draw_util::kD3D10PolygonOffsetFactorFloat24),
+          slope * xenos::kPolygonOffsetScaleSubpixelUnit *
+              float(scale_x > scale_y ? scale_x : scale_y)};
+}
+
+inline DepthBias ComputeHostDepthBias(const RegisterFile& regs, bool primitive_polygonal,
+                                      xenos::DepthRenderTargetFormat depth_format,
+                                      uint32_t scale_x = 1, uint32_t scale_y = 1) {
+  float slope = 0.0f;
+  float offset = 0.0f;
+  draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, slope, offset);
+  return ScaleHostDepthBias(slope, offset, depth_format, scale_x, scale_y);
+}
+
+// User clip plane configuration for vertex shader translation, matching
+// VulkanPipelineCache.
+struct UserClipPlaneConfig {
+  uint32_t enabled_mask = 0;
+  uint32_t count = 0;
+  bool cull_only = false;
+};
+
+constexpr UserClipPlaneConfig GetUserClipPlaneConfig(reg::PA_CL_CLIP_CNTL clip_cntl,
+                                                     bool shader_clip_distance,
+                                                     bool shader_cull_distance) {
+  UserClipPlaneConfig config{};
+  if (clip_cntl.clip_disable || !clip_cntl.ucp_ena) {
+    return config;
+  }
+  if ((clip_cntl.ucp_cull_only_ena && shader_cull_distance) ||
+      (!shader_clip_distance && shader_cull_distance)) {
+    config.cull_only = true;
+  } else if (!shader_clip_distance) {
+    return config;
+  }
+  config.enabled_mask = clip_cntl.ucp_ena;
+  config.count = uint32_t(std::popcount(config.enabled_mask));
+  return config;
+}
+
+// Whether a render area covers the entire image extent from (0, 0).
+constexpr bool CoversFullExtent(VkRect2D area, VkExtent2D extent) {
+  return area.offset.x == 0 && area.offset.y == 0 && area.extent.width == extent.width &&
+         area.extent.height == extent.height;
+}
+
+// Clamps one axis of draw resolution scaling so guest_extent * scale fits
+// within the device's host attachment/viewport limits.
+constexpr uint32_t ClampResolutionScaleAxis(uint32_t scale, uint32_t guest_extent,
+                                            uint32_t max_host_extent) {
+  if (!guest_extent) {
+    return scale;
+  }
+  while (scale > 1 && uint64_t(guest_extent) * scale > max_host_extent) {
+    --scale;
+  }
+  return scale;
 }
 
 }  // namespace rex::graphics::native

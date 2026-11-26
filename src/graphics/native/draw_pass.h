@@ -36,7 +36,8 @@ struct CachedTexture {
   // Set once a draw carrying this entry is accepted, so later draws in the same
   // batch can sample it without uploading again.
   bool uploaded = false;
-  // Per-face resolve versions last copied into a cached GPU-resolved cube.
+  // Per-face resolve addresses and versions last copied into a cached GPU-resolved cube.
+  std::array<uint32_t, kTextureCubeArrayLayers> resolved_face_addresses{};
   std::array<uint64_t, kTextureCubeArrayLayers> resolved_face_versions{};
   // Resolve version last copied into a cached cropped 2D GPU resolve.
   uint64_t resolved_crop_version = 0;
@@ -46,6 +47,9 @@ struct CachedTexture {
   ~CachedTexture();
   CachedTexture(const CachedTexture&) = delete;
   CachedTexture& operator=(const CachedTexture&) = delete;
+
+  VkImageView GetOrCreateView(VkImageViewType view_type, VkFormat format,
+                              VkComponentMapping swizzle, uint32_t array_layers);
 };
 
 struct DrawTexture {
@@ -57,6 +61,7 @@ struct DrawTexture {
   VkFormat format = VK_FORMAT_UNDEFINED;
   // VK_IMAGE_VIEW_TYPE_2D_ARRAY, or VK_IMAGE_VIEW_TYPE_CUBE for cubes.
   VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+  uint32_t host_swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_0000;
   VkComponentMapping swizzle{};
   std::vector<std::vector<uint8_t>> levels;
   std::shared_ptr<ColorImage> resolved_image;
@@ -104,6 +109,7 @@ struct DrawInput {
   // PA_CL_CLIP_CNTL.CLIP_DISABLE, mapped to depth clamping since Vulkan cannot
   // disable clipping entirely.
   bool depth_clamp_enable = false;
+  DepthBias depth_bias{};
   std::vector<uint8_t> vertices;
   std::vector<DrawTexture> textures;
   std::vector<uint32_t> texture_bindings;
@@ -115,12 +121,43 @@ struct DrawInput {
   bool edram_depth_clear_color = false;
   uint32_t edram_clear_stencil = 0;
   uint32_t edram_clear_format = 0;
+
+  // Resets all fields for reuse across draws while keeping vector capacities.
+  void Clear() {
+    system = {};
+    float_constants[0].clear();
+    float_constants[1].clear();
+    bool_loop.fill(0);
+    fetch.fill(0);
+    viewport = {};
+    scissor = {};
+    primitive_restart = false;
+    topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    blend.fill({});
+    color_formats.fill(VK_FORMAT_UNDEFINED);
+    color_count = 0;
+    depth_stencil = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    depth_format = VK_FORMAT_UNDEFINED;
+    samples = VK_SAMPLE_COUNT_1_BIT;
+    blend_constants.fill(0.0f);
+    cull = VK_CULL_MODE_NONE;
+    front_face = VK_FRONT_FACE_CLOCKWISE;
+    depth_clamp_enable = false;
+    depth_bias = {};
+    vertices.clear();
+    textures.clear();
+    texture_bindings.clear();
+    samplers.clear();
+    edram_depth_clear_color = false;
+    edram_clear_stencil = 0;
+    edram_clear_format = 0;
+  }
 };
 
 struct DrawPipelineKey {
   const Shader::Translation* vertex;
   const Shader::Translation* pixel;
-  std::array<uint32_t, 28> state;
+  std::array<uint32_t, 22> state;
   std::array<std::array<uint32_t, 9>, xenos::kMaxColorRenderTargets> colors;
   auto operator<=>(const DrawPipelineKey&) const = default;
 };
@@ -203,6 +240,12 @@ class DrawPass {
   uint32_t index_count_ = 0;
   draw_util::ViewportInfo viewport_{};
   draw_util::Scissor scissor_{};
+  bool depth_bias_enable_ = false;
+  DepthBias depth_bias_{};
+  bool stencil_enable_ = false;
+  std::array<uint32_t, 2> stencil_compare_mask_{};
+  std::array<uint32_t, 2> stencil_write_mask_{};
+  std::array<uint32_t, 2> stencil_reference_{};
   bool edram_depth_clear_color_ = false;
   std::array<uint32_t, 2> edram_clear_constants_{};
 };
