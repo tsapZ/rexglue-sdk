@@ -100,6 +100,10 @@ bool ColorImage::Initialize(VkExtent2D extent, VkFormat format, VkSampleCountFla
 
 void ColorImage::Transition(VkCommandBuffer commands, VkImageLayout layout,
                             VkPipelineStageFlags stage, VkAccessFlags access) {
+  if (layout_ == layout && access_ == VK_ACCESS_SHADER_READ_BIT &&
+      access == VK_ACCESS_SHADER_READ_BIT && (stage_ & stage) == stage) {
+    return;
+  }
   VkImageMemoryBarrier barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
   barrier.srcAccessMask = access_;
