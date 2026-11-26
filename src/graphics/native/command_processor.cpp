@@ -37,21 +37,6 @@ namespace {
 
 using Translator = SpirvShaderTranslator;
 
-VkFilter ToFilter(xenos::TextureFilter filter) {
-  return filter == xenos::TextureFilter::kLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-}
-
-VkSamplerAddressMode ToAddressMode(xenos::ClampMode mode) {
-  switch (mode) {
-    case xenos::ClampMode::kRepeat:
-      return VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    case xenos::ClampMode::kMirroredRepeat:
-      return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
-    default:
-      return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  }
-}
-
 std::optional<VkPrimitiveTopology> GetTopology(xenos::PrimitiveType type) {
   switch (type) {
     case xenos::PrimitiveType::kTriangleList:
@@ -227,8 +212,8 @@ bool NativeCommandProcessor::SetupContext() {
   instance.vkGetPhysicalDeviceFormatProperties(vulkan_device_->physical_device(),
                                                VK_FORMAT_D24_UNORM_S8_UINT,
                                                &depth_unorm24_properties);
-  depth_unorm24_supported_ = (depth_unorm24_properties.optimalTilingFeatures &
-                              kUsedDepthFormatFeatures) == kUsedDepthFormatFeatures;
+  const bool depth_unorm24_supported = (depth_unorm24_properties.optimalTilingFeatures &
+                                         kUsedDepthFormatFeatures) == kUsedDepthFormatFeatures;
   VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   pool.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
   pool.queueFamilyIndex = vulkan_device_->queue_family_graphics_compute();
@@ -289,20 +274,28 @@ bool NativeCommandProcessor::SetupContext() {
     }
     frame_timing_ << "swap,address,width,height,ready_ns,result\n";
   }
-  if (!InitializeNullTextures()) {
-    ShutdownContext();
-    return false;
-  }
   const uint32_t shared_segment_size =
       kPhysicalMemorySize >> translator_->GetSharedMemoryStorageBufferCountLog2();
-  if (vulkan_device_->properties().maxStorageBufferRange >= shared_segment_size &&
-      ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          vulkan_device_, kPhysicalMemorySize,
-          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-          ui::vulkan::util::MemoryPurpose::kDeviceLocal, shared_vertex_buffer_,
-          shared_vertex_memory_)) {
-    shared_vertex_valid_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
-    cached_texture_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
+  if (vulkan_device_->properties().maxStorageBufferRange >= shared_segment_size) {
+    shared_vertex_ = std::make_unique<SharedVertexMemory>(*vulkan_device_);
+    if (!shared_vertex_->Initialize()) {
+      shared_vertex_.reset();
+    }
+  }
+  texture_cache_ = std::make_unique<NativeTextureCache>(*vulkan_device_, *memory_, *register_file_,
+                                                        clock_, draw_resolution_scale_x_,
+                                                        draw_resolution_scale_y_);
+  target_cache_ = std::make_unique<NativeTargetCache>(
+      *vulkan_device_, clock_, draw_resolution_scale_x_, draw_resolution_scale_y_,
+      depth_unorm24_supported,
+      [this](const DrawInput& input, std::span<const uint32_t> indices,
+             const Shader::Translation& vertex, const Shader::Translation* pixel,
+             uint32_t rt_index, const std::shared_ptr<ColorImage>& image) {
+        QueueReplayDraw(input, indices, vertex, pixel, rt_index, image);
+      });
+  if (!texture_cache_->Initialize(shared_vertex_ != nullptr)) {
+    ShutdownContext();
+    return false;
   }
   memory_invalidation_handle_ =
       memory_->RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
@@ -316,80 +309,7 @@ bool NativeCommandProcessor::SetupContext() {
   return true;
 }
 
-bool NativeCommandProcessor::InitializeNullTextures() {
-  const auto& vk = vulkan_device_->functions();
-  const VkDevice device = vulkan_device_->device();
-  VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-  image.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-  image.imageType = VK_IMAGE_TYPE_2D;
-  image.format = ColorImage::kFormat;
-  image.extent = {1, 1, 1};
-  image.mipLevels = 1;
-  image.arrayLayers = 6;
-  image.samples = VK_SAMPLE_COUNT_1_BIT;
-  image.tiling = VK_IMAGE_TILING_OPTIMAL;
-  image.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-          vulkan_device_, image, ui::vulkan::util::MemoryPurpose::kDeviceLocal, null_texture_image_,
-          null_texture_memory_)) {
-    return false;
-  }
-  VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-  view.image = null_texture_image_;
-  view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-  view.format = ColorImage::kFormat;
-  view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  if (vk.vkCreateImageView(device, &view, nullptr, &null_texture_2d_view_) != VK_SUCCESS) {
-    return false;
-  }
-  view.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
-  view.subresourceRange.layerCount = 6;
-  return vk.vkCreateImageView(device, &view, nullptr, &null_texture_cube_view_) == VK_SUCCESS;
-}
-
-void NativeCommandProcessor::DestroyNullTextures() {
-  const auto& vk = vulkan_device_->functions();
-  const VkDevice device = vulkan_device_->device();
-  vk.vkDestroyImageView(device, null_texture_cube_view_, nullptr);
-  vk.vkDestroyImageView(device, null_texture_2d_view_, nullptr);
-  vk.vkDestroyImage(device, null_texture_image_, nullptr);
-  vk.vkFreeMemory(device, null_texture_memory_, nullptr);
-  null_texture_cube_view_ = null_texture_2d_view_ = VK_NULL_HANDLE;
-  null_texture_image_ = VK_NULL_HANDLE;
-  null_texture_memory_ = VK_NULL_HANDLE;
-  null_textures_initialized_ = false;
-}
-
-void NativeCommandProcessor::RecordNullTextureInitialization() {
-  if (null_textures_initialized_ || null_texture_image_ == VK_NULL_HANDLE) {
-    return;
-  }
-  const auto& vk = vulkan_device_->functions();
-  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};
-  VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-  barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  barrier.image = null_texture_image_;
-  barrier.subresourceRange = range;
-  barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  vk.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-  const VkClearColorValue zero{};
-  vk.vkCmdClearColorImage(command_buffer_, null_texture_image_,
-                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
-  barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-  vk.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          0, 0, nullptr, 0, nullptr, 1, &barrier);
-  null_textures_initialized_ = true;
-}
-
 void NativeCommandProcessor::ShutdownContext() {
-  depth_unorm24_supported_ = false;
   if (memory_invalidation_handle_) {
     memory_->UnregisterPhysicalMemoryInvalidationCallback(memory_invalidation_handle_);
     memory_invalidation_handle_ = nullptr;
@@ -416,31 +336,11 @@ void NativeCommandProcessor::ShutdownContext() {
   scratch_input_.Clear();
   in_flight_readback_.reset();
   // Draws in pending_ / in_flight_ have released their shared textures by now.
-  cached_textures_.clear();
-  resolved_cubes_.clear();
-  resolved_crops_.clear();
-  for (const auto& entry : samplers_) {
-    vk.vkDestroySampler(device, entry.second.sampler, nullptr);
-  }
-  samplers_.clear();
   draw_uploads_.reset();
-  if (shared_vertex_buffer_ != VK_NULL_HANDLE) {
-    vk.vkDestroyBuffer(device, shared_vertex_buffer_, nullptr);
-    shared_vertex_buffer_ = VK_NULL_HANDLE;
-  }
-  if (shared_vertex_memory_ != VK_NULL_HANDLE) {
-    vk.vkFreeMemory(device, shared_vertex_memory_, nullptr);
-    shared_vertex_memory_ = VK_NULL_HANDLE;
-  }
-  shared_vertex_valid_pages_.clear();
-  cached_texture_pages_.clear();
+  shared_vertex_.reset();
   presented_.reset();
-  presented_resolve_address_.reset();
-  resolved_images_.clear();
-  pending_fast_clears_.clear();
-  pending_color_fast_clears_.clear();
-  targets_.clear();
-  DestroyNullTextures();
+  target_cache_.reset();
+  texture_cache_.reset();
   for (const auto& entry : pipelines_) {
     vk.vkDestroyPipeline(device, entry.second, nullptr);
   }
@@ -489,208 +389,7 @@ Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type,
 }
 
 std::span<const uint8_t> NativeCommandProcessor::ReadPhysical(uint32_t address, size_t size) {
-  if (!IsPhysicalRange(address, size) ||
-      memory_->GetPhysicalHeap()->QueryRangeAccess(address, address + uint32_t(size) - 1) ==
-          memory::PageAccess::kNoAccess) {
-    return {};
-  }
-  return {memory_->TranslatePhysical(address), size};
-}
-
-bool NativeCommandProcessor::ReadTextures(const SpirvShader& shader, DrawInput& input) {
-  DrainMemoryInvalidations();
-  const auto& textures = shader.GetTextureBindingsAfterTranslation();
-  const auto& samplers = shader.GetSamplerBindingsAfterTranslation();
-  const auto& properties = vulkan_device_->properties();
-  if (textures.size() > properties.maxPerStageDescriptorSampledImages ||
-      samplers.size() > properties.maxPerStageDescriptorSamplers) {
-    return false;
-  }
-
-  std::array<int, 32> indices;
-  indices.fill(-1);
-  for (const auto& binding : textures) {
-    const bool cube = binding.dimension == xenos::FetchOpDimension::kCube;
-    if (!cube && binding.dimension != xenos::FetchOpDimension::k2D) {
-      return false;
-    }
-    const uint32_t slot = binding.fetch_constant;
-    const auto fetch = register_file_->GetTextureFetch(slot);
-    // A fetch constant that isn't a usable texture of the fetched dimension
-    // reads as zero on the guest - bind a zero-cleared fallback rather than
-    // dropping the draw. Its signs stay unsigned.
-    const bool use_fallback = ShouldUseFallbackTexture(
-        fetch.type == xenos::FetchConstantType::kTexture,
-        (fetch.base_address & 0x1FFFF) != 0, fetch.stacked,
-        fetch.dimension == (cube ? xenos::DataDimension::kCube
-                                 : xenos::DataDimension::k2DOrStacked));
-    if (indices[slot] < 0) {
-      auto& texture = input.textures.emplace_back();
-      if (use_fallback) {
-        texture.fallback_view =
-            cube ? null_texture_cube_view_ : null_texture_2d_view_;
-      } else if (!ReadTexture(fetch, texture)) {
-        REXGPU_DEBUG(
-            "Native Vulkan texture {} unsupported: format={} base={:05X} flags={:08X}/{:08X}", slot,
-            uint32_t(fetch.format), uint32_t(fetch.base_address), fetch.dword_4, fetch.dword_5);
-        return false;
-      }
-      if (!use_fallback) {
-        input.system.texture_swizzled_signs[slot / 4] |= uint32_t(texture_util::SwizzleSigns(fetch))
-                                                         << ((slot % 4) * 8);
-        if (texture.resolution_scaled) {
-          input.system.textures_resolution_scaled |= uint32_t(1) << slot;
-        }
-        if (!properties.imageViewFormatSwizzle) {
-          PackSystemTextureSwizzle(input.system.texture_swizzles, slot, texture.host_swizzle);
-        }
-      }
-      indices[slot] = int(input.textures.size() - 1);
-    }
-    input.texture_bindings.push_back(uint32_t(indices[slot]));
-  }
-  for (const auto& sampler : samplers) {
-    const auto fetch = register_file_->GetTextureFetch(sampler.fetch_constant);
-    DrawSampler out;
-    out.min_filter =
-        ToFilter(sampler.min_filter == xenos::TextureFilter::kUseFetchConst ? fetch.min_filter
-                                                                            : sampler.min_filter);
-    out.mag_filter =
-        ToFilter(sampler.mag_filter == xenos::TextureFilter::kUseFetchConst ? fetch.mag_filter
-                                                                            : sampler.mag_filter);
-    const auto mip_filter = sampler.mip_filter == xenos::TextureFilter::kUseFetchConst
-                                ? fetch.mip_filter
-                                : sampler.mip_filter;
-    out.mip_mode = mip_filter == xenos::TextureFilter::kLinear ? VK_SAMPLER_MIPMAP_MODE_LINEAR
-                                                               : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    out.max_lod = mip_filter == xenos::TextureFilter::kBaseMap ? 0.0f : float(fetch.mip_max_level);
-    out.address_u = ToAddressMode(fetch.clamp_x);
-    out.address_v = ToAddressMode(fetch.clamp_y);
-    const VkSampler handle = GetSampler(out);
-    if (handle == VK_NULL_HANDLE) {
-      return false;
-    }
-    input.samplers.push_back(handle);
-  }
-  return true;
-}
-
-VkSampler NativeCommandProcessor::GetSampler(const DrawSampler& key) {
-  auto existing = samplers_.find(key);
-  if (existing != samplers_.end()) {
-    existing->second.last_use_submission = next_submission_;
-    return existing->second.sampler;
-  }
-  if (samplers_.size() >= kMaxSamplers) {
-    const auto victim = SelectRetiredEviction(
-        samplers_, retired_submission_ + 1,
-        [](const DrawSampler&, const CachedSampler&) { return true; });
-    if (!victim) {
-      return VK_NULL_HANDLE;
-    }
-    auto victim_it = samplers_.find(*victim);
-    vulkan_device_->functions().vkDestroySampler(vulkan_device_->device(),
-                                                 victim_it->second.sampler, nullptr);
-    samplers_.erase(victim_it);
-  }
-  VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-  info.minFilter = key.min_filter;
-  info.magFilter = key.mag_filter;
-  info.mipmapMode = key.mip_mode;
-  info.maxLod = key.max_lod;
-  info.addressModeU = key.address_u;
-  info.addressModeV = key.address_v;
-  info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  VkSampler sampler = VK_NULL_HANDLE;
-  if (vulkan_device_->functions().vkCreateSampler(vulkan_device_->device(), &info, nullptr,
-                                                  &sampler) != VK_SUCCESS) {
-    return VK_NULL_HANDLE;
-  }
-  samplers_.emplace(key, CachedSampler{sampler, next_submission_});
-  return sampler;
-}
-
-void NativeCommandProcessor::InvalidateTextures(uint32_t start, uint32_t length) {
-  bool erased = false;
-  for (auto it = cached_textures_.begin(); it != cached_textures_.end();) {
-    const CachedTexture& texture = *it->second.texture;
-    if (RangesOverlap(start, length, texture.base_start, texture.base_length) ||
-        RangesOverlap(start, length, texture.mip_start, texture.mip_length)) {
-      it = cached_textures_.erase(it);
-      erased = true;
-    } else {
-      ++it;
-    }
-  }
-  if (erased) {
-    RebuildCachedTexturePages();
-  }
-}
-
-void NativeCommandProcessor::PruneResolvedDependents() {
-  for (auto it = resolved_crops_.begin(); it != resolved_crops_.end();) {
-    if (!resolved_images_.contains(it->first.address)) {
-      it = resolved_crops_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-  for (auto it = resolved_cubes_.begin(); it != resolved_cubes_.end();) {
-    bool alive = true;
-    for (uint32_t face_addr : it->second.texture->resolved_face_addresses) {
-      if (!face_addr || !resolved_images_.contains(face_addr)) {
-        alive = false;
-        break;
-      }
-    }
-    if (!alive) {
-      it = resolved_cubes_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-}
-
-void NativeCommandProcessor::InvalidateResolvedTextures(uint32_t start, uint32_t length) {
-  bool erased = false;
-  for (auto it = resolved_images_.begin(); it != resolved_images_.end();) {
-    if (RangesOverlap(start, length, it->second.guest_start, it->second.guest_length)) {
-      if (presented_resolve_address_ && *presented_resolve_address_ == it->first) {
-        presented_resolve_address_.reset();
-      }
-      it = resolved_images_.erase(it);
-      erased = true;
-    } else {
-      ++it;
-    }
-  }
-  if (erased) {
-    PruneResolvedDependents();
-    RebuildCachedTexturePages();
-  }
-}
-
-void NativeCommandProcessor::RebuildCachedTexturePages() {
-  if (cached_texture_pages_.empty()) {
-    return;
-  }
-  std::lock_guard<std::mutex> lock(invalidation_mutex_);
-  std::fill(cached_texture_pages_.begin(), cached_texture_pages_.end(), 0);
-  for (const auto& [key, entry] : cached_textures_) {
-    const auto& texture = *entry.texture;
-    const auto [base_first, base_count] =
-        GetPhysicalPageRange(texture.base_start, texture.base_length);
-    SetPageRangeBits(cached_texture_pages_, base_first, base_count);
-    if (texture.mip_length) {
-      const auto [mip_first, mip_count] =
-          GetPhysicalPageRange(texture.mip_start, texture.mip_length);
-      SetPageRangeBits(cached_texture_pages_, mip_first, mip_count);
-    }
-  }
-  for (const auto& [addr, entry] : resolved_images_) {
-    const auto [first, count] = GetPhysicalPageRange(entry.guest_start, entry.guest_length);
-    SetPageRangeBits(cached_texture_pages_, first, count);
-  }
+  return ReadGuestPhysical(*memory_, address, size);
 }
 
 void NativeCommandProcessor::DrainMemoryInvalidations() {
@@ -704,22 +403,18 @@ void NativeCommandProcessor::DrainMemoryInvalidations() {
     has_pending_invalidations_.store(false, std::memory_order_release);
   }
   for (const auto& [start, length] : invalidations) {
-    InvalidateTextures(start, length);
-    InvalidateResolvedTextures(start, length);
+    texture_cache_->InvalidateTextures(start, length);
+    texture_cache_->InvalidateResolvedTextures(start, length);
     InvalidateSharedVertices(start, length);
   }
 }
 
 void NativeCommandProcessor::InvalidateGpuMemory() {
-  cached_textures_.clear();
-  resolved_images_.clear();
-  resolved_cubes_.clear();
-  resolved_crops_.clear();
-  presented_resolve_address_.reset();
-  std::fill(shared_vertex_valid_pages_.begin(), shared_vertex_valid_pages_.end(), 0);
-  if (!cached_texture_pages_.empty()) {
-    std::lock_guard<std::mutex> lock(invalidation_mutex_);
-    std::fill(cached_texture_pages_.begin(), cached_texture_pages_.end(), 0);
+  if (texture_cache_) {
+    texture_cache_->InvalidateAll();
+  }
+  if (shared_vertex_) {
+    shared_vertex_->InvalidateAll();
   }
 }
 
@@ -744,69 +439,38 @@ void NativeCommandProcessor::ClearCaches() {
   InvalidateGpuMemory();
   const auto& vk = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
-  for (const auto& entry : samplers_) {
-    vk.vkDestroySampler(device, entry.second.sampler, nullptr);
-  }
-  samplers_.clear();
+  texture_cache_->ClearSamplers();
   for (const auto& entry : pipelines_) {
     vk.vkDestroyPipeline(device, entry.second, nullptr);
   }
   pipelines_.clear();
   draw_bindings_.clear();
-  pending_fast_clears_.clear();
-  pending_color_fast_clears_.clear();
-  targets_.clear();
-}
-
-void NativeCommandProcessor::InvalidateSharedVertices(uint32_t start, uint32_t length) {
-  if (shared_vertex_valid_pages_.empty()) {
-    return;
-  }
-  const auto [first_page, page_count] = GetPhysicalPageRange(start, length);
-  ClearPageRangeBits(shared_vertex_valid_pages_, first_page, page_count);
+  target_cache_->Clear();
 }
 
 bool NativeCommandProcessor::EnsureSharedVertexRange(uint32_t address, uint32_t size) {
   if (!size || ReadPhysical(address, size).empty()) {
     return false;
   }
-  const auto [first_page, page_count] = GetPhysicalPageRange(address, size);
-  const uint32_t end_page = first_page + page_count;
-  uint32_t cursor = first_page;
-  uint32_t run_first_page = 0;
-  uint32_t run_page_count = 0;
-  while (FindNextInvalidPageRun(shared_vertex_valid_pages_, cursor, end_page, run_first_page,
-                                run_page_count)) {
-    const uint32_t max_chunk_pages = uint32_t(kDrawUploadPageSize >> kSharedVertexPageShift);
-    uint32_t chunk_page = run_first_page;
-    uint32_t remaining_pages = run_page_count;
-    while (remaining_pages) {
-      const uint32_t chunk_pages = std::min(remaining_pages, max_chunk_pages);
-      const uint32_t chunk_addr = chunk_page << kSharedVertexPageShift;
-      const uint32_t chunk_size =
-          std::min(chunk_pages << kSharedVertexPageShift, kPhysicalMemorySize - chunk_addr);
-      const auto bytes = ReadPhysical(chunk_addr, chunk_size);
-      if (bytes.empty()) {
-        return false;
-      }
-      VkBuffer src_buffer = VK_NULL_HANDLE;
-      VkDeviceSize src_offset = 0;
-      uint8_t* dst =
-          draw_uploads_->Request(next_submission_, chunk_size, 16, src_buffer, src_offset);
-      if (!dst) {
-        return false;
-      }
-      // Watch the guest pages before reading them so any write after the copy
-      // invalidates them before a later draw reads stale vertices.
-      memory_->EnablePhysicalMemoryAccessCallbacks(chunk_addr, chunk_size, true, false);
-      std::memcpy(dst, bytes.data(), chunk_size);
-      pending_.emplace_back(QueuedBufferUpload{src_buffer, src_offset, chunk_addr, chunk_size});
-      SetPageRangeBits(shared_vertex_valid_pages_, chunk_page, chunk_pages);
-      chunk_page += chunk_pages;
-      remaining_pages -= chunk_pages;
-    }
-  }
-  return true;
+  return shared_vertex_->EnsureRange(
+      address, size, uint32_t(kDrawUploadPageSize), [&](uint32_t chunk_addr, uint32_t chunk_size) {
+        const auto bytes = ReadPhysical(chunk_addr, chunk_size);
+        if (bytes.empty()) {
+          return false;
+        }
+        VkBuffer src_buffer = VK_NULL_HANDLE;
+        VkDeviceSize src_offset = 0;
+        uint8_t* dst = draw_uploads_->Request(clock_.next, chunk_size, 16, src_buffer, src_offset);
+        if (!dst) {
+          return false;
+        }
+        // Watch the guest pages before reading them so any write after the copy
+        // invalidates them before a later draw reads stale vertices.
+        memory_->EnablePhysicalMemoryAccessCallbacks(chunk_addr, chunk_size, true, false);
+        std::memcpy(dst, bytes.data(), chunk_size);
+        pending_.emplace_back(QueuedBufferUpload{src_buffer, src_offset, chunk_addr, chunk_size});
+        return true;
+      });
 }
 
 std::pair<uint32_t, uint32_t> NativeCommandProcessor::MemoryInvalidationCallbackThunk(
@@ -824,520 +488,19 @@ std::pair<uint32_t, uint32_t> NativeCommandProcessor::MemoryInvalidationCallback
   {
     // Only the tiny pending list is touched here; this runs on a guest thread
     // while the global critical region is held.
-    std::lock_guard<std::mutex> lock(invalidation_mutex_);
-    if (!exact_range && !cached_texture_pages_.empty()) {
+    if (!exact_range) {
       const auto [widened_start, widened_length] =
-          WidenInvalidationPageRange(cached_texture_pages_, physical_address_start, length);
+          texture_cache_->WidenInvalidation(physical_address_start, length);
       if (widened_length) {
         physical_address_start = widened_start;
         length = widened_length;
       }
     }
+    std::lock_guard<std::mutex> lock(invalidation_mutex_);
     pending_invalidations_.emplace_back(physical_address_start, length);
     has_pending_invalidations_.store(true, std::memory_order_release);
   }
   return {physical_address_start, length};
-}
-
-template <typename EntryMap, typename Key, typename OnCreated>
-std::shared_ptr<CachedTexture> NativeCommandProcessor::GetOrCreateCachedTexture(
-    EntryMap& cache, size_t max_entries, const Key& key, const VkImageCreateInfo& image_info,
-    OnCreated&& on_created, bool& failed) {
-  failed = false;
-  if (auto found = cache.find(key); found != cache.end()) {
-    found->second.last_use_submission = next_submission_;
-    found->second.texture->last_use_submission = next_submission_;
-    return found->second.texture;
-  }
-  if (cache.size() >= max_entries) {
-    const auto victim = SelectRetiredEviction(
-        cache, retired_submission_ + 1,
-        [](const Key&, const CachedTextureEntry&) { return true; });
-    if (victim) {
-      cache.erase(*victim);
-    }
-  }
-  if (cache.size() >= max_entries) {
-    return {};
-  }
-  auto entry = std::make_shared<CachedTexture>();
-  entry->device = vulkan_device_;
-  entry->level_count = image_info.mipLevels;
-  entry->last_use_submission = next_submission_;
-  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-          vulkan_device_, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, entry->image,
-          entry->memory)) {
-    failed = true;
-    return {};
-  }
-  on_created(*entry);
-  cache.emplace(key, CachedTextureEntry{entry, next_submission_});
-  return entry;
-}
-
-bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
-                                         DrawTexture& texture) {
-  const bool cube = fetch.dimension == xenos::DataDimension::kCube;
-  if (fetch.type != xenos::FetchConstantType::kTexture ||
-      (!cube && fetch.dimension != xenos::DataDimension::k2DOrStacked) || fetch.stacked) {
-    return false;
-  }
-  // IEEE float host formats are natively signed, so a signed guest fetch maps
-  // straight onto them. Integer, UNORM and BC formats would need separate SNORM
-  // views, so those signed fetches are still rejected until they exist.
-  if (!IsFloatTextureFormat(fetch.format) &&
-      (fetch.sign_x == xenos::TextureSign::kSigned ||
-       fetch.sign_y == xenos::TextureSign::kSigned ||
-       fetch.sign_z == xenos::TextureSign::kSigned ||
-       fetch.sign_w == xenos::TextureSign::kSigned)) {
-    return false;
-  }
-
-  texture.width = fetch.size_2d.width + 1;
-  texture.height = fetch.size_2d.height + 1;
-  if (cube && texture.width != texture.height) {
-    return false;
-  }
-  texture.array_layers = GetTextureArrayLayers(fetch.dimension);
-  texture.view_type = cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-  uint32_t block_size;
-  uint32_t block_width = 1;
-  bool depth_texture = false;
-  switch (fetch.format) {
-    case xenos::TextureFormat::k_8:
-    case xenos::TextureFormat::k_8_A:
-    case xenos::TextureFormat::k_8_B:
-      texture.format = VK_FORMAT_R8_UNORM;
-      block_size = 1;
-      break;
-    case xenos::TextureFormat::k_8_8:
-      texture.format = VK_FORMAT_R8G8_UNORM;
-      block_size = 2;
-      break;
-    case xenos::TextureFormat::k_5_6_5:
-      texture.format = VK_FORMAT_R5G6B5_UNORM_PACK16;
-      block_size = 2;
-      break;
-    case xenos::TextureFormat::k_32_FLOAT:
-      texture.format = VK_FORMAT_R32_SFLOAT;
-      block_size = 4;
-      break;
-    case xenos::TextureFormat::k_16_16_FLOAT:
-      texture.format = VK_FORMAT_R16G16_SFLOAT;
-      block_size = 4;
-      break;
-    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
-      texture.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-      block_size = 8;
-      break;
-    case xenos::TextureFormat::k_24_8:
-    case xenos::TextureFormat::k_24_8_FLOAT:
-      texture.format = VK_FORMAT_R32_SFLOAT;
-      block_size = 4;
-      depth_texture = true;
-      break;
-    case xenos::TextureFormat::k_2_10_10_10:
-    case xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16:
-      texture.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-      block_size = 4;
-      break;
-    case xenos::TextureFormat::k_8_8_8_8_AS_16_16_16_16:
-    case xenos::TextureFormat::k_8_8_8_8_A:
-    case xenos::TextureFormat::k_8_8_8_8:
-      texture.format = VK_FORMAT_R8G8B8A8_UNORM;
-      block_size = 4;
-      break;
-    case xenos::TextureFormat::k_DXT1_AS_16_16_16_16:
-    case xenos::TextureFormat::k_DXT1:
-      texture.format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
-      block_width = 4;
-      block_size = 8;
-      break;
-    case xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16:
-    case xenos::TextureFormat::k_DXT2_3:
-      texture.format = VK_FORMAT_BC2_UNORM_BLOCK;
-      block_width = 4;
-      block_size = 16;
-      break;
-    case xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16:
-    case xenos::TextureFormat::k_DXT4_5:
-      texture.format = VK_FORMAT_BC3_UNORM_BLOCK;
-      block_width = 4;
-      block_size = 16;
-      break;
-    case xenos::TextureFormat::k_DXN:
-      texture.format = VK_FORMAT_BC5_UNORM_BLOCK;
-      block_width = 4;
-      block_size = 16;
-      break;
-    default:
-      return false;
-  }
-
-  // Replicate the guest components that the format actually stores, matching
-  // the Xenos Vulkan host format swizzle: RRRR for one channel, RGGG for two,
-  // RGBA otherwise. Block sizes don't map to channels, so use the count.
-  const uint32_t channel_count = TextureChannelCount(fetch.format);
-  uint32_t base_page, mip_page, mip_min, mip_max;
-  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &base_page,
-                                                 &mip_page, &mip_min, &mip_max);
-  if (!base_page || mip_min != 0) {
-    return false;
-  }
-  const uint32_t address = base_page << 12;
-  const uint32_t scaled_width = texture.width * draw_resolution_scale_x_;
-  const uint32_t scaled_height = texture.height * draw_resolution_scale_y_;
-  const bool is_scaled = draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1;
-  const bool use_view_swizzle = vulkan_device_->properties().imageViewFormatSwizzle;
-  auto resolved = resolved_images_.find(address);
-  if (cube && !mip_max && resolved != resolved_images_.end()) {
-    // Some titles render each cube face as a separate small color target and
-    // resolve it to its own slice of the guest layout, leaving guest memory
-    // zero. Assemble and cache a cube image from those six resolved faces,
-    // re-copying only when a face resolve version advances.
-    const auto cube_layout = texture_util::GetGuestTextureLayout(
-        fetch.dimension, fetch.pitch, texture.width, texture.height, 1, fetch.tiled,
-        fetch.format, fetch.packed_mips, true, mip_max);
-    const uint32_t face_stride = cube_layout.base.array_slice_stride_bytes;
-    std::array<std::shared_ptr<ColorImage>, kTextureCubeArrayLayers> faces{};
-    std::array<uint32_t, kTextureCubeArrayLayers> face_addresses{};
-    std::array<uint64_t, kTextureCubeArrayLayers> face_versions{};
-    std::optional<bool> face_swap;
-    bool faces_usable = face_stride != 0;
-    for (uint32_t face = 0; faces_usable && face < kTextureCubeArrayLayers; ++face) {
-      const uint32_t face_addr = GetResolvedCubeFaceAddress(address, face_stride, face);
-      auto face_resolved = resolved_images_.find(face_addr);
-      if (face_resolved == resolved_images_.end()) {
-        faces_usable = false;
-        break;
-      }
-      auto& entry = face_resolved->second;
-      const auto face_extent = entry.image->extent();
-      if (!CanUseResolvedCubeFace(texture.format == entry.image->format(), face_extent.width,
-                                  face_extent.height, scaled_width, scaled_height,
-                                  draw_resolution_scale_x_, draw_resolution_scale_y_)) {
-        faces_usable = false;
-        break;
-      }
-      const bool swap_red_blue =
-          !depth_texture && reg::RB_COPY_DEST_INFO{entry.dest_info}.copy_dest_swap != 0;
-      if (face_swap && *face_swap != swap_red_blue) {
-        faces_usable = false;
-        break;
-      }
-      face_swap = swap_red_blue;
-      faces[face] = entry.image;
-      face_addresses[face] = face_addr;
-      face_versions[face] = entry.version;
-      entry.last_use_submission = next_submission_;
-    }
-    if (faces_usable) {
-      texture.width = scaled_width;
-      texture.height = scaled_height;
-      texture.resolution_scaled = is_scaled;
-      texture.host_swizzle = MakeHostTextureSwizzle(fetch.swizzle, channel_count, *face_swap);
-      texture.swizzle =
-          MakeTextureComponentMappingFromHostSwizzle(texture.host_swizzle, use_view_swizzle);
-      const ResolvedCubeKey cube_key{address, scaled_width, scaled_height, texture.format};
-      VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-      image.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-      image.imageType = VK_IMAGE_TYPE_2D;
-      image.format = texture.format;
-      image.extent = {scaled_width, scaled_height, 1};
-      image.mipLevels = 1;
-      image.arrayLayers = kTextureCubeArrayLayers;
-      image.samples = VK_SAMPLE_COUNT_1_BIT;
-      image.tiling = VK_IMAGE_TILING_OPTIMAL;
-      image.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-      bool failed = false;
-      auto entry = GetOrCreateCachedTexture(
-          resolved_cubes_, kMaxResolvedCubes, cube_key, image,
-          [&](CachedTexture& created) { created.resolved_face_addresses = face_addresses; },
-          failed);
-      if (failed) {
-        return false;
-      }
-      if (entry) {
-        entry->resolved_face_addresses = face_addresses;
-        const VkImageView image_view = entry->GetOrCreateView(
-            VK_IMAGE_VIEW_TYPE_CUBE, texture.format, texture.swizzle, kTextureCubeArrayLayers);
-        if (image_view == VK_NULL_HANDLE) {
-          return false;
-        }
-        const bool needs_upload =
-            ShouldUploadResolvedCube(entry->uploaded, entry->resolved_face_versions, face_versions);
-        texture.cached_texture = entry;
-        texture.cached_view = image_view;
-        texture.upload_cached = needs_upload;
-        if (needs_upload) {
-          texture.resolved_cube_faces = std::move(faces);
-          texture.resolved_cube_face_versions = face_versions;
-        }
-        return true;
-      }
-      texture.resolved_cube_faces = std::move(faces);
-      return true;
-    }
-  }
-  if (!cube && !mip_max && resolved != resolved_images_.end() &&
-      texture.format == resolved->second.image->format()) {
-    // A 32bpp 3/4-channel resolve copied with copy_dest_swap keeps the EDRAM
-    // red/blue order, while the guest fetch swizzle expects them swapped in
-    // memory, so apply that swap to the host view instead.
-    const bool swap_red_blue =
-        !depth_texture && reg::RB_COPY_DEST_INFO{resolved->second.dest_info}.copy_dest_swap != 0;
-    const auto extent = resolved->second.image->extent();
-    if (extent.width == scaled_width && extent.height == scaled_height) {
-      resolved->second.last_use_submission = next_submission_;
-      texture.width = scaled_width;
-      texture.height = scaled_height;
-      texture.resolution_scaled = is_scaled;
-      texture.host_swizzle = MakeHostTextureSwizzle(fetch.swizzle, channel_count, swap_red_blue);
-      texture.swizzle =
-          MakeTextureComponentMappingFromHostSwizzle(texture.host_swizzle, use_view_swizzle);
-      texture.resolved_image = resolved->second.image;
-      return true;
-    }
-    // Resolves are 8x8-aligned, so the cached image can be up to one alignment
-    // unit larger than the texture. Crop its top-left corner during the upload;
-    // otherwise fall through to guest memory so a newly written CPU texture at
-    // the same address with a different size is not dropped.
-    const uint32_t alignment = resolved->second.tiled_destination ? xenos::kTextureTileWidthHeight
-                                                                  : xenos::kResolveAlignmentPixels;
-    if (CanCropAlignedResolve(extent.width, extent.height, scaled_width, scaled_height,
-                              draw_resolution_scale_x_, draw_resolution_scale_y_, alignment)) {
-      resolved->second.last_use_submission = next_submission_;
-      texture.width = scaled_width;
-      texture.height = scaled_height;
-      texture.resolution_scaled = is_scaled;
-      texture.host_swizzle = MakeHostTextureSwizzle(fetch.swizzle, channel_count, swap_red_blue);
-      texture.swizzle =
-          MakeTextureComponentMappingFromHostSwizzle(texture.host_swizzle, use_view_swizzle);
-      const ResolvedCropKey crop_key{address, scaled_width, scaled_height, texture.format};
-      VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-      image.imageType = VK_IMAGE_TYPE_2D;
-      image.format = texture.format;
-      image.extent = {scaled_width, scaled_height, 1};
-      image.mipLevels = 1;
-      image.arrayLayers = 1;
-      image.samples = VK_SAMPLE_COUNT_1_BIT;
-      image.tiling = VK_IMAGE_TILING_OPTIMAL;
-      image.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-      bool failed = false;
-      auto entry = GetOrCreateCachedTexture(resolved_crops_, kMaxResolvedCrops, crop_key, image,
-                                            [](CachedTexture&) {}, failed);
-      if (failed) {
-        return false;
-      }
-      if (entry) {
-        const VkImageView image_view = entry->GetOrCreateView(
-            VK_IMAGE_VIEW_TYPE_2D_ARRAY, texture.format, texture.swizzle, 1);
-        if (image_view == VK_NULL_HANDLE) {
-          return false;
-        }
-        const bool needs_upload = ShouldUploadResolvedCrop(
-            entry->uploaded, entry->resolved_crop_version, resolved->second.version);
-        texture.cached_texture = entry;
-        texture.cached_view = image_view;
-        texture.upload_cached = needs_upload;
-        if (needs_upload) {
-          texture.crop_source = resolved->second.image;
-          texture.resolved_crop_version = resolved->second.version;
-        }
-        return true;
-      }
-      texture.crop_source = resolved->second.image;
-      return true;
-    }
-  }
-  texture.host_swizzle = MakeHostTextureSwizzle(
-      fetch.swizzle, channel_count, fetch.format == xenos::TextureFormat::k_5_6_5);
-  texture.swizzle =
-      MakeTextureComponentMappingFromHostSwizzle(texture.host_swizzle, use_view_swizzle);
-
-  GuestTextureKey key;
-  key.base_page = base_page;
-  key.mip_page = mip_page;
-  key.width = texture.width;
-  key.height = texture.height;
-  key.array_layers = texture.array_layers;
-  key.format = fetch.format;
-  key.dimension = fetch.dimension;
-  key.tiled = fetch.tiled != 0;
-  key.packed_mips = fetch.packed_mips != 0;
-  key.endianness = fetch.endianness;
-  key.pitch = fetch.pitch;
-  key.mip_max = mip_max;
-
-  // A cached texture whose texels are already uploaded can be sampled straight
-  // away: the guest layout and the physical page checks only matter when the
-  // image is created or decoded for the first time.
-  std::shared_ptr<CachedTexture> entry;
-  auto cached = cached_textures_.find(key);
-  if (cached != cached_textures_.end()) {
-    entry = cached->second.texture;
-    cached->second.last_use_submission = next_submission_;
-    entry->last_use_submission = next_submission_;
-    if (entry->uploaded) {
-      const VkImageView image_view = entry->GetOrCreateView(
-          texture.view_type, texture.format, texture.swizzle, texture.array_layers);
-      if (image_view == VK_NULL_HANDLE) {
-        return false;
-      }
-      texture.cached_texture = entry;
-      texture.cached_view = image_view;
-      texture.upload_cached = false;
-      return true;
-    }
-  }
-
-  const auto layout = texture_util::GetGuestTextureLayout(
-      fetch.dimension, fetch.pitch, texture.width, texture.height, 1, fetch.tiled, fetch.format,
-      fetch.packed_mips, true, mip_max);
-
-  const uint32_t level_count = layout.max_level + 1;
-  const uint32_t base_length =
-      uint32_t(rex::align(layout.base.level_data_extent_bytes, uint32_t(4)));
-  if (!IsPhysicalRange(address, base_length)) {
-    return false;
-  }
-  uint32_t mip_start = 0;
-  uint32_t mip_length = 0;
-  if (layout.max_level > 0) {
-    mip_start = mip_page << 12;
-    mip_length = uint32_t(rex::align(layout.mips_total_extent_bytes, uint32_t(4)));
-    if (!IsPhysicalRange(mip_start, mip_length)) {
-      return false;
-    }
-  }
-
-  if (!entry) {
-    VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    image.imageType = VK_IMAGE_TYPE_2D;
-    image.format = texture.format;
-    image.extent = {texture.width, texture.height, 1};
-    image.mipLevels = level_count;
-    image.arrayLayers = texture.array_layers;
-    image.samples = VK_SAMPLE_COUNT_1_BIT;
-    image.tiling = VK_IMAGE_TILING_OPTIMAL;
-    image.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (texture.view_type == VK_IMAGE_VIEW_TYPE_CUBE) {
-      image.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-    }
-    bool failed = false;
-    const size_t size_before = cached_textures_.size();
-    entry = GetOrCreateCachedTexture(
-        cached_textures_, kMaxCachedTextures, key, image,
-        [&](CachedTexture& created) {
-          created.base_start = address;
-          created.base_length = base_length;
-          created.mip_start = mip_start;
-          created.mip_length = mip_length;
-          if (!cached_texture_pages_.empty()) {
-            std::lock_guard<std::mutex> lock(invalidation_mutex_);
-            const auto [base_first, base_count] = GetPhysicalPageRange(address, base_length);
-            SetPageRangeBits(cached_texture_pages_, base_first, base_count);
-            if (mip_length) {
-              const auto [mip_first, mip_count] = GetPhysicalPageRange(mip_start, mip_length);
-              SetPageRangeBits(cached_texture_pages_, mip_first, mip_count);
-            }
-          }
-          // Watch the guest pages before reading them, so a write between the read and
-          // the next frame invalidates this entry.
-          memory_->EnablePhysicalMemoryAccessCallbacks(address, base_length, true, false);
-          if (mip_length) {
-            memory_->EnablePhysicalMemoryAccessCallbacks(mip_start, mip_length, true, false);
-          }
-        },
-        failed);
-    if (failed) {
-      return false;
-    }
-    if (cached_textures_.size() <= size_before && entry) {
-      RebuildCachedTexturePages();
-    }
-  }
-
-  const bool upload = !entry || !entry->uploaded;
-  if (upload) {
-    constexpr std::array<size_t, 4> byte_xor{0, 1, 3, 2};
-    const size_t swap = byte_xor[uint32_t(fetch.endianness)];
-    for (uint32_t level = 0; level <= layout.max_level; ++level) {
-      const uint32_t level_storage = std::min(level, layout.packed_level);
-      const auto& level_layout = level ? layout.mips[level_storage] : layout.base;
-      const uint64_t level_address =
-          level ? (uint64_t(mip_page) << 12) + layout.mip_offsets_bytes[level_storage] : address;
-      if (level_address >= kPhysicalMemorySize) {
-        return false;
-      }
-      // Array slices are stored within the level, each `array_slice_stride_bytes`
-      // apart, so the last slice's data must be readable as well.
-      const size_t level_read_size =
-          GetTextureLevelReadSize(level_layout.array_slice_stride_bytes,
-                                  level_layout.array_slice_data_extent_bytes, texture.array_layers);
-      const auto source =
-          ReadPhysical(uint32_t(level_address), rex::align(level_read_size, size_t(4)));
-      if (source.empty()) {
-        return false;
-      }
-      uint32_t start_x = 0, start_y = 0, start_z = 0;
-      if (level >= layout.packed_level) {
-        texture_util::GetPackedMipOffset(texture.width, texture.height, 1, fetch.format, level,
-                                         start_x, start_y, start_z);
-      }
-      const uint32_t level_width = std::max(1u, texture.width >> level);
-      const uint32_t level_height = std::max(1u, texture.height >> level);
-      const uint32_t blocks_x = (level_width + block_width - 1) / block_width;
-      const uint32_t blocks_y = (level_height + block_width - 1) / block_width;
-      auto& data = texture.levels.emplace_back(size_t(blocks_x) * blocks_y * block_size *
-                                               texture.array_layers);
-      for (uint32_t slice = 0; slice < texture.array_layers; ++slice) {
-        const size_t slice_base = size_t(slice) * level_layout.array_slice_stride_bytes;
-        // Each face is tiled independently from the origin of its own data.
-        for (uint32_t y = 0; y < blocks_y; ++y) {
-          for (uint32_t x = 0; x < blocks_x; ++x) {
-            const size_t offset =
-                slice_base +
-                (fetch.tiled ? size_t(texture_util::GetTiledOffset2D(
-                                   int32_t(x + start_x), int32_t(y + start_y),
-                                   level_layout.row_pitch_bytes / block_size,
-                                   std::countr_zero(block_size)))
-                             : size_t(y + start_y) * level_layout.row_pitch_bytes +
-                                   size_t(x + start_x) * block_size);
-            if (offset > source.size() || block_size > source.size() - offset) {
-              return false;
-            }
-            uint8_t* dst = data.data() +
-                           ((size_t(slice) * blocks_y + y) * blocks_x + x) * block_size;
-            for (uint32_t i = 0; i < block_size; ++i) {
-              dst[i] = source[(offset + i) ^ swap];
-            }
-            if (depth_texture) {
-              uint32_t packed;
-              std::memcpy(&packed, dst, sizeof(packed));
-              const float depth = fetch.format == xenos::TextureFormat::k_24_8_FLOAT
-                                      ? xenos::Float20e4To32(packed >> 8)
-                                      : float(packed >> 8) / 16777215.0f;
-              std::memcpy(dst, &depth, sizeof(depth));
-            }
-          }
-        }
-      }
-    }
-  }
-
-  if (!entry) {
-    return true;
-  }
-  const VkImageView image_view = entry->GetOrCreateView(texture.view_type, texture.format,
-                                                        texture.swizzle, texture.array_layers);
-  if (image_view == VK_NULL_HANDLE) {
-    return false;
-  }
-  texture.cached_texture = entry;
-  texture.cached_view = image_view;
-  texture.upload_cached = upload;
-  return true;
 }
 
 bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
@@ -1483,7 +646,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   input.primitive_restart |= expanded;
   input.samples = VkSampleCountFlagBits(1u << uint32_t(dimensions.msaa_samples));
-  input.depth_format = use_depth ? GetDepthFormat(depth_info.depth_format) : VK_FORMAT_UNDEFINED;
+  input.depth_format = use_depth ? target_cache_->GetDepthFormat(depth_info.depth_format) : VK_FORMAT_UNDEFINED;
   auto& depth = input.depth_stencil;
   depth.depthTestEnable = depth_control.z_enable;
   depth.depthWriteEnable = depth_control.z_enable && depth_control.z_write_enable;
@@ -1540,7 +703,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   for (size_t channel = 0; channel < input.blend_constants.size(); ++channel) {
     input.blend_constants[channel] = regs.Get<float>(XE_GPU_REG_RB_BLEND_RED + uint32_t(channel));
   }
-  if (ps && !ReadTextures(*ps, input)) {
+  DrainMemoryInvalidations();
+  if (ps && !texture_cache_->ReadTextures(*ps, input)) {
     return false;
   }
   draw_util::GetHostViewportInfo(regs, draw_resolution_scale_x_, draw_resolution_scale_y_, false,
@@ -1633,7 +797,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   const bool may_snapshot_fast_clear =
       dimensions.msaa_samples == xenos::MsaaSamples::k4X &&
       ((!use_color && use_depth && !ps) || rectangle);
-  const bool use_shared_vertices = shared_vertex_buffer_ != VK_NULL_HANDLE &&
+  const bool use_shared_vertices = shared_vertex_ &&
                                    !(expanded && index_buffer_info) && !may_snapshot_fast_clear;
   std::array<bool, 96> uploaded{};
   for (const auto& binding : vs.vertex_bindings()) {
@@ -1723,8 +887,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   draw.pass = std::make_unique<DrawPass>(*vulkan_device_);
   const uint32_t shared_count = uint32_t(1) << translator_->GetSharedMemoryStorageBufferCountLog2();
   if (!draw.pass->Initialize(input, indices, vertex, pixel, shared_count, pipeline_cache_,
-                             pipelines_, draw_bindings_, *draw_uploads_, next_submission_,
-                             use_shared_vertices ? shared_vertex_buffer_ : VK_NULL_HANDLE)) {
+                             pipelines_, draw_bindings_, *draw_uploads_, clock_.next,
+                             use_shared_vertices ? shared_vertex_->buffer() : VK_NULL_HANDLE)) {
     return false;
   }
   pending_.emplace_back(std::move(draw));
@@ -1755,22 +919,6 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   const uint32_t depth_tile = layout.DecodeBase(depth_info.value);
   const uint32_t pitch_tiles_4x =
       xenos::GetSurfacePitchTiles(dimensions.surface_pitch, xenos::MsaaSamples::k4X, false);
-  // Collect matching aliases first so replaying never mutates targets_ during iteration.
-  const auto collect_aliases = [&](auto&& predicate) {
-    std::vector<std::pair<std::shared_ptr<ColorImage>, xenos::MsaaSamples>> aliases;
-    for (auto& [target_key, entry] : targets_) {
-      const uint32_t tile = std::get<0>(target_key);
-      const uint32_t pitch = std::get<1>(target_key);
-      const xenos::MsaaSamples samples = std::get<2>(target_key);
-      const VkFormat fmt = std::get<3>(target_key);
-      if (samples >= xenos::MsaaSamples::k4X || !predicate(tile, pitch, samples, fmt, *entry.image)) {
-        continue;
-      }
-      entry.last_use_submission = next_submission_;
-      aliases.emplace_back(entry.image, samples);
-    }
-    return aliases;
-  };
   if (aliased_4x_depth_clear && pitch_tiles_4x) {
     PendingFastClear clear;
     clear.input = input;
@@ -1781,7 +929,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         IsEdramDepthClearToColor(depth_info.depth_format, depth_control, front.stencilwritemask);
     clear.clear_stencil =
         depth_control.stencilzpass == xenos::StencilOp::kReplace ? front.stencilref : 0u;
-    const auto aliases = collect_aliases([&](uint32_t tile, uint32_t pitch,
+    const auto aliases = target_cache_->CollectAliases([&](uint32_t tile, uint32_t pitch,
                                              xenos::MsaaSamples samples, VkFormat,
                                              const ColorImage& img) {
       if (tile != depth_tile ||
@@ -1796,11 +944,11 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return depth_target || color_target;
     });
     for (const auto& [image, samples] : aliases) {
-      ReplayAliasedFastClear(clear, image, samples);
+      target_cache_->ReplayAliasedFastClear(clear, image, samples);
     }
-    pending_fast_clears_.insert_or_assign({depth_tile, pitch_tiles_4x}, std::move(clear));
+    target_cache_->pending_fast_clears().insert_or_assign({depth_tile, pitch_tiles_4x}, std::move(clear));
     if (clear.color_clear_capable) {
-      ErasePendingColorFastClears(depth_tile, pitch_tiles_4x);
+      target_cache_->ErasePendingColorFastClears(depth_tile, pitch_tiles_4x);
     }
   } else if (aliased_4x_color_depth_clear) {
     if (use_depth && pitch_tiles_4x) {
@@ -1828,7 +976,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       clear.depth_format = depth_info.depth_format;
       clear.color_clear_capable = false;
       clear.clear_stencil = 0;
-      const auto depth_aliases = collect_aliases([&](uint32_t tile, uint32_t pitch,
+      const auto depth_aliases = target_cache_->CollectAliases([&](uint32_t tile, uint32_t pitch,
                                                      xenos::MsaaSamples samples, VkFormat,
                                                      const ColorImage& img) {
         return tile == depth_tile &&
@@ -1837,9 +985,9 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                img.format() == input.depth_format;
       });
       for (const auto& [image, samples] : depth_aliases) {
-        ReplayAliasedFastClear(clear, image, samples);
+        target_cache_->ReplayAliasedFastClear(clear, image, samples);
       }
-      pending_fast_clears_.insert_or_assign({depth_tile, pitch_tiles_4x}, std::move(clear));
+      target_cache_->pending_fast_clears().insert_or_assign({depth_tile, pitch_tiles_4x}, std::move(clear));
     }
     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
       if (!bound_rt[i]) {
@@ -1868,7 +1016,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       color_clear.vertex = &vertex;
       color_clear.pixel = pixel;
       color_clear.rt_index = i;
-      const auto color_aliases = collect_aliases([&](uint32_t tile, uint32_t pitch,
+      const auto color_aliases = target_cache_->CollectAliases([&](uint32_t tile, uint32_t pitch,
                                                      xenos::MsaaSamples samples, VkFormat fmt,
                                                      const ColorImage& img) {
         return tile == rt_tile && fmt == rt_format &&
@@ -1876,13 +1024,13 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                xenos::GetSurfacePitchTiles(pitch, samples, rt_is_64bpp) == rt_pitch_tiles_4x;
       });
       for (const auto& [image, samples] : color_aliases) {
-        ReplayAliasedColorFastClear(color_clear, image, samples);
+        target_cache_->ReplayAliasedColorFastClear(color_clear, image, samples);
       }
-      pending_color_fast_clears_.insert_or_assign({rt_tile, rt_pitch_tiles_4x, rt_format},
+      target_cache_->pending_color_fast_clears().insert_or_assign({rt_tile, rt_pitch_tiles_4x, rt_format},
                                                   std::move(color_clear));
       if (!rt_is_64bpp) {
-        if (auto fc = pending_fast_clears_.find({rt_tile, rt_pitch_tiles_4x});
-            fc != pending_fast_clears_.end()) {
+        if (auto fc = target_cache_->pending_fast_clears().find({rt_tile, rt_pitch_tiles_4x});
+            fc != target_cache_->pending_fast_clears().end()) {
           fc->second.color_clear_capable = false;
         }
       }
@@ -1892,7 +1040,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     const uint32_t pitch_tiles =
         xenos::GetSurfacePitchTiles(dimensions.surface_pitch, dimensions.msaa_samples, false);
     if (pitch_tiles && use_depth) {
-      pending_fast_clears_.erase({depth_tile, pitch_tiles});
+      target_cache_->pending_fast_clears().erase({depth_tile, pitch_tiles});
     }
     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
       if ((writes >> (i * 4)) & 15) {
@@ -1900,13 +1048,13 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
             regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
         const uint32_t rt_tile = layout.DecodeBase(target.value);
         if (pitch_tiles) {
-          pending_fast_clears_.erase({rt_tile, pitch_tiles});
+          target_cache_->pending_fast_clears().erase({rt_tile, pitch_tiles});
         }
         const uint32_t rt_pitch_tiles = xenos::GetSurfacePitchTiles(
             dimensions.surface_pitch, dimensions.msaa_samples,
             xenos::IsColorRenderTargetFormat64bpp(target.color_format));
         if (rt_pitch_tiles) {
-          ErasePendingColorFastClears(rt_tile, rt_pitch_tiles);
+          target_cache_->ErasePendingColorFastClears(rt_tile, rt_pitch_tiles);
         }
       }
     }
@@ -1914,191 +1062,34 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   return true;
 }
 
-VkFormat NativeCommandProcessor::GetDepthFormat(xenos::DepthRenderTargetFormat format) const {
-  return SelectDepthFormat(format, depth_unorm24_supported_);
-}
-
-DrawInput NativeCommandProcessor::RescaleFastClearInput(const DrawInput& base,
-                                                        xenos::MsaaSamples samples) const {
-  // The 4x-MSAA clear covers the aliased target with half the horizontal pitch;
-  // scale the guest-space viewport and scissor to the host pixels of the alias.
-  const auto scale = GetMsaa4xAliasScale(samples);
-  const auto& properties = vulkan_device_->properties();
-  std::array<float, 3> ndc_scale;
-  std::array<float, 3> ndc_offset;
-  std::copy(std::begin(base.viewport.ndc_scale), std::end(base.viewport.ndc_scale),
-            ndc_scale.begin());
-  std::copy(std::begin(base.viewport.ndc_offset), std::end(base.viewport.ndc_offset),
-            ndc_offset.begin());
-
-  DrawInput input = base;
-  input.samples = VkSampleCountFlagBits(1u << uint32_t(samples));
-  constexpr uint32_t kMsaaSamplesFlagMask =
-      ((1u << xenos::kMsaaSamplesBits) - 1u) << Translator::kSysFlag_MsaaSamples_Shift;
-  input.system.flags = (base.system.flags & ~kMsaaSamplesFlagMask) |
-                       (uint32_t(samples) << Translator::kSysFlag_MsaaSamples_Shift);
-  ScaleViewportAndScissor(input.viewport, input.scissor, ndc_scale, ndc_offset, scale.x, scale.y,
-                          properties.maxViewportDimensions[0], properties.maxViewportDimensions[1]);
-  std::copy(ndc_scale.begin(), ndc_scale.end(), input.viewport.ndc_scale);
-  std::copy(ndc_offset.begin(), ndc_offset.end(), input.viewport.ndc_offset);
-  std::copy(ndc_scale.begin(), ndc_scale.end(), input.system.ndc_scale);
-  std::copy(ndc_offset.begin(), ndc_offset.end(), input.system.ndc_offset);
-  return input;
-}
-
-void NativeCommandProcessor::ReplayAliasedFastClear(const PendingFastClear& clear,
-                                                    const std::shared_ptr<ColorImage>& image,
-                                                    xenos::MsaaSamples samples) {
-  const bool depth_target = (image->aspects() & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
-  std::optional<uint32_t> clear_format;
-  if (!depth_target) {
-    clear_format = GetEdramClearColorFormatMode(image->format());
-    if (!clear_format) {
-      return;
-    }
-  }
-  DrawInput input = RescaleFastClearInput(clear.input, samples);
-  QueuedDraw draw{};
-  if (!depth_target) {
-    // The clear writes a 32-bit EDRAM depth-stencil word into an aliased color
-    // target; the fragment shader unpacks it for the target format.
-    input.color_count = 1;
-    input.color_formats[0] = image->format();
-    VkPipelineColorBlendAttachmentState blend{};
-    blend.blendEnable = VK_FALSE;
-    blend.colorWriteMask = 0xF;
-    input.blend[0] = blend;
-    input.depth_format = VK_FORMAT_UNDEFINED;
-    input.depth_stencil = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    input.edram_depth_clear_color = true;
-    input.edram_clear_stencil = clear.clear_stencil;
-    input.edram_clear_format = *clear_format;
-    draw.colors[0] = image;
-    draw.color_count = 1;
-  } else {
-    draw.depth = image;
-  }
-  draw.pass = std::make_unique<DrawPass>(*vulkan_device_);
-  const uint32_t shared_count = uint32_t(1) << translator_->GetSharedMemoryStorageBufferCountLog2();
-  if (!draw.pass->Initialize(input, clear.indices, *clear.vertex, nullptr, shared_count,
-                             pipeline_cache_, pipelines_, draw_bindings_, *draw_uploads_,
-                             next_submission_)) {
-    return;
-  }
-  pending_.emplace_back(std::move(draw));
-}
-
-void NativeCommandProcessor::ApplyPendingFastClear(uint32_t tile, uint32_t pitch_tiles,
-                                                   xenos::MsaaSamples samples,
-                                                   const std::shared_ptr<ColorImage>& image) {
-  if (samples >= xenos::MsaaSamples::k4X) {
-    return;
-  }
-  const auto pending = pending_fast_clears_.find({tile, pitch_tiles});
-  if (pending == pending_fast_clears_.end()) {
-    return;
-  }
-  const PendingFastClear& clear = pending->second;
-  const bool depth_target = (image->aspects() & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 &&
-                            image->format() == GetDepthFormat(clear.depth_format);
-  const bool color_target =
-      (image->aspects() & VK_IMAGE_ASPECT_COLOR_BIT) != 0 && clear.color_clear_capable &&
-      GetEdramClearColorFormatMode(image->format()).has_value();
-  if (depth_target || color_target) {
-    ReplayAliasedFastClear(clear, image, samples);
-  }
-}
-
-void NativeCommandProcessor::ReplayAliasedColorFastClear(const PendingColorFastClear& clear,
-                                                         const std::shared_ptr<ColorImage>& image,
-                                                         xenos::MsaaSamples samples) {
-  const DrawInput input = RescaleFastClearInput(clear.input, samples);
-  QueuedDraw draw{};
-  draw.colors[clear.rt_index] = image;
-  draw.color_count = clear.rt_index + 1;
-  draw.pass = std::make_unique<DrawPass>(*vulkan_device_);
-  const uint32_t shared_count = uint32_t(1) << translator_->GetSharedMemoryStorageBufferCountLog2();
-  if (!draw.pass->Initialize(input, clear.indices, *clear.vertex, clear.pixel, shared_count,
-                             pipeline_cache_, pipelines_, draw_bindings_, *draw_uploads_,
-                             next_submission_)) {
-    return;
-  }
-  pending_.emplace_back(std::move(draw));
-}
-
-void NativeCommandProcessor::ApplyPendingColorFastClear(uint32_t tile, uint32_t pitch_tiles,
-                                                         xenos::MsaaSamples samples,
-                                                         VkFormat format,
-                                                         const std::shared_ptr<ColorImage>& image) {
-  if (samples >= xenos::MsaaSamples::k4X || !pitch_tiles) {
-    return;
-  }
-  const auto pending = pending_color_fast_clears_.find({tile, pitch_tiles, format});
-  if (pending == pending_color_fast_clears_.end()) {
-    return;
-  }
-  ReplayAliasedColorFastClear(pending->second, image, samples);
-}
-
-void NativeCommandProcessor::ErasePendingColorFastClears(uint32_t tile, uint32_t pitch_tiles) {
-  for (auto it = pending_color_fast_clears_.lower_bound({tile, pitch_tiles, VK_FORMAT_UNDEFINED});
-       it != pending_color_fast_clears_.end() && std::get<0>(it->first) == tile &&
-       std::get<1>(it->first) == pitch_tiles;) {
-    it = pending_color_fast_clears_.erase(it);
-  }
-}
-
 std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, uint32_t pitch,
                                                                xenos::MsaaSamples samples,
                                                                VkFormat format,
                                                                VkImageAspectFlags aspects,
                                                                bool is_64bpp) {
-  const auto key = std::tuple(tile, pitch, samples, format);
-  if (auto existing = targets_.find(key); existing != targets_.end()) {
-    existing->second.last_use_submission = next_submission_;
-    return existing->second.image;
+  return target_cache_->FindTarget(tile, pitch, samples, format, aspects, is_64bpp,
+                                   ActiveEdramLayout().tile_count, presented_);
+}
+
+void NativeCommandProcessor::QueueReplayDraw(const DrawInput& input,
+                                             std::span<const uint32_t> indices,
+                                             const Shader::Translation& vertex,
+                                             const Shader::Translation* pixel, uint32_t rt_index,
+                                             const std::shared_ptr<ColorImage>& image) {
+  QueuedDraw draw{};
+  if (image->aspects() & VK_IMAGE_ASPECT_DEPTH_BIT) {
+    draw.depth = image;
+  } else {
+    draw.colors[rt_index] = image;
+    draw.color_count = rt_index + 1;
   }
-  if (!pitch) {
-    return {};
+  draw.pass = std::make_unique<DrawPass>(*vulkan_device_);
+  const uint32_t shared_count = uint32_t(1) << translator_->GetSharedMemoryStorageBufferCountLog2();
+  if (!draw.pass->Initialize(input, indices, vertex, pixel, shared_count, pipeline_cache_,
+                             pipelines_, draw_bindings_, *draw_uploads_, clock_.next)) {
+    return;
   }
-  if (targets_.size() >= kMaxTargets) {
-    // Evict the least recently used target whose GPU work has completed. Only
-    // submissions up to the last retired fence are eligible, so queued and
-    // in-flight draws keep their images, and the presented image is kept too.
-    const auto victim = SelectRetiredEviction(
-        targets_, retired_submission_ + 1,
-        [this](const auto&, const CachedImage& entry) { return entry.image != presented_; });
-    if (!victim) {
-      return {};
-    }
-    targets_.erase(*victim);
-  }
-  const auto& properties = vulkan_device_->properties();
-  const uint32_t max_width = std::min(properties.maxImageDimension2D,
-                                      properties.maxFramebufferWidth);
-  const uint32_t max_height = std::min(properties.maxImageDimension2D,
-                                       properties.maxFramebufferHeight);
-  if (uint64_t(pitch) * draw_resolution_scale_x_ > max_width) {
-    return {};
-  }
-  const uint32_t height =
-      GetTargetHeight(pitch, samples, ActiveEdramLayout().tile_count,
-                      max_height / draw_resolution_scale_y_, is_64bpp);
-  auto image = std::make_shared<ColorImage>(*vulkan_device_);
-  if (!image->Initialize({pitch * draw_resolution_scale_x_, height * draw_resolution_scale_y_},
-                         format, VkSampleCountFlagBits(1u << uint32_t(samples)), aspects)) {
-    return {};
-  }
-  // shortcut: separate host images, share overlapping tiles when ownership tracking is added.
-  targets_.emplace(key, CachedImage{image, next_submission_});
-  if (!is_64bpp) {
-    ApplyPendingFastClear(tile, xenos::GetSurfacePitchTiles(pitch, samples, false), samples, image);
-  }
-  if ((aspects & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
-    ApplyPendingColorFastClear(tile, xenos::GetSurfacePitchTiles(pitch, samples, is_64bpp), samples,
-                               format, image);
-  }
-  return image;
+  pending_.emplace_back(std::move(draw));
 }
 
 bool NativeCommandProcessor::IssueCopy() {
@@ -2120,7 +1111,7 @@ bool NativeCommandProcessor::IssueCopy() {
   if (copy.IsClearingDepth()) {
     const auto depth_format = xenos::DepthRenderTargetFormat(copy.depth_edram_info.format);
     auto depth = FindTarget(copy.depth_original_base, surface_info.surface_pitch,
-                            surface_info.msaa_samples, GetDepthFormat(depth_format),
+                            surface_info.msaa_samples, target_cache_->GetDepthFormat(depth_format),
                             VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
     if (!depth) {
       return false;
@@ -2177,7 +1168,7 @@ bool NativeCommandProcessor::IssueCopy() {
   const bool color_is_64bpp = !depth && xenos::IsColorRenderTargetFormat64bpp(
                                             xenos::ColorRenderTargetFormat(copy.color_edram_info.format));
   auto source = depth ? FindTarget(copy.depth_original_base, surface_info.surface_pitch, samples,
-                                   GetDepthFormat(depth_format),
+                                   target_cache_->GetDepthFormat(depth_format),
                                    VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
                       : FindTarget(copy.color_original_base, surface_info.surface_pitch, samples,
                                    color_format, VK_IMAGE_ASPECT_COLOR_BIT, color_is_64bpp);
@@ -2188,14 +1179,14 @@ bool NativeCommandProcessor::IssueCopy() {
       xenos::GetSurfacePitchTiles(surface_info.surface_pitch, samples, false);
   if (copy_pitch_tiles) {
     if (copy.IsClearingDepth() || depth) {
-      pending_fast_clears_.erase({copy.depth_original_base, copy_pitch_tiles});
+      target_cache_->pending_fast_clears().erase({copy.depth_original_base, copy_pitch_tiles});
     }
     if (copy.IsClearingColor() || !depth) {
-      pending_fast_clears_.erase({copy.color_original_base, copy_pitch_tiles});
+      target_cache_->pending_fast_clears().erase({copy.color_original_base, copy_pitch_tiles});
       const uint32_t color_copy_pitch_tiles =
           xenos::GetSurfacePitchTiles(surface_info.surface_pitch, samples, color_is_64bpp);
       if (color_copy_pitch_tiles) {
-        ErasePendingColorFastClears(copy.color_original_base, color_copy_pitch_tiles);
+        target_cache_->ErasePendingColorFastClears(copy.color_original_base, color_copy_pitch_tiles);
       }
     }
   }
@@ -2220,12 +1211,12 @@ bool NativeCommandProcessor::IssueCopy() {
   bool tiled_destination =
       target_extent.width != extent.width || target_extent.height != extent.height;
   const bool has_offset = copy.copy_dest_x || copy.copy_dest_y;
-  auto existing = resolved_images_.find(resolve_address);
+  auto existing = resolved_images().find(resolve_address);
   std::shared_ptr<ColorImage> destination;
   VkOffset2D destination_offset{};
   uint32_t dest_resolve_address = resolve_address;
   uint32_t dest_pitch_to_store = dest_pitch;
-  if (existing != resolved_images_.end() && existing->second.image->format() == output_format) {
+  if (existing != resolved_images().end() && existing->second.image->format() == output_format) {
     const auto existing_extent = existing->second.image->extent();
     if (!has_offset && existing_extent.width == target_extent.width &&
         existing_extent.height == target_extent.height) {
@@ -2247,9 +1238,9 @@ bool NativeCommandProcessor::IssueCopy() {
   if (!destination && dest_pitch_reg.copy_dest_pitch != 0) {
     const uint32_t bpp_log2 = GetResolveBytesPerBlockLog2(output_format);
     uint64_t best_version = 0;
-    for (const auto& [base_addr, entry] : resolved_images_) {
+    for (const auto& [base_addr, entry] : resolved_images()) {
       if (!entry.tiled_destination || base_addr >= resolve_address ||
-          entry.last_use_submission + 4 < next_submission_ ||
+          entry.last_use_submission + 4 < clock_.next ||
           entry.image->format() != output_format || entry.dest_info != dest_info ||
           reg::RB_COPY_DEST_PITCH{entry.dest_pitch}.copy_dest_pitch !=
               dest_pitch_reg.copy_dest_pitch) {
@@ -2294,21 +1285,21 @@ bool NativeCommandProcessor::IssueCopy() {
       }
       return false;
     }
-    if (existing == resolved_images_.end() && resolved_images_.size() >= kMaxResolvedImages) {
+    if (existing == resolved_images().end() && resolved_images().size() >= NativeTextureCache::kMaxResolvedImages) {
       // Drop the least recently used resolve whose GPU work has completed. Only
       // retired submissions are eligible, and the presented image is kept; the
       // shared owners in pending_ / in_flight_ keep surviving images alive.
-      const auto victim = SelectRetiredEviction(resolved_images_, retired_submission_ + 1,
+      const auto victim = SelectRetiredEviction(resolved_images(), clock_.retired + 1,
                                                 [this](uint32_t address, const CachedImage& entry) {
                                                   return entry.image != presented_ &&
-                                                         address != presented_resolve_address_;
+                                                         address != presented_resolve_address();
                                                 });
       if (!victim) {
         return false;
       }
-      resolved_images_.erase(*victim);
-      PruneResolvedDependents();
-      RebuildCachedTexturePages();
+      resolved_images().erase(*victim);
+      texture_cache_->PruneResolvedDependents();
+      texture_cache_->RebuildCachedTexturePages();
     }
     destination = std::make_shared<ColorImage>(*vulkan_device_);
     if (!destination->Initialize(target_extent, output_format)) {
@@ -2320,16 +1311,16 @@ bool NativeCommandProcessor::IssueCopy() {
   if ((depth && depth_descriptor == SIZE_MAX) || (single_sample && color_descriptor == SIZE_MAX)) {
     return false;
   }
-  InvalidateTextures(copy.copy_dest_extent_start, copy.copy_dest_extent_length);
+  texture_cache_->InvalidateTextures(copy.copy_dest_extent_start, copy.copy_dest_extent_length);
   bool erased_other_resolved = false;
-  for (auto it = resolved_images_.begin(); it != resolved_images_.end();) {
+  for (auto it = resolved_images().begin(); it != resolved_images().end();) {
     if (it->first != dest_resolve_address &&
         RangesOverlap(copy.copy_dest_extent_start, copy.copy_dest_extent_length,
                       it->second.guest_start, it->second.guest_length)) {
-      if (presented_resolve_address_ && *presented_resolve_address_ == it->first) {
-        presented_resolve_address_.reset();
+      if (presented_resolve_address() && *presented_resolve_address() == it->first) {
+        presented_resolve_address().reset();
       }
-      it = resolved_images_.erase(it);
+      it = resolved_images().erase(it);
       erased_other_resolved = true;
     } else {
       ++it;
@@ -2337,8 +1328,8 @@ bool NativeCommandProcessor::IssueCopy() {
   }
   uint32_t guest_start = copy.copy_dest_extent_start;
   uint32_t guest_end = copy.copy_dest_extent_start + copy.copy_dest_extent_length;
-  if (auto prev = resolved_images_.find(dest_resolve_address);
-      prev != resolved_images_.end() && prev->second.image == destination &&
+  if (auto prev = resolved_images().find(dest_resolve_address);
+      prev != resolved_images().end() && prev->second.image == destination &&
       prev->second.guest_length) {
     guest_start = std::min(guest_start, prev->second.guest_start);
     guest_end = std::max(guest_end, prev->second.guest_start + prev->second.guest_length);
@@ -2355,7 +1346,7 @@ bool NativeCommandProcessor::IssueCopy() {
       copy.copy_dest_x, copy.copy_dest_y,
       uint32_t(copy.coordinate_info.width_div_8) << xenos::kResolveAlignmentPixelsLog2,
       copy.height_div_8 << xenos::kResolveAlignmentPixelsLog2};
-  CachedResolve resolve_entry{{destination, next_submission_},
+  CachedResolve resolve_entry{{destination, clock_.next},
                               dest_info,
                               dest_pitch_to_store,
                               next_resolve_version_++,
@@ -2366,14 +1357,12 @@ bool NativeCommandProcessor::IssueCopy() {
                               copy_dest_pitch,
                               copy.copy_dest_info.copy_dest_endian,
                               rgba8_readback_eligible};
-  resolved_images_.insert_or_assign(dest_resolve_address, std::move(resolve_entry));
+  resolved_images().insert_or_assign(dest_resolve_address, std::move(resolve_entry));
   if (erased_other_resolved) {
-    PruneResolvedDependents();
-    RebuildCachedTexturePages();
-  } else if (!cached_texture_pages_.empty()) {
-    std::lock_guard<std::mutex> lock(invalidation_mutex_);
-    const auto [first_page, page_count] = GetPhysicalPageRange(guest_start, guest_length);
-    SetPageRangeBits(cached_texture_pages_, first_page, page_count);
+    texture_cache_->PruneResolvedDependents();
+    texture_cache_->RebuildCachedTexturePages();
+  } else {
+    texture_cache_->MarkCachedPages(guest_start, guest_length);
   }
   memory_->EnablePhysicalMemoryAccessCallbacks(copy.copy_dest_extent_start,
                                                copy.copy_dest_extent_length, true, false);
@@ -2496,7 +1485,7 @@ bool NativeCommandProcessor::ReadBackResolve(const draw_util::ResolveInfo& copy,
   if (stored) {
     // The CPU wrote guest memory directly, bypassing the access-violation watch,
     // so anything cached from the written range is stale now.
-    InvalidateTextures(address, end - address);
+    texture_cache_->InvalidateTextures(address, end - address);
     InvalidateSharedVertices(address, end - address);
   }
   return stored;
@@ -2511,7 +1500,7 @@ bool NativeCommandProcessor::ReadBackResolvedRange(uint32_t address, uint32_t le
   DrainMemoryInvalidations();
   const CachedResolve* best = nullptr;
   uint32_t best_base = 0;
-  for (const auto& [base_addr, entry] : resolved_images_) {
+  for (const auto& [base_addr, entry] : resolved_images()) {
     if (!entry.rgba8_readback_valid ||
         !RangesOverlap(address, length, entry.guest_start, entry.guest_length)) {
       continue;
@@ -2552,7 +1541,7 @@ bool NativeCommandProcessor::ReadBackResolvedRange(uint32_t address, uint32_t le
   }
   std::memcpy(memory_->TranslatePhysical(clip_first), tiled.data() + (clip_first - best_base),
               clip_last - clip_first);
-  InvalidateTextures(clip_first, clip_last - clip_first);
+  texture_cache_->InvalidateTextures(clip_first, clip_last - clip_first);
   InvalidateSharedVertices(clip_first, clip_last - clip_first);
   return true;
 }
@@ -2777,8 +1766,8 @@ bool NativeCommandProcessor::RetireSubmission() {
     }
   }
   if (result == VK_SUCCESS) {
-    draw_uploads_->Reclaim(next_submission_ - 1);
-    retired_submission_ = next_submission_ - 1;
+    draw_uploads_->Reclaim(clock_.next - 1);
+    clock_.retired = clock_.next - 1;
   }
   submitted_ = false;
   if (result == VK_ERROR_DEVICE_LOST) {
@@ -2792,8 +1781,8 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t width,
   const uint32_t scaled_width = width * draw_resolution_scale_x_;
   const uint32_t scaled_height = height * draw_resolution_scale_y_;
   std::optional<VkExtent2D> resolved_extent;
-  if (const auto resolved = resolved_images_.find(frontbuffer_ptr & (kPhysicalMemorySize - 1));
-      resolved != resolved_images_.end()) {
+  if (const auto resolved = resolved_images().find(frontbuffer_ptr & (kPhysicalMemorySize - 1));
+      resolved != resolved_images().end()) {
     resolved_extent = resolved->second.image->extent();
   }
   const VkExtent2D output_extent =
@@ -2868,7 +1857,7 @@ void NativeCommandProcessor::RecordBufferUploads(std::span<const FrameCommand> c
   pre.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
   pre.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   pre.srcQueueFamilyIndex = pre.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  pre.buffer = shared_vertex_buffer_;
+  pre.buffer = shared_vertex_->buffer();
   pre.offset = 0;
   pre.size = VK_WHOLE_SIZE;
   vk.vkCmdPipelineBarrier(command_buffer_,
@@ -2877,13 +1866,13 @@ void NativeCommandProcessor::RecordBufferUploads(std::span<const FrameCommand> c
   for (const auto& command : commands) {
     const auto& upload = std::get<QueuedBufferUpload>(command);
     const VkBufferCopy copy{upload.src_offset, upload.dst_offset, upload.size};
-    vk.vkCmdCopyBuffer(command_buffer_, upload.src_buffer, shared_vertex_buffer_, 1, &copy);
+    vk.vkCmdCopyBuffer(command_buffer_, upload.src_buffer, shared_vertex_->buffer(), 1, &copy);
   }
   VkBufferMemoryBarrier post{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
   post.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   post.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
   post.srcQueueFamilyIndex = post.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  post.buffer = shared_vertex_buffer_;
+  post.buffer = shared_vertex_->buffer();
   post.offset = 0;
   post.size = VK_WHOLE_SIZE;
   vk.vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -2893,7 +1882,7 @@ void NativeCommandProcessor::RecordBufferUploads(std::span<const FrameCommand> c
 size_t NativeCommandProcessor::RecordPending() {
   // Clear the fallback textures and move them to the shader-read layout once,
   // before any draw that may sample them.
-  RecordNullTextureInitialization();
+  texture_cache_->RecordNullTextureInitialization(command_buffer_);
   size_t drawn = 0;
   for (size_t first = 0; first < pending_.size();) {
     const auto& command = pending_[first];
@@ -2949,7 +1938,7 @@ bool NativeCommandProcessor::SubmitCommands() {
       graphics_system_->OnHostGpuLossFromAnyThread(true);
     return false;
   }
-  ++next_submission_;
+  ++clock_.next;
   submitted_ = true;
   for (const auto& command : pending_) {
     if (const auto* resolve = std::get_if<QueuedResolve>(&command)) {
@@ -2986,18 +1975,18 @@ bool NativeCommandProcessor::RenderGuestOutput(ui::Presenter::GuestOutputRefresh
   }
   const size_t drawn = RecordPending();
 
-  const auto resolved = resolved_images_.find(frontbuffer_address & (kPhysicalMemorySize - 1));
-  const bool use_pwl = resolved != resolved_images_.end() &&
+  const auto resolved = resolved_images().find(frontbuffer_address & (kPhysicalMemorySize - 1));
+  const bool use_pwl = resolved != resolved_images().end() &&
                        resolved->second.image->format() == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-  if (resolved != resolved_images_.end() && resolved->second.image->initialized() &&
+  if (resolved != resolved_images().end() && resolved->second.image->initialized() &&
       (resolved->second.image->format() == ColorImage::kFormat || use_pwl) &&
       resolved->second.image->extent().width >= extent.width &&
       resolved->second.image->extent().height >= extent.height) {
     presented_ = resolved->second.image;
-    resolved->second.last_use_submission = next_submission_;
-    presented_resolve_address_ = resolved->first;
+    resolved->second.last_use_submission = clock_.next;
+    presented_resolve_address() = resolved->first;
   } else {
-    presented_resolve_address_.reset();
+    presented_resolve_address().reset();
   }
 
   VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};

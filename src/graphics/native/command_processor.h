@@ -22,6 +22,9 @@
 #include "draw_pass.h"
 #include "image_readback.h"
 #include "output_gamma.h"
+#include "shared_vertex_memory.h"
+#include "target_cache.h"
+#include "texture_cache.h"
 
 namespace rex::graphics::native {
 
@@ -49,11 +52,6 @@ class NativeCommandProcessor : public CommandProcessor {
 
  private:
   std::span<const uint8_t> ReadPhysical(uint32_t address, size_t size);
-  bool ReadTextures(const SpirvShader& shader, DrawInput& input);
-  bool ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch, DrawTexture& texture);
-  bool InitializeNullTextures();
-  void DestroyNullTextures();
-  void RecordNullTextureInitialization();
   struct QueuedDraw {
     std::array<std::shared_ptr<ColorImage>, xenos::kMaxColorRenderTargets> colors;
     std::shared_ptr<ColorImage> depth;
@@ -88,70 +86,23 @@ class NativeCommandProcessor : public CommandProcessor {
   };
   using FrameCommand =
       std::variant<QueuedDraw, QueuedResolve, QueuedDepthClear, QueuedBufferUpload>;
+  using PendingFastClear = NativeTargetCache::PendingFastClear;
+  using PendingColorFastClear = NativeTargetCache::PendingColorFastClear;
+  using CachedResolve = NativeTextureCache::CachedResolve;
 
-  // A 4x-MSAA depth-only draw that D3D9 issued to clear an aliased 1x- or
-  // 2x-MSAA EDRAM tile. Kept so a target created later for the same tile is
-  // initialized with the clear before it is drawn to.
-  struct PendingFastClear {
-    DrawInput input;
-    std::vector<uint32_t> indices;
-    const Shader::Translation* vertex = nullptr;
-    xenos::DepthRenderTargetFormat depth_format = xenos::DepthRenderTargetFormat::kD24S8;
-    bool color_clear_capable = false;
-    uint32_t clear_stencil = 0;
-  };
-  struct PendingColorFastClear {
-    DrawInput input;
-    std::vector<uint32_t> indices;
-    const Shader::Translation* vertex = nullptr;
-    const Shader::Translation* pixel = nullptr;
-    uint32_t rt_index = 0;
-  };
-
-  struct CachedImage {
-    std::shared_ptr<ColorImage> image;
-    uint64_t last_use_submission = 0;
-  };
-  struct CachedResolve : CachedImage {
-    uint32_t dest_info;
-    uint32_t dest_pitch;
-    uint64_t version = 0;
-    bool tiled_destination = false;
-    uint32_t guest_start = 0;
-    uint32_t guest_length = 0;
-    ResolveRectangle last_rect{};
-    uint32_t copy_dest_pitch = 0;
-    xenos::Endian128 endian = xenos::Endian128::kNone;
-    bool rgba8_readback_valid = false;
-  };
-  struct CachedSampler {
-    VkSampler sampler = VK_NULL_HANDLE;
-    uint64_t last_use_submission = 0;
-  };
-  struct CachedTextureEntry {
-    std::shared_ptr<CachedTexture> texture;
-    uint64_t last_use_submission = 0;
-  };
-  static constexpr size_t kMaxTargets = 64;
-  static constexpr size_t kMaxResolvedImages = 256;
-  static constexpr size_t kMaxSamplers = 256;
-  static constexpr size_t kMaxCachedTextures = 1024;
-  static constexpr size_t kMaxResolvedCubes = 64;
-  static constexpr size_t kMaxResolvedCrops = 64;
-
-  VkSampler GetSampler(const DrawSampler& key);
+  std::unordered_map<uint32_t, CachedResolve>& resolved_images() {
+    return texture_cache_->resolved_images();
+  }
+  std::optional<uint32_t>& presented_resolve_address() {
+    return texture_cache_->presented_resolve_address();
+  }
+  void InvalidateSharedVertices(uint32_t start, uint32_t length) {
+    if (shared_vertex_) {
+      shared_vertex_->Invalidate(start, length);
+    }
+  }
   void DrainMemoryInvalidations();
-  void InvalidateTextures(uint32_t start, uint32_t length);
-  void InvalidateResolvedTextures(uint32_t start, uint32_t length);
-  void PruneResolvedDependents();
-  void RebuildCachedTexturePages();
-  void InvalidateSharedVertices(uint32_t start, uint32_t length);
   bool EnsureSharedVertexRange(uint32_t address, uint32_t size);
-  template <typename EntryMap, typename Key, typename OnCreated>
-  std::shared_ptr<CachedTexture> GetOrCreateCachedTexture(EntryMap& cache, size_t max_entries,
-                                                          const Key& key,
-                                                          const VkImageCreateInfo& image_info,
-                                                          OnCreated&& on_created, bool& failed);
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);
   std::pair<uint32_t, uint32_t> MemoryInvalidationCallback(uint32_t physical_address_start,
@@ -160,22 +111,9 @@ class NativeCommandProcessor : public CommandProcessor {
   std::shared_ptr<ColorImage> FindTarget(uint32_t tile, uint32_t pitch, xenos::MsaaSamples samples,
                                          VkFormat format, VkImageAspectFlags aspects,
                                          bool is_64bpp = false);
-  DrawInput RescaleFastClearInput(const DrawInput& base, xenos::MsaaSamples samples) const;
-  // Replays an aliased 4x-MSAA fast clear onto a 1x/2x target that already
-  // exists (depth or color), appending the queued draw to pending_.
-  void ReplayAliasedFastClear(const PendingFastClear& clear, const std::shared_ptr<ColorImage>& image,
-                              xenos::MsaaSamples samples);
-  // Finds a pending fast clear for an aliased target tile and replays it if it
-  // is compatible with the newly created image, then drops it.
-  void ApplyPendingFastClear(uint32_t tile, uint32_t pitch_tiles, xenos::MsaaSamples samples,
-                             const std::shared_ptr<ColorImage>& image);
-  void ReplayAliasedColorFastClear(const PendingColorFastClear& clear,
-                                   const std::shared_ptr<ColorImage>& image,
-                                   xenos::MsaaSamples samples);
-  void ApplyPendingColorFastClear(uint32_t tile, uint32_t pitch_tiles, xenos::MsaaSamples samples,
-                                  VkFormat format, const std::shared_ptr<ColorImage>& image);
-  void ErasePendingColorFastClears(uint32_t tile, uint32_t pitch_tiles);
-  VkFormat GetDepthFormat(xenos::DepthRenderTargetFormat format) const;
+  void QueueReplayDraw(const DrawInput& input, std::span<const uint32_t> indices,
+                       const Shader::Translation& vertex, const Shader::Translation* pixel,
+                       uint32_t rt_index, const std::shared_ptr<ColorImage>& image);
   bool BeginCommands();
   size_t RecordPending();
   bool SubmitCommands();
@@ -196,45 +134,25 @@ class NativeCommandProcessor : public CommandProcessor {
   PFN_vkCmdBlitImage cmd_blit_image_ = nullptr;
   bool r8_resolve_blit_ = false;
   bool rg8_resolve_blit_ = false;
-  // Whether VK_FORMAT_D24_UNORM_S8_UINT supports optimal-tiling sampled image
-  // and depth/stencil attachment usage on this device.
-  bool depth_unorm24_supported_ = false;
   uint32_t draw_resolution_scale_x_ = 1;
   uint32_t draw_resolution_scale_y_ = 1;
   VkCommandPool command_pool_ = VK_NULL_HANDLE;
   VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
   VkFence fence_ = VK_NULL_HANDLE;
-  // 1x1 zero-cleared cube-compatible image shared by the 2D array and cube
-  // fallback views bound for fetch constants that cannot produce texels.
-  VkImage null_texture_image_ = VK_NULL_HANDLE;
-  VkDeviceMemory null_texture_memory_ = VK_NULL_HANDLE;
-  VkImageView null_texture_2d_view_ = VK_NULL_HANDLE;
-  VkImageView null_texture_cube_view_ = VK_NULL_HANDLE;
-  bool null_textures_initialized_ = false;
   std::multimap<uint64_t, std::unique_ptr<SpirvShader>> shaders_;
   std::unique_ptr<SpirvShaderTranslator> translator_;
   DrawPipelines pipelines_;
   DrawBindingCache draw_bindings_;
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> draw_uploads_;
-  VkBuffer shared_vertex_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory shared_vertex_memory_ = VK_NULL_HANDLE;
-  std::vector<uint64_t> shared_vertex_valid_pages_;
-  uint64_t next_submission_ = 1;
   uint64_t next_resolve_version_ = 1;
+  SubmissionClock clock_;
+  std::unique_ptr<SharedVertexMemory> shared_vertex_;
+  std::unique_ptr<NativeTextureCache> texture_cache_;
+  std::unique_ptr<NativeTargetCache> target_cache_;
   VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
-  std::map<std::tuple<uint32_t, uint32_t, xenos::MsaaSamples, VkFormat>, CachedImage> targets_;
-  std::map<std::pair<uint32_t, uint32_t>, PendingFastClear> pending_fast_clears_;
-  std::map<std::tuple<uint32_t, uint32_t, VkFormat>, PendingColorFastClear>
-      pending_color_fast_clears_;
-  std::unordered_map<uint32_t, CachedResolve> resolved_images_;
-  std::unordered_map<DrawSampler, CachedSampler, DrawSamplerHash> samplers_;
-  std::unordered_map<GuestTextureKey, CachedTextureEntry, GuestTextureKeyHash> cached_textures_;
-  std::unordered_map<ResolvedCubeKey, CachedTextureEntry, ResolvedCubeKeyHash> resolved_cubes_;
-  std::unordered_map<ResolvedCropKey, CachedTextureEntry, ResolvedCropKeyHash> resolved_crops_;
   // Written from guest threads while the global critical region is held, so it
   // only guards the pending list - never call into memory_ or Vulkan here.
   std::mutex invalidation_mutex_;
-  std::vector<uint64_t> cached_texture_pages_;
   std::vector<std::pair<uint32_t, uint32_t>> pending_invalidations_;
   std::atomic<bool> has_pending_invalidations_{false};
   void* memory_invalidation_handle_ = nullptr;
@@ -245,10 +163,6 @@ class NativeCommandProcessor : public CommandProcessor {
   DrawInput scratch_input_;
   std::unique_ptr<ImageReadback> in_flight_readback_;
   std::shared_ptr<ColorImage> presented_;
-  // Physical front buffer address of the last presented resolve. Kept across
-  // submissions so eviction cannot drop the image the presenter is showing.
-  std::optional<uint32_t> presented_resolve_address_;
-  uint64_t retired_submission_ = 0;
   std::unique_ptr<OutputGamma> output_gamma_;
   std::unique_ptr<DepthResolve> depth_resolve_;
   std::unique_ptr<ColorResolve> color_resolve_;

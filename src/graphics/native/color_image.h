@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <utility>
 
 #include <rex/ui/vulkan/device.h>
@@ -59,6 +60,18 @@ class ColorImage {
   VkPipelineStageFlags stage_ = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
   VkAccessFlags access_ = 0;
   bool unpublished_resolve_ = false;
+};
+
+struct CachedImage {
+  std::shared_ptr<ColorImage> image;
+  uint64_t last_use_submission = 0;
+};
+
+// Submission indices shared by the caches: `next` is the submission being
+// recorded, and everything up to `retired` has completed on the GPU.
+struct SubmissionClock {
+  uint64_t next = 1;
+  uint64_t retired = 0;
 };
 
 }  // namespace rex::graphics::native

@@ -193,6 +193,9 @@ if(REXGLUE_USE_VULKAN)
         native/draw_pass.cpp
         native/output_gamma.cpp
         native/image_readback.cpp
+        native/shared_vertex_memory.cpp
+        native/target_cache.cpp
+        native/texture_cache.cpp
         ${REXGPU_NATIVE_BASE_SOURCES}
         ${REXGPU_XENOS_SPIRV_SOURCES}
     )
