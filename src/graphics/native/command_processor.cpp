@@ -214,23 +214,30 @@ bool NativeCommandProcessor::SetupContext() {
                                                &depth_unorm24_properties);
   const bool depth_unorm24_supported = (depth_unorm24_properties.optimalTilingFeatures &
                                          kUsedDepthFormatFeatures) == kUsedDepthFormatFeatures;
+  get_pipeline_cache_data_ = reinterpret_cast<PFN_vkGetPipelineCacheData>(
+      instance.vkGetDeviceProcAddr(device, "vkGetPipelineCacheData"));
+  merge_pipeline_caches_ = reinterpret_cast<PFN_vkMergePipelineCaches>(
+      instance.vkGetDeviceProcAddr(device, "vkMergePipelineCaches"));
   VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   pool.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
   pool.queueFamilyIndex = vulkan_device_->queue_family_graphics_compute();
-  if (pool.queueFamilyIndex == UINT32_MAX ||
-      vk.vkCreateCommandPool(device, &pool, nullptr, &command_pool_) != VK_SUCCESS) {
+  if (pool.queueFamilyIndex == UINT32_MAX) {
     return false;
   }
-  VkCommandBufferAllocateInfo buffer{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-  buffer.commandPool = command_pool_;
-  buffer.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  buffer.commandBufferCount = 1;
-  const VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-  if (vk.vkAllocateCommandBuffers(device, &buffer, &command_buffer_) != VK_SUCCESS ||
-      vk.vkCreateFence(device, &fence, nullptr, &fence_) != VK_SUCCESS) {
-    ShutdownContext();
-    return false;
+  for (auto& frame : frames_) {
+    VkCommandBufferAllocateInfo buffer{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    buffer.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    buffer.commandBufferCount = 1;
+    const VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vk.vkCreateCommandPool(device, &pool, nullptr, &frame.command_pool) != VK_SUCCESS ||
+        (buffer.commandPool = frame.command_pool,
+         vk.vkAllocateCommandBuffers(device, &buffer, &frame.command_buffer) != VK_SUCCESS) ||
+        vk.vkCreateFence(device, &fence, nullptr, &frame.fence) != VK_SUCCESS) {
+      ShutdownContext();
+      return false;
+    }
   }
+  current_frame_ = last_submitted_frame_ = 0;
 
   graphics::GetConfigDrawResolutionScale(draw_resolution_scale_x_, draw_resolution_scale_y_);
   const uint32_t max_w = std::min(vulkan_device_->properties().maxImageDimension2D,
@@ -324,18 +331,14 @@ void NativeCommandProcessor::ShutdownContext() {
   }
   const auto& vk = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
-  if (!RetireSubmission() && submitted_) {
-    auto queue = vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
-    vk.vkQueueWaitIdle(queue.queue());
-  }
+  WaitForAllSubmissions();
   if (frame_timing_.is_open()) {
     frame_timing_.close();
   }
   pending_.clear();
-  in_flight_.clear();
+  pending_passes_.clear();
   scratch_input_.Clear();
-  in_flight_readback_.reset();
-  // Draws in pending_ / in_flight_ have released their shared textures by now.
+  // Pending and in-flight draws have released their shared textures by now.
   draw_uploads_.reset();
   shared_vertex_.reset();
   presented_.reset();
@@ -346,6 +349,8 @@ void NativeCommandProcessor::ShutdownContext() {
   }
   pipelines_.clear();
   draw_bindings_.clear();
+  SavePipelineCache();
+  pipeline_cache_path_.clear();
   vk.vkDestroyPipelineCache(device, pipeline_cache_, nullptr);
   pipeline_cache_ = VK_NULL_HANDLE;
   color_resolve_.reset();
@@ -354,12 +359,115 @@ void NativeCommandProcessor::ShutdownContext() {
   translator_.reset();
   active_vertex_shader_ = active_pixel_shader_ = nullptr;
   shaders_.clear();
-  vk.vkDestroyFence(device, fence_, nullptr);
-  vk.vkDestroyCommandPool(device, command_pool_, nullptr);
+  for (auto& frame : frames_) {
+    vk.vkDestroyFence(device, frame.fence, nullptr);
+    vk.vkDestroyCommandPool(device, frame.command_pool, nullptr);
+    frame = {};
+  }
   command_buffer_ = VK_NULL_HANDLE;
-  command_pool_ = VK_NULL_HANDLE;
-  fence_ = VK_NULL_HANDLE;
   vulkan_device_ = nullptr;
+}
+
+namespace {
+
+std::array<uint8_t, VK_UUID_SIZE> GetPipelineCacheUuid(const ui::vulkan::VulkanDevice& device) {
+  VkPhysicalDeviceProperties properties{};
+  device.vulkan_instance()->functions().vkGetPhysicalDeviceProperties(device.physical_device(),
+                                                                      &properties);
+  std::array<uint8_t, VK_UUID_SIZE> uuid;
+  std::memcpy(uuid.data(), properties.pipelineCacheUUID, uuid.size());
+  return uuid;
+}
+
+}  // namespace
+
+void NativeCommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                                     uint32_t title_id, bool blocking) {
+  CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
+  if (!vulkan_device_ || pipeline_cache_ == VK_NULL_HANDLE || !merge_pipeline_caches_ ||
+      !get_pipeline_cache_data_) {
+    return;
+  }
+  // A new title: keep what the previous one built before switching files.
+  SavePipelineCache();
+  const auto directory = cache_root / "shaders" / "local";
+  std::error_code error;
+  std::filesystem::create_directories(directory, error);
+  if (error) {
+    REXLOG_WARN("Native Vulkan: pipeline cache disabled, could not create {}: {}",
+                directory.string(), error.message());
+    pipeline_cache_path_.clear();
+    return;
+  }
+  pipeline_cache_path_ = directory / fmt::format("{:08X}.native.vk.pcache", title_id);
+  std::ifstream file(pipeline_cache_path_, std::ios::binary);
+  if (!file) {
+    return;
+  }
+  const std::vector<uint8_t> bytes{std::istreambuf_iterator<char>(file),
+                                   std::istreambuf_iterator<char>()};
+  const auto& properties = vulkan_device_->properties();
+  const auto data = GetPipelineCacheFileData(bytes, properties.vendorID, properties.deviceID,
+                                             GetPipelineCacheUuid(*vulkan_device_));
+  if (data.empty()) {
+    REXLOG_WARN("Native Vulkan: ignoring stale or corrupt pipeline cache {}",
+                pipeline_cache_path_.string());
+    return;
+  }
+  const auto& vk = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+  info.initialDataSize = data.size();
+  info.pInitialData = data.data();
+  VkPipelineCache stored = VK_NULL_HANDLE;
+  if (vk.vkCreatePipelineCache(device, &info, nullptr, &stored) != VK_SUCCESS) {
+    return;
+  }
+  if (merge_pipeline_caches_(device, pipeline_cache_, 1, &stored) == VK_SUCCESS) {
+    REXLOG_INFO("Native Vulkan: loaded {} bytes of pipeline cache from {}", data.size(),
+                pipeline_cache_path_.string());
+  }
+  vk.vkDestroyPipelineCache(device, stored, nullptr);
+}
+
+void NativeCommandProcessor::SavePipelineCache() {
+  if (pipeline_cache_path_.empty() || pipeline_cache_ == VK_NULL_HANDLE ||
+      !get_pipeline_cache_data_) {
+    return;
+  }
+  const VkDevice device = vulkan_device_->device();
+  size_t size = 0;
+  if (get_pipeline_cache_data_(device, pipeline_cache_, &size, nullptr) != VK_SUCCESS || !size) {
+    return;
+  }
+  std::vector<uint8_t> data(size);
+  if (get_pipeline_cache_data_(device, pipeline_cache_, &size, data.data()) != VK_SUCCESS) {
+    return;
+  }
+  data.resize(size);
+  const auto& properties = vulkan_device_->properties();
+  const auto header = MakePipelineCacheFileHeader(properties.vendorID, properties.deviceID,
+                                                  GetPipelineCacheUuid(*vulkan_device_), data);
+  // Written next to the cache and renamed over it, so a crash never leaves a
+  // half-written file behind.
+  auto temporary = pipeline_cache_path_;
+  temporary += ".tmp";
+  {
+    std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+    file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    file.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
+    if (!file) {
+      REXLOG_WARN("Native Vulkan: could not write pipeline cache {}", temporary.string());
+      return;
+    }
+  }
+  std::error_code error;
+  std::filesystem::rename(temporary, pipeline_cache_path_, error);
+  if (error) {
+    REXLOG_WARN("Native Vulkan: could not replace pipeline cache {}: {}",
+                pipeline_cache_path_.string(), error.message());
+    std::filesystem::remove(temporary, error);
+  }
 }
 
 Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type,
@@ -427,14 +535,9 @@ void NativeCommandProcessor::ClearCaches() {
     RecordPending();
     SubmitCommands();
   }
-  if (!RetireSubmission() && submitted_) {
-    auto queue = vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
-    vulkan_device_->functions().vkQueueWaitIdle(queue.queue());
-    submitted_ = false;
-  }
+  WaitForAllSubmissions();
   pending_.clear();
-  in_flight_.clear();
-  in_flight_readback_.reset();
+  pending_passes_.clear();
   presented_.reset();
   InvalidateGpuMemory();
   const auto& vk = vulkan_device_->functions();
@@ -884,11 +987,9 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return false;
     }
   }
-  draw.pass = std::make_unique<DrawPass>(*vulkan_device_);
-  const uint32_t shared_count = uint32_t(1) << translator_->GetSharedMemoryStorageBufferCountLog2();
-  if (!draw.pass->Initialize(input, indices, vertex, pixel, shared_count, pipeline_cache_,
-                             pipelines_, draw_bindings_, *draw_uploads_, clock_.next,
-                             use_shared_vertices ? shared_vertex_->buffer() : VK_NULL_HANDLE)) {
+  draw.pass_index = AddPendingPass(input, indices, vertex, pixel,
+                                   use_shared_vertices ? shared_vertex_->buffer() : VK_NULL_HANDLE);
+  if (draw.pass_index == SIZE_MAX) {
     return false;
   }
   pending_.emplace_back(std::move(draw));
@@ -1083,13 +1184,25 @@ void NativeCommandProcessor::QueueReplayDraw(const DrawInput& input,
     draw.colors[rt_index] = image;
     draw.color_count = rt_index + 1;
   }
-  draw.pass = std::make_unique<DrawPass>(*vulkan_device_);
-  const uint32_t shared_count = uint32_t(1) << translator_->GetSharedMemoryStorageBufferCountLog2();
-  if (!draw.pass->Initialize(input, indices, vertex, pixel, shared_count, pipeline_cache_,
-                             pipelines_, draw_bindings_, *draw_uploads_, clock_.next)) {
-    return;
+  draw.pass_index = AddPendingPass(input, indices, vertex, pixel);
+  if (draw.pass_index != SIZE_MAX) {
+    pending_.emplace_back(std::move(draw));
   }
-  pending_.emplace_back(std::move(draw));
+}
+
+size_t NativeCommandProcessor::AddPendingPass(const DrawInput& input,
+                                              std::span<const uint32_t> indices,
+                                              const Shader::Translation& vertex,
+                                              const Shader::Translation* pixel,
+                                              VkBuffer shared_vertex_buffer) {
+  auto& pass = pending_passes_.emplace_back(*vulkan_device_);
+  const uint32_t shared_count = uint32_t(1) << translator_->GetSharedMemoryStorageBufferCountLog2();
+  if (!pass.Initialize(input, indices, vertex, pixel, shared_count, pipeline_cache_, pipelines_,
+                       draw_bindings_, *draw_uploads_, clock_.next, shared_vertex_buffer)) {
+    pending_passes_.pop_back();
+    return SIZE_MAX;
+  }
+  return pending_passes_.size() - 1;
 }
 
 bool NativeCommandProcessor::IssueCopy() {
@@ -1288,7 +1401,7 @@ bool NativeCommandProcessor::IssueCopy() {
     if (existing == resolved_images().end() && resolved_images().size() >= NativeTextureCache::kMaxResolvedImages) {
       // Drop the least recently used resolve whose GPU work has completed. Only
       // retired submissions are eligible, and the presented image is kept; the
-      // shared owners in pending_ / in_flight_ keep surviving images alive.
+      // shared owners in pending and in-flight commands keep surviving images alive.
       const auto victim = SelectRetiredEviction(resolved_images(), clock_.retired + 1,
                                                 [this](uint32_t address, const CachedImage& entry) {
                                                   return entry.image != presented_ &&
@@ -1447,20 +1560,15 @@ bool NativeCommandProcessor::CaptureResolveImage(ColorImage& image, VkOffset2D s
   image.Transition(command_buffer_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                    VK_ACCESS_SHADER_READ_BIT);
-  if (!SubmitCommands()) {
+  const uint32_t frame = current_frame_;
+  if (!SubmitCommands() || !RetireAllSubmissions()) {
     return false;
   }
-  in_flight_readback_ = std::move(readback);
-  if (!RetireSubmission()) {
-    return false;
-  }
-  const auto mapped = in_flight_readback_->Map(fence_);
+  const auto mapped = readback->Map(frames_[frame].fence);
   if (!recorded || mapped.empty()) {
-    in_flight_readback_.reset();
     return false;
   }
   pixels_out.assign(mapped.begin(), mapped.end());
-  in_flight_readback_.reset();
   return true;
 }
 
@@ -1550,7 +1658,7 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
   const auto& vk = vulkan_device_->functions();
   const auto& draw = std::get<QueuedDraw>(commands.front());
   for (const auto& command : commands) {
-    std::get<QueuedDraw>(command).pass->RecordTextureUpload(command_buffer_);
+    pending_passes_[std::get<QueuedDraw>(command).pass_index].RecordTextureUpload(command_buffer_);
   }
   std::array<VkRenderingAttachmentInfo, xenos::kMaxColorRenderTargets> colors{};
   VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -1604,7 +1712,7 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
   if (!needs_full_clear) {
     VkExtent2D covered{};
     for (const auto& command : commands) {
-      const auto& scissor = std::get<QueuedDraw>(command).pass->scissor();
+      const auto& scissor = pending_passes_[std::get<QueuedDraw>(command).pass_index].scissor();
       covered.width = std::max(covered.width, scissor.offset[0] + scissor.extent[0]);
       covered.height = std::max(covered.height, scissor.offset[1] + scissor.extent[1]);
     }
@@ -1612,8 +1720,10 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
                                    std::min(covered.height, attachment_extent.height)};
   }
   vk.vkCmdBeginRendering(command_buffer_, &rendering);
+  DrawRenderState state;
   for (const auto& command : commands) {
-    std::get<QueuedDraw>(command).pass->Record(command_buffer_, attachment_extent);
+    pending_passes_[std::get<QueuedDraw>(command).pass_index].Record(command_buffer_,
+                                                                     attachment_extent, state);
   }
   vk.vkCmdEndRendering(command_buffer_);
 }
@@ -1740,20 +1850,21 @@ void NativeCommandProcessor::LogFrameTiming(const FrameTiming& frame, const char
   }
 }
 
-bool NativeCommandProcessor::RetireSubmission() {
-  if (!submitted_) {
+bool NativeCommandProcessor::RetireFrame(FrameSlot& frame) {
+  if (!frame.submitted) {
     return true;
   }
   const auto& vk = vulkan_device_->functions();
-  const auto result = vk.vkWaitForFences(vulkan_device_->device(), 1, &fence_, VK_TRUE, UINT64_MAX);
+  const auto result =
+      vk.vkWaitForFences(vulkan_device_->device(), 1, &frame.fence, VK_TRUE, UINT64_MAX);
   if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
     return false;
   }
-  if (submitted_frame_) {
-    LogFrameTiming(*submitted_frame_, result == VK_SUCCESS ? "rendered" : "gpu_failed");
-    submitted_frame_.reset();
+  if (frame.frame) {
+    LogFrameTiming(*frame.frame, result == VK_SUCCESS ? "rendered" : "gpu_failed");
+    frame.frame.reset();
   }
-  for (const auto& command : in_flight_) {
+  for (const auto& command : frame.commands) {
     const auto* resolve = std::get_if<QueuedResolve>(&command);
     if (!resolve) {
       continue;
@@ -1765,15 +1876,41 @@ bool NativeCommandProcessor::RetireSubmission() {
       color_resolve_->Free(resolve->color_descriptor);
     }
   }
+  frame.commands.clear();
+  frame.passes.clear();
+  // A fence also waits for every earlier submission to the queue.
   if (result == VK_SUCCESS) {
-    draw_uploads_->Reclaim(clock_.next - 1);
-    clock_.retired = clock_.next - 1;
+    clock_.retired = std::max(clock_.retired, frame.submission);
+    draw_uploads_->Reclaim(clock_.retired);
   }
-  submitted_ = false;
+  frame.submitted = false;
   if (result == VK_ERROR_DEVICE_LOST) {
     graphics_system_->OnHostGpuLossFromAnyThread(true);
   }
   return result == VK_SUCCESS;
+}
+
+bool NativeCommandProcessor::RetireAllSubmissions() {
+  bool retired = true;
+  for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+    retired &= RetireFrame(frames_[(current_frame_ + i) % kMaxFramesInFlight]);
+  }
+  return retired;
+}
+
+void NativeCommandProcessor::WaitForAllSubmissions() {
+  const bool any_submitted =
+      std::ranges::any_of(frames_, [](const FrameSlot& frame) { return frame.submitted; });
+  if (!RetireAllSubmissions() && any_submitted) {
+    auto queue = vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+    vulkan_device_->functions().vkQueueWaitIdle(queue.queue());
+  }
+  for (auto& frame : frames_) {
+    frame.commands.clear();
+    frame.passes.clear();
+    frame.frame.reset();
+    frame.submitted = false;
+  }
 }
 
 void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t width, uint32_t height) {
@@ -1826,27 +1963,28 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t width,
   } else if (!fresh) {
     LogFrameTiming(timing, "stale");
   } else {
-    submitted_frame_ = timing;
+    frames_[last_submitted_frame_].frame = timing;
   }
 }
 
 bool NativeCommandProcessor::BeginCommands() {
   const auto& vk = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
-  if (!RetireSubmission()) {
+  // Only the slot submitted kMaxFramesInFlight submissions ago is waited for.
+  auto& frame = frames_[current_frame_];
+  if (!RetireFrame(frame)) {
     return false;
   }
-  if (vk.vkResetFences(device, 1, &fence_) != VK_SUCCESS ||
-      vk.vkResetCommandPool(device, command_pool_, 0) != VK_SUCCESS) {
+  if (vk.vkResetFences(device, 1, &frame.fence) != VK_SUCCESS ||
+      vk.vkResetCommandPool(device, frame.command_pool, 0) != VK_SUCCESS) {
     return false;
   }
   VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  if (vk.vkBeginCommandBuffer(command_buffer_, &begin) != VK_SUCCESS) {
+  if (vk.vkBeginCommandBuffer(frame.command_buffer, &begin) != VK_SUCCESS) {
     return false;
   }
-  in_flight_.clear();
-  in_flight_readback_.reset();
+  command_buffer_ = frame.command_buffer;
   presented_.reset();
   return true;
 }
@@ -1931,21 +2069,25 @@ bool NativeCommandProcessor::SubmitCommands() {
   VkResult result;
   {
     auto queue = vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
-    result = vk.vkQueueSubmit(queue.queue(), 1, &submit, fence_);
+    result = vk.vkQueueSubmit(queue.queue(), 1, &submit, frames_[current_frame_].fence);
   }
   if (result != VK_SUCCESS) {
     if (result == VK_ERROR_DEVICE_LOST)
       graphics_system_->OnHostGpuLossFromAnyThread(true);
     return false;
   }
-  ++clock_.next;
-  submitted_ = true;
+  auto& frame = frames_[current_frame_];
+  frame.submission = clock_.next++;
+  frame.submitted = true;
   for (const auto& command : pending_) {
     if (const auto* resolve = std::get_if<QueuedResolve>(&command)) {
       resolve->destination->MarkResolved();
     }
   }
-  pending_.swap(in_flight_);
+  frame.commands.swap(pending_);
+  frame.passes.swap(pending_passes_);
+  last_submitted_frame_ = current_frame_;
+  current_frame_ = (current_frame_ + 1) % kMaxFramesInFlight;
   return true;
 }
 
@@ -2014,8 +2156,8 @@ bool NativeCommandProcessor::RenderGuestOutput(ui::Presenter::GuestOutputRefresh
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
     const auto ramp = use_pwl ? std::as_bytes(std::span(gamma_ramp_pwl_rgb(), 128 * 3))
                               : std::as_bytes(std::span(gamma_ramp_256_entry_table(), 256));
-    if (!output_gamma_->Record(command_buffer_, presented_->view(), output.image_view(), extent,
-                               ramp, use_pwl)) {
+    if (!output_gamma_->Record(command_buffer_, current_frame_, presented_->view(),
+                               output.image_view(), extent, ramp, use_pwl)) {
       return false;
     }
   } else {

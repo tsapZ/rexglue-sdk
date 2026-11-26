@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <compare>
@@ -859,6 +860,158 @@ constexpr uint32_t ClampResolutionScaleAxis(uint32_t scale, uint32_t guest_exten
     --scale;
   }
   return scale;
+}
+
+// Size a draw's upload allocation needs so every uniform buffer bound with
+// VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC stays in bounds: the descriptor
+// range is fixed, and Vulkan requires dynamic offset + range <= buffer size.
+constexpr uint64_t ComputeDynamicUboRequiredSize(std::span<const uint64_t> offsets,
+                                                 std::span<const uint64_t> ranges,
+                                                 uint64_t size) {
+  for (size_t i = 0; i < offsets.size() && i < ranges.size(); ++i) {
+    size = std::max(size, offsets[i] + ranges[i]);
+  }
+  return size;
+}
+
+// Graphics state bound in the current render pass, so a draw only records the
+// binds and dynamic state that differ from the previous draw.
+struct DrawRenderState {
+  static constexpr uint32_t kSetCount = 4;
+  static constexpr uint32_t kDynamicOffsetCount = 5;
+  // Set that holds the dynamic uniform buffers.
+  static constexpr uint32_t kDynamicSet = 1;
+
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kSetCount> sets{};
+  std::array<uint32_t, kDynamicOffsetCount> dynamic_offsets{};
+  bool viewport_valid = false;
+  VkViewport viewport{};
+  bool scissor_valid = false;
+  VkRect2D scissor{};
+  bool depth_bias_valid = false;
+  std::array<float, 2> depth_bias{};
+  bool blend_constants_valid = false;
+  std::array<float, 4> blend_constants{};
+  // Front and back face values, with validity bits 1 (front) and 2 (back).
+  std::array<uint32_t, 2> stencil_compare_mask{};
+  std::array<uint32_t, 2> stencil_write_mask{};
+  std::array<uint32_t, 2> stencil_reference{};
+  uint32_t stencil_compare_mask_valid = 0;
+  uint32_t stencil_write_mask_valid = 0;
+  uint32_t stencil_reference_valid = 0;
+  VkBuffer index_buffer = VK_NULL_HANDLE;
+  uint64_t index_offset = 0;
+
+  // Returns whether `current` must be rebound to `wanted`, updating it.
+  template <typename T>
+  static bool Update(bool& valid, T& current, const T& wanted) {
+    if (valid && std::memcmp(&current, &wanted, sizeof(T)) == 0) {
+      return false;
+    }
+    valid = true;
+    current = wanted;
+    return true;
+  }
+  bool SetPipeline(VkPipeline wanted) {
+    if (pipeline == wanted) {
+      return false;
+    }
+    pipeline = wanted;
+    return true;
+  }
+  // First descriptor set to rebind (kSetCount when none). A different pipeline
+  // layout may disturb every bound set, so it rebinds all of them; the dynamic
+  // set also rebinds when its offsets change.
+  uint32_t FirstChangedSet(VkPipelineLayout wanted_layout,
+                           const std::array<VkDescriptorSet, kSetCount>& wanted_sets,
+                           const std::array<uint32_t, kDynamicOffsetCount>& wanted_offsets) {
+    uint32_t first = kSetCount;
+    if (layout != wanted_layout) {
+      first = 0;
+    } else {
+      for (uint32_t i = 0; i < kSetCount; ++i) {
+        if (sets[i] != wanted_sets[i] || (i == kDynamicSet && dynamic_offsets != wanted_offsets)) {
+          first = i;
+          break;
+        }
+      }
+    }
+    layout = wanted_layout;
+    sets = wanted_sets;
+    dynamic_offsets = wanted_offsets;
+    return first;
+  }
+  // Faces (bit 1 front, bit 2 back) whose value must be set to `wanted`.
+  static uint32_t UpdateStencil(std::array<uint32_t, 2>& current, uint32_t& valid,
+                                const std::array<uint32_t, 2>& wanted) {
+    uint32_t faces = 0;
+    for (uint32_t face = 0; face < 2; ++face) {
+      if (!(valid & (1u << face)) || current[face] != wanted[face]) {
+        faces |= 1u << face;
+        current[face] = wanted[face];
+      }
+    }
+    valid = 3;
+    return faces;
+  }
+  bool SetIndexBuffer(VkBuffer buffer, uint64_t offset) {
+    if (index_buffer == buffer && index_offset == offset) {
+      return false;
+    }
+    index_buffer = buffer;
+    index_offset = offset;
+    return true;
+  }
+};
+
+// Header of a VkPipelineCache blob stored on disk: the data is merged only on
+// the device that wrote it and only when it is intact.
+struct PipelineCacheFileHeader {
+  static constexpr uint32_t kMagic = 0x4350564E;  // "NVPC"
+  static constexpr uint32_t kVersion = 1;
+  uint32_t magic = kMagic;
+  uint32_t version = kVersion;
+  uint32_t vendor_id = 0;
+  uint32_t device_id = 0;
+  std::array<uint8_t, VK_UUID_SIZE> cache_uuid{};
+  uint64_t data_size = 0;
+  uint64_t data_hash = 0;
+};
+static_assert(sizeof(PipelineCacheFileHeader) == 48);
+
+inline PipelineCacheFileHeader MakePipelineCacheFileHeader(
+    uint32_t vendor_id, uint32_t device_id, const std::array<uint8_t, VK_UUID_SIZE>& cache_uuid,
+    std::span<const uint8_t> data) {
+  PipelineCacheFileHeader header;
+  header.vendor_id = vendor_id;
+  header.device_id = device_id;
+  header.cache_uuid = cache_uuid;
+  header.data_size = data.size();
+  header.data_hash = XXH3_64bits(data.data(), data.size());
+  return header;
+}
+
+// The pipeline cache data in a stored file, or empty when the file is
+// truncated, corrupt, from another version or from another device.
+inline std::span<const uint8_t> GetPipelineCacheFileData(
+    std::span<const uint8_t> file, uint32_t vendor_id, uint32_t device_id,
+    const std::array<uint8_t, VK_UUID_SIZE>& cache_uuid) {
+  PipelineCacheFileHeader header;
+  if (file.size() < sizeof(header)) {
+    return {};
+  }
+  std::memcpy(&header, file.data(), sizeof(header));
+  const auto data = file.subspan(sizeof(header));
+  if (header.magic != PipelineCacheFileHeader::kMagic ||
+      header.version != PipelineCacheFileHeader::kVersion || header.vendor_id != vendor_id ||
+      header.device_id != device_id || header.cache_uuid != cache_uuid ||
+      header.data_size != data.size() ||
+      header.data_hash != XXH3_64bits(data.data(), data.size())) {
+    return {};
+  }
+  return data;
 }
 
 }  // namespace rex::graphics::native

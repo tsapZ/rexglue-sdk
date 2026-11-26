@@ -180,27 +180,49 @@ constexpr VkBufferUsageFlags kDrawUploadUsage =
     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
+// Descriptor range of each constant buffer, bound as
+// VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: the largest data a draw can have.
+constexpr std::array<uint64_t, SpirvShaderTranslator::kConstantBufferCount>
+    kDynamicConstantBufferRanges{sizeof(SpirvShaderTranslator::SystemConstants),
+                                 256 * 4 * sizeof(uint32_t), 256 * 4 * sizeof(uint32_t),
+                                 40 * sizeof(uint32_t), 192 * sizeof(uint32_t)};
+
 struct DrawBindings {
   explicit DrawBindings(const ui::vulkan::VulkanDevice& device) : device(device) {}
   ~DrawBindings();
   bool Initialize(uint32_t shared_count, uint32_t image_count, uint32_t sampler_count);
   VkDescriptorSet GetOrCreateSharedVertexSet(VkBuffer buffer, uint32_t shared_count);
+  // Dynamic constant buffer set of an upload pool page. Pool pages live until
+  // the pool is destroyed, so the set is kept as long as these bindings.
+  VkDescriptorSet GetOrCreateConstantSet(VkBuffer buffer);
+  void WriteConstantSet(VkDescriptorSet set, VkBuffer buffer) const;
+  // The single set shared by every draw for a layout without bindings, or
+  // VK_NULL_HANDLE when the layout has bindings (or allocation failed).
+  VkDescriptorSet GetEmptySet(size_t index);
 
   const ui::vulkan::VulkanDevice& device;
   std::array<VkDescriptorSetLayout, 4> layouts{};
   std::array<std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool>, 4> pools;
+  std::array<bool, 4> empty_layouts{};
+  std::array<size_t, 4> empty_set_indices{SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
   VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
   VkDescriptorSet shared_vertex_set = VK_NULL_HANDLE;
   size_t shared_vertex_set_index = SIZE_MAX;
   VkBuffer shared_vertex_buffer = VK_NULL_HANDLE;
+  std::unordered_map<VkBuffer, size_t> constant_sets;
 };
 
 using DrawBindingCache = std::map<std::array<uint32_t, 3>, std::unique_ptr<DrawBindings>>;
 
 class DrawPass {
  public:
-  explicit DrawPass(const ui::vulkan::VulkanDevice& device) : device_(device) {}
+  explicit DrawPass(const ui::vulkan::VulkanDevice& device) : device_(&device) {}
   ~DrawPass();
+  // Movable so frames store passes flat; a moved-from pass owns nothing.
+  DrawPass(DrawPass&& other) noexcept;
+  DrawPass& operator=(DrawPass&& other) noexcept;
+  DrawPass(const DrawPass&) = delete;
+  DrawPass& operator=(const DrawPass&) = delete;
 
   bool Initialize(const DrawInput& input, std::span<const uint32_t> indices,
                   const Shader::Translation& vertex, const Shader::Translation* pixel,
@@ -208,15 +230,20 @@ class DrawPass {
                   DrawPipelines& pipelines, DrawBindingCache& binding_cache,
                   ui::vulkan::VulkanUploadBufferPool& uploads, uint64_t submission,
                   VkBuffer shared_vertex_buffer = VK_NULL_HANDLE);
-  void Record(VkCommandBuffer commands, VkExtent2D extent);
+  // Records only the binds and dynamic state that differ from `state`.
+  void Record(VkCommandBuffer commands, VkExtent2D extent, DrawRenderState& state);
   void RecordTextureUpload(VkCommandBuffer commands);
   const draw_util::Scissor& scissor() const { return scissor_; }
 
  private:
-  const ui::vulkan::VulkanDevice& device_;
+  void Release();
+
+  const ui::vulkan::VulkanDevice* device_;
   DrawBindings* bindings_ = nullptr;
+  // Sets this pass allocated and frees; shared and cached sets stay SIZE_MAX.
   std::array<size_t, 4> set_indices_{SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
   std::array<VkDescriptorSet, 4> sets_{};
+  std::array<uint32_t, SpirvShaderTranslator::kConstantBufferCount> dynamic_offsets_{};
   VkPipeline pipeline_ = VK_NULL_HANDLE;
   std::array<float, 4> blend_constants_{};
   VkBuffer buffer_ = VK_NULL_HANDLE;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -38,6 +39,8 @@ class NativeCommandProcessor : public CommandProcessor {
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t width, uint32_t height) override;
   void ClearCaches() override;
   void InvalidateGpuMemory() override;
+  void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
+                               bool blocking) override;
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
@@ -56,7 +59,8 @@ class NativeCommandProcessor : public CommandProcessor {
     std::array<std::shared_ptr<ColorImage>, xenos::kMaxColorRenderTargets> colors;
     std::shared_ptr<ColorImage> depth;
     uint32_t color_count;
-    std::unique_ptr<DrawPass> pass;
+    // Index into the passes recorded with the same commands.
+    size_t pass_index;
   };
   struct QueuedResolve {
     std::shared_ptr<ColorImage> source;
@@ -129,16 +133,53 @@ class NativeCommandProcessor : public CommandProcessor {
   bool RenderGuestOutput(ui::Presenter::GuestOutputRefreshContext& context, VkExtent2D extent,
                          uint32_t frontbuffer_address);
 
+  struct FrameTiming {
+    uint64_t swap;
+    uint32_t address;
+    VkExtent2D extent;
+    int64_t ready_ns;
+  };
+  // Two submissions in flight: the CPU records one while the GPU runs the other.
+  static constexpr uint32_t kMaxFramesInFlight = 2;
+  struct FrameSlot {
+    VkCommandPool command_pool = VK_NULL_HANDLE;
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    bool submitted = false;
+    uint64_t submission = 0;
+    std::vector<FrameCommand> commands;
+    std::vector<DrawPass> passes;
+    std::optional<FrameTiming> frame;
+  };
+  // Waits for the slot's submission and releases what it kept alive.
+  bool RetireFrame(FrameSlot& frame);
+  // Waits for every submission, oldest first.
+  bool RetireAllSubmissions();
+  // RetireAllSubmissions, falling back to waiting for the queue to go idle, and
+  // dropping everything the frames kept alive either way.
+  void WaitForAllSubmissions();
+  // Adds a pass for the next pending draw, or returns SIZE_MAX if it fails to initialize.
+  size_t AddPendingPass(const DrawInput& input, std::span<const uint32_t> indices,
+                        const Shader::Translation& vertex, const Shader::Translation* pixel,
+                        VkBuffer shared_vertex_buffer = VK_NULL_HANDLE);
+  void SavePipelineCache();
+
   ui::vulkan::VulkanDevice* vulkan_device_ = nullptr;
+  PFN_vkGetPipelineCacheData get_pipeline_cache_data_ = nullptr;
+  PFN_vkMergePipelineCaches merge_pipeline_caches_ = nullptr;
+  std::filesystem::path pipeline_cache_path_;
   PFN_vkCmdResolveImage cmd_resolve_image_ = nullptr;
   PFN_vkCmdBlitImage cmd_blit_image_ = nullptr;
   bool r8_resolve_blit_ = false;
   bool rg8_resolve_blit_ = false;
   uint32_t draw_resolution_scale_x_ = 1;
   uint32_t draw_resolution_scale_y_ = 1;
-  VkCommandPool command_pool_ = VK_NULL_HANDLE;
+  std::array<FrameSlot, kMaxFramesInFlight> frames_;
+  // The slot being recorded, and the one submitted last.
+  uint32_t current_frame_ = 0;
+  uint32_t last_submitted_frame_ = 0;
+  // Command buffer of the slot being recorded.
   VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
-  VkFence fence_ = VK_NULL_HANDLE;
   std::multimap<uint64_t, std::unique_ptr<SpirvShader>> shaders_;
   std::unique_ptr<SpirvShaderTranslator> translator_;
   DrawPipelines pipelines_;
@@ -157,26 +198,16 @@ class NativeCommandProcessor : public CommandProcessor {
   std::atomic<bool> has_pending_invalidations_{false};
   void* memory_invalidation_handle_ = nullptr;
   std::vector<FrameCommand> pending_;
-  std::vector<FrameCommand> in_flight_;
+  std::vector<DrawPass> pending_passes_;
   // Reused by IssueDraw so decoding guest indices and building DrawInput do not allocate per draw.
   std::vector<uint32_t> scratch_indices_;
   DrawInput scratch_input_;
-  std::unique_ptr<ImageReadback> in_flight_readback_;
   std::shared_ptr<ColorImage> presented_;
   std::unique_ptr<OutputGamma> output_gamma_;
   std::unique_ptr<DepthResolve> depth_resolve_;
   std::unique_ptr<ColorResolve> color_resolve_;
-  struct FrameTiming {
-    uint64_t swap;
-    uint32_t address;
-    VkExtent2D extent;
-    int64_t ready_ns;
-  };
   std::ofstream frame_timing_;
-  std::optional<FrameTiming> submitted_frame_;
   void LogFrameTiming(const FrameTiming& frame, const char* result);
-  bool RetireSubmission();
-  bool submitted_ = false;
   bool reported_frame_ = false;
 };
 

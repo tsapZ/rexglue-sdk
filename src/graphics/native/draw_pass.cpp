@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <utility>
 
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
@@ -76,6 +77,16 @@ DrawBindings::~DrawBindings() {
   if (shared_vertex_set_index != SIZE_MAX && pools[0]) {
     pools[0]->Free(shared_vertex_set_index);
   }
+  if (pools[1]) {
+    for (const auto& entry : constant_sets) {
+      pools[1]->Free(entry.second);
+    }
+  }
+  for (size_t i = 0; i < empty_set_indices.size(); ++i) {
+    if (empty_set_indices[i] != SIZE_MAX && pools[i]) {
+      pools[i]->Free(empty_set_indices[i]);
+    }
+  }
   for (size_t i = 0; i < layouts.size(); ++i) {
     pools[i].reset();
     vk.vkDestroyDescriptorSetLayout(device.device(), layouts[i], nullptr);
@@ -122,6 +133,53 @@ VkDescriptorSet DrawBindings::GetOrCreateSharedVertexSet(VkBuffer buffer, uint32
   return shared_vertex_set;
 }
 
+VkDescriptorSet DrawBindings::GetOrCreateConstantSet(VkBuffer buffer) {
+  if (auto found = constant_sets.find(buffer); found != constant_sets.end()) {
+    return pools[1]->Get(found->second);
+  }
+  const size_t index = pools[1]->Allocate();
+  if (index == SIZE_MAX) {
+    return VK_NULL_HANDLE;
+  }
+  const VkDescriptorSet set = pools[1]->Get(index);
+  WriteConstantSet(set, buffer);
+  constant_sets.emplace(buffer, index);
+  return set;
+}
+
+void DrawBindings::WriteConstantSet(VkDescriptorSet set, VkBuffer buffer) const {
+  std::array<VkDescriptorBufferInfo, Translator::kConstantBufferCount> infos{};
+  std::array<VkWriteDescriptorSet, Translator::kConstantBufferCount> writes{};
+  for (uint32_t i = 0; i < infos.size(); ++i) {
+    infos[i] = {buffer, 0, kDynamicConstantBufferRanges[i]};
+    writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                 nullptr,
+                 set,
+                 i,
+                 0,
+                 1,
+                 VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+                 nullptr,
+                 &infos[i],
+                 nullptr};
+  }
+  device.functions().vkUpdateDescriptorSets(device.device(), uint32_t(writes.size()),
+                                            writes.data(), 0, nullptr);
+}
+
+VkDescriptorSet DrawBindings::GetEmptySet(size_t index) {
+  if (!empty_layouts[index]) {
+    return VK_NULL_HANDLE;
+  }
+  if (empty_set_indices[index] == SIZE_MAX) {
+    empty_set_indices[index] = pools[index]->Allocate();
+    if (empty_set_indices[index] == SIZE_MAX) {
+      return VK_NULL_HANDLE;
+    }
+  }
+  return pools[index]->Get(empty_set_indices[index]);
+}
+
 bool DrawBindings::Initialize(uint32_t shared_count, uint32_t image_count, uint32_t sampler_count) {
   if (image_count > xenos::kTextureFetchConstantCount ||
       sampler_count > xenos::kTextureFetchConstantCount) {
@@ -131,7 +189,7 @@ bool DrawBindings::Initialize(uint32_t shared_count, uint32_t image_count, uint3
   const auto handle = device.device();
   std::array<VkDescriptorSetLayoutBinding, Translator::kConstantBufferCount> constants{};
   for (uint32_t i = 0; i < constants.size(); ++i) {
-    constants[i] = {i, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+    constants[i] = {i, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
   }
   const VkDescriptorSetLayoutBinding shared{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, shared_count,
@@ -149,6 +207,7 @@ bool DrawBindings::Initialize(uint32_t shared_count, uint32_t image_count, uint3
     info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     info.bindingCount = uint32_t(bindings[i].size());
     info.pBindings = bindings[i].data();
+    empty_layouts[i] = bindings[i].empty();
     if (vk.vkCreateDescriptorSetLayout(handle, &info, nullptr, &layouts[i]) != VK_SUCCESS) {
       return false;
     }
@@ -161,7 +220,7 @@ bool DrawBindings::Initialize(uint32_t shared_count, uint32_t image_count, uint3
       }
     }
     pools[i] = std::make_unique<ui::vulkan::SingleLayoutDescriptorSetPool>(
-        &device, 64, uint32_t(sizes.size()), sizes.data(), layouts[i]);
+        &device, empty_layouts[i] ? 1 : 64, uint32_t(sizes.size()), sizes.data(), layouts[i]);
   }
   VkPipelineLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -174,12 +233,50 @@ bool DrawBindings::Initialize(uint32_t shared_count, uint32_t image_count, uint3
   return vk.vkCreatePipelineLayout(handle, &info, nullptr, &pipeline_layout) == VK_SUCCESS;
 }
 
-DrawPass::~DrawPass() {
-  const auto& vk = device_.functions();
-  const VkDevice device = device_.device();
+DrawPass::DrawPass(DrawPass&& other) noexcept : device_(other.device_) {
+  *this = std::move(other);
+}
+
+DrawPass& DrawPass::operator=(DrawPass&& other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  Release();
+  device_ = other.device_;
+  bindings_ = std::exchange(other.bindings_, nullptr);
+  set_indices_ = std::exchange(other.set_indices_, {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
+  sets_ = other.sets_;
+  dynamic_offsets_ = other.dynamic_offsets_;
+  pipeline_ = other.pipeline_;
+  blend_constants_ = other.blend_constants_;
+  buffer_ = other.buffer_;
+  buffer_memory_ = std::exchange(other.buffer_memory_, VkDeviceMemory(VK_NULL_HANDLE));
+  textures_ = std::move(other.textures_);
+  other.textures_.clear();
+  index_offset_ = other.index_offset_;
+  index_count_ = other.index_count_;
+  viewport_ = other.viewport_;
+  scissor_ = other.scissor_;
+  depth_bias_enable_ = other.depth_bias_enable_;
+  depth_bias_ = other.depth_bias_;
+  stencil_enable_ = other.stencil_enable_;
+  stencil_compare_mask_ = other.stencil_compare_mask_;
+  stencil_write_mask_ = other.stencil_write_mask_;
+  stencil_reference_ = other.stencil_reference_;
+  edram_depth_clear_color_ = other.edram_depth_clear_color_;
+  edram_clear_constants_ = other.edram_clear_constants_;
+  return *this;
+}
+
+DrawPass::~DrawPass() { Release(); }
+
+void DrawPass::Release() {
+  const auto& vk = device_->functions();
+  const VkDevice device = device_->device();
   for (size_t i = 0; i < set_indices_.size(); ++i) {
     if (set_indices_[i] != SIZE_MAX) {
       bindings_->pools[i]->Free(set_indices_[i]);
+      set_indices_[i] = SIZE_MAX;
     }
   }
   for (const auto& texture : textures_) {
@@ -191,9 +288,12 @@ DrawPass::~DrawPass() {
     vk.vkDestroyImage(device, texture.image, nullptr);
     vk.vkFreeMemory(device, texture.memory, nullptr);
   }
+  textures_.clear();
   if (buffer_memory_) {
     vk.vkDestroyBuffer(device, buffer_, nullptr);
     vk.vkFreeMemory(device, buffer_memory_, nullptr);
+    buffer_ = VK_NULL_HANDLE;
+    buffer_memory_ = VK_NULL_HANDLE;
   }
 }
 
@@ -203,8 +303,8 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
                           DrawPipelines& pipelines, DrawBindingCache& binding_cache,
                           ui::vulkan::VulkanUploadBufferPool& uploads, uint64_t submission,
                           VkBuffer shared_vertex_buffer) {
-  const auto& vk = device_.functions();
-  const VkDevice device = device_.device();
+  const auto& vk = device_->functions();
+  const VkDevice device = device_->device();
   const bool has_textures = !input.texture_bindings.empty() || !input.samplers.empty();
   textures_.resize(input.textures.size());
   blend_constants_ = input.blend_constants;
@@ -226,7 +326,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   const std::array binding_key{shared_buffer_count, image_count, sampler_count};
   auto found = binding_cache.find(binding_key);
   if (found == binding_cache.end()) {
-    auto layout = std::make_unique<DrawBindings>(device_);
+    auto layout = std::make_unique<DrawBindings>(*device_);
     if (!layout->Initialize(shared_buffer_count, image_count, sampler_count)) {
       return false;
     }
@@ -241,6 +341,17 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       }
       continue;
     }
+    // The constant set depends on the upload buffer, chosen below.
+    if (i == DrawRenderState::kDynamicSet) {
+      continue;
+    }
+    if (bindings_->empty_layouts[i]) {
+      sets_[i] = bindings_->GetEmptySet(i);
+      if (sets_[i] == VK_NULL_HANDLE) {
+        return false;
+      }
+      continue;
+    }
     auto& pool = *bindings_->pools[i];
     set_indices_[i] = pool.Allocate();
     if (set_indices_[i] == SIZE_MAX) {
@@ -249,7 +360,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     sets_[i] = pool.Get(set_indices_[i]);
   }
 
-  const auto props = device_.properties();
+  const auto props = device_->properties();
   const VkDeviceSize uniform_alignment = props.minUniformBufferOffsetAlignment;
   const std::array<std::span<const uint8_t>, Translator::kConstantBufferCount> constants{{
       {reinterpret_cast<const uint8_t*>(&input.system), sizeof(input.system)},
@@ -264,9 +375,10 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       shared_vertex_buffer != VK_NULL_HANDLE ? 0 : input.vertices.size();
   VkDeviceSize size = vertex_size;
   std::array<VkDescriptorBufferInfo, Translator::kConstantBufferCount> constant_infos{};
+  std::array<uint64_t, Translator::kConstantBufferCount> constant_offsets{};
   for (size_t i = 0; i < constants.size(); ++i) {
     size = rex::align(size, uniform_alignment);
-    constant_infos[i].offset = size;
+    constant_infos[i].offset = constant_offsets[i] = size;
     constant_infos[i].range = std::max<size_t>(constants[i].size(), 16);
     size += constant_infos[i].range;
   }
@@ -283,6 +395,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       size = copy.bufferOffset + input_texture.levels[level].size();
     }
   }
+  size = ComputeDynamicUboRequiredSize(constant_offsets, kDynamicConstantBufferRanges, size);
   const VkDeviceSize alignment =
       std::max({VkDeviceSize(16), uniform_alignment, props.minStorageBufferOffsetAlignment});
   VkDeviceSize buffer_offset = 0;
@@ -290,7 +403,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   if (rex::align(size, alignment) <= kDrawUploadPageSize) {
     bytes = uploads.Request(submission, size, alignment, buffer_, buffer_offset);
   } else {
-    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(&device_, size, kDrawUploadUsage,
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(device_, size, kDrawUploadUsage,
                                                            ui::vulkan::util::MemoryPurpose::kUpload,
                                                            buffer_, buffer_memory_)) {
       return false;
@@ -315,6 +428,21 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       std::memcpy(target, constants[i].data(), constants[i].size());
     }
     constant_infos[i].offset += buffer_offset;
+    dynamic_offsets_[i] = uint32_t(constant_infos[i].offset);
+  }
+  if (buffer_memory_) {
+    // A dedicated buffer outlives no other draw, so it gets a set of its own.
+    set_indices_[1] = bindings_->pools[1]->Allocate();
+    if (set_indices_[1] == SIZE_MAX) {
+      return false;
+    }
+    sets_[1] = bindings_->pools[1]->Get(set_indices_[1]);
+    bindings_->WriteConstantSet(sets_[1], buffer_);
+  } else {
+    sets_[1] = bindings_->GetOrCreateConstantSet(buffer_);
+    if (sets_[1] == VK_NULL_HANDLE) {
+      return false;
+    }
   }
   std::memcpy(bytes + index_offset_, indices.data(), indices.size_bytes());
   index_offset_ += buffer_offset;
@@ -343,7 +471,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   constexpr size_t kInlineSharedBuffers = 8;
   std::array<VkDescriptorBufferInfo, kInlineSharedBuffers> inline_shared_infos{};
   std::vector<VkDescriptorBufferInfo> heap_shared_infos;
-  std::array<VkWriteDescriptorSet, 1 + Translator::kConstantBufferCount> writes{};
+  std::array<VkWriteDescriptorSet, 1> writes{};
   uint32_t write_count = 0;
   if (shared_vertex_buffer == VK_NULL_HANDLE) {
     VkDescriptorBufferInfo* shared_infos;
@@ -366,11 +494,9 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
                              nullptr,
                              shared_infos};
   }
-  for (uint32_t i = 0; i < constant_infos.size(); ++i) {
-    writes[write_count++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets_[1], i, 0, 1,
-                             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,      nullptr, &constant_infos[i]};
+  if (write_count) {
+    vk.vkUpdateDescriptorSets(device, write_count, writes.data(), 0, nullptr);
   }
-  vk.vkUpdateDescriptorSets(device, write_count, writes.data(), 0, nullptr);
 
   for (size_t i = 0; i < textures_.size(); ++i) {
     const auto& input_texture = input.textures[i];
@@ -419,7 +545,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       info.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     }
     if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-            &device_, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, texture.image,
+            device_, info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, texture.image,
             texture.memory)) {
       return false;
     }
@@ -515,12 +641,12 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     return true;
   }
 
-  const VkShaderModule vs = CreateShaderModule(device_, vertex);
+  const VkShaderModule vs = CreateShaderModule(*device_, vertex);
   VkShaderModule ps = VK_NULL_HANDLE;
   if (input.edram_depth_clear_color) {
-    ps = CreateShaderModule(device_, kEdramDepthClear, sizeof(kEdramDepthClear));
+    ps = CreateShaderModule(*device_, kEdramDepthClear, sizeof(kEdramDepthClear));
   } else if (pixel) {
-    ps = CreateShaderModule(device_, *pixel);
+    ps = CreateShaderModule(*device_, *pixel);
   }
   const bool has_fragment = ps != VK_NULL_HANDLE;
   if (!vs || ((pixel || input.edram_depth_clear_color) && !has_fragment)) {
@@ -596,7 +722,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
 }
 
 void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
-  const auto& vk = device_.functions();
+  const auto& vk = device_->functions();
   for (const auto& texture : textures_) {
     if (texture.fallback_view != VK_NULL_HANDLE) {
       // Zero-cleared and already in the shader-read layout for the device's life.
@@ -690,12 +816,12 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
   }
 }
 
-void DrawPass::Record(VkCommandBuffer commands, VkExtent2D extent) {
+void DrawPass::Record(VkCommandBuffer commands, VkExtent2D extent, DrawRenderState& state) {
   if (!viewport_.xy_extent[0] || !viewport_.xy_extent[1] || scissor_.offset[0] >= extent.width ||
       scissor_.offset[1] >= extent.height) {
     return;
   }
-  const auto& vk = device_.functions();
+  const auto& vk = device_->functions();
   const VkViewport viewport{float(viewport_.xy_offset[0]),
                             float(viewport_.xy_offset[1]),
                             float(viewport_.xy_extent[0]),
@@ -705,38 +831,63 @@ void DrawPass::Record(VkCommandBuffer commands, VkExtent2D extent) {
   const VkRect2D scissor{{int32_t(scissor_.offset[0]), int32_t(scissor_.offset[1])},
                          {std::min(scissor_.extent[0], extent.width - scissor_.offset[0]),
                           std::min(scissor_.extent[1], extent.height - scissor_.offset[1])}};
-  vk.vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-  vk.vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, bindings_->pipeline_layout,
-                             0, uint32_t(sets_.size()), sets_.data(), 0, nullptr);
-  vk.vkCmdSetViewport(commands, 0, 1, &viewport);
-  vk.vkCmdSetScissor(commands, 0, 1, &scissor);
-  if (depth_bias_enable_) {
+  if (state.SetPipeline(pipeline_)) {
+    vk.vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+  }
+  const uint32_t first_set =
+      state.FirstChangedSet(bindings_->pipeline_layout, sets_, dynamic_offsets_);
+  if (first_set < sets_.size()) {
+    // The dynamic offsets belong to the constant set, so only pass them with it.
+    const bool with_constants = first_set <= DrawRenderState::kDynamicSet;
+    vk.vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                               bindings_->pipeline_layout, first_set,
+                               uint32_t(sets_.size()) - first_set, sets_.data() + first_set,
+                               with_constants ? uint32_t(dynamic_offsets_.size()) : 0,
+                               with_constants ? dynamic_offsets_.data() : nullptr);
+  }
+  if (DrawRenderState::Update(state.viewport_valid, state.viewport, viewport)) {
+    vk.vkCmdSetViewport(commands, 0, 1, &viewport);
+  }
+  if (DrawRenderState::Update(state.scissor_valid, state.scissor, scissor)) {
+    vk.vkCmdSetScissor(commands, 0, 1, &scissor);
+  }
+  if (depth_bias_enable_ &&
+      DrawRenderState::Update(state.depth_bias_valid, state.depth_bias,
+                              {depth_bias_.constant_factor, depth_bias_.slope_factor})) {
     vk.vkCmdSetDepthBias(commands, depth_bias_.constant_factor, 0.0f, depth_bias_.slope_factor);
   }
-  vk.vkCmdSetBlendConstants(commands, blend_constants_.data());
-  if (stencil_enable_) {
-    const bool split_stencil = device_.properties().separateStencilMaskRef;
-    if (!split_stencil || stencil_compare_mask_[0] == stencil_compare_mask_[1]) {
-      vk.vkCmdSetStencilCompareMask(commands, VK_STENCIL_FACE_FRONT_AND_BACK,
-                                    stencil_compare_mask_[0]);
-    } else {
-      vk.vkCmdSetStencilCompareMask(commands, VK_STENCIL_FACE_FRONT_BIT, stencil_compare_mask_[0]);
-      vk.vkCmdSetStencilCompareMask(commands, VK_STENCIL_FACE_BACK_BIT, stencil_compare_mask_[1]);
-    }
-    if (!split_stencil || stencil_write_mask_[0] == stencil_write_mask_[1]) {
-      vk.vkCmdSetStencilWriteMask(commands, VK_STENCIL_FACE_FRONT_AND_BACK, stencil_write_mask_[0]);
-    } else {
-      vk.vkCmdSetStencilWriteMask(commands, VK_STENCIL_FACE_FRONT_BIT, stencil_write_mask_[0]);
-      vk.vkCmdSetStencilWriteMask(commands, VK_STENCIL_FACE_BACK_BIT, stencil_write_mask_[1]);
-    }
-    if (!split_stencil || stencil_reference_[0] == stencil_reference_[1]) {
-      vk.vkCmdSetStencilReference(commands, VK_STENCIL_FACE_FRONT_AND_BACK, stencil_reference_[0]);
-    } else {
-      vk.vkCmdSetStencilReference(commands, VK_STENCIL_FACE_FRONT_BIT, stencil_reference_[0]);
-      vk.vkCmdSetStencilReference(commands, VK_STENCIL_FACE_BACK_BIT, stencil_reference_[1]);
-    }
+  if (DrawRenderState::Update(state.blend_constants_valid, state.blend_constants,
+                              blend_constants_)) {
+    vk.vkCmdSetBlendConstants(commands, blend_constants_.data());
   }
-  vk.vkCmdBindIndexBuffer(commands, buffer_, index_offset_, VK_INDEX_TYPE_UINT32);
+  if (stencil_enable_) {
+    const bool split_stencil = device_->properties().separateStencilMaskRef;
+    const auto set_stencil = [&](auto set, const std::array<uint32_t, 2>& values,
+                                 std::array<uint32_t, 2>& current, uint32_t& valid) {
+      const std::array<uint32_t, 2> wanted =
+          split_stencil ? values : std::array<uint32_t, 2>{values[0], values[0]};
+      const uint32_t faces = DrawRenderState::UpdateStencil(current, valid, wanted);
+      if (faces == 3 && wanted[0] == wanted[1]) {
+        set(commands, VK_STENCIL_FACE_FRONT_AND_BACK, wanted[0]);
+        return;
+      }
+      if (faces & 1) {
+        set(commands, VK_STENCIL_FACE_FRONT_BIT, wanted[0]);
+      }
+      if (faces & 2) {
+        set(commands, VK_STENCIL_FACE_BACK_BIT, wanted[1]);
+      }
+    };
+    set_stencil(vk.vkCmdSetStencilCompareMask, stencil_compare_mask_, state.stencil_compare_mask,
+                state.stencil_compare_mask_valid);
+    set_stencil(vk.vkCmdSetStencilWriteMask, stencil_write_mask_, state.stencil_write_mask,
+                state.stencil_write_mask_valid);
+    set_stencil(vk.vkCmdSetStencilReference, stencil_reference_, state.stencil_reference,
+                state.stencil_reference_valid);
+  }
+  if (state.SetIndexBuffer(buffer_, index_offset_)) {
+    vk.vkCmdBindIndexBuffer(commands, buffer_, index_offset_, VK_INDEX_TYPE_UINT32);
+  }
   if (edram_depth_clear_color_) {
     vk.vkCmdPushConstants(commands, bindings_->pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                           sizeof(edram_clear_constants_), edram_clear_constants_.data());
