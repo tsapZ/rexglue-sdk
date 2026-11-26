@@ -30,11 +30,24 @@ set(REXGPU_XENOS_SOURCES
     pipeline/shader/translator_disasm.cpp
 )
 
-# Everything except the Xenos plugin entry point: the native plugin needs its
-# own copies of GraphicsSystem and CommandProcessor, since those symbols are
-# not part of rexruntime.
-set(REXGPU_NATIVE_BASE_SOURCES ${REXGPU_XENOS_SOURCES})
-list(REMOVE_ITEM REXGPU_NATIVE_BASE_SOURCES plugin_main.cpp)
+# Only the shared Xenos/shader/texture units that rexgpu-native actually uses:
+# excluding plugin_main.cpp plus unused Xenos emulation modules (render target
+# cache, primitive processor, shader interpreter, draw extent estimator, packet
+# disassembler, sampler info).
+set(REXGPU_NATIVE_BASE_SOURCES
+    flags.cpp
+    register_file.cpp
+    registers.cpp
+    pipeline/shader/shader.cpp
+    format/ucode.cpp
+    graphics_system.cpp
+    command_processor.cpp
+    util/draw.cpp
+    shared_memory.cpp
+    pipeline/texture/cache.cpp
+    pipeline/shader/translator.cpp
+    pipeline/shader/translator_disasm.cpp
+)
 
 # SPIR-V shader translation
 set(REXGPU_XENOS_SPIRV_SOURCES
@@ -219,10 +232,5 @@ if(REXGLUE_USE_VULKAN)
         xxHash::xxhash
         Vulkan::Headers
         glslang::SPIRV
-        glslang
-        MachineIndependent
-        GenericCodeGen
-        OSDependent
-        OGLCompiler
     )
 endif()
