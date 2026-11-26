@@ -113,6 +113,7 @@ class NativeCommandProcessor : public CommandProcessor {
     uint32_t dest_info;
     uint32_t dest_pitch;
     uint64_t version = 0;
+    bool tiled_destination = false;
   };
   struct CachedSampler {
     VkSampler sampler = VK_NULL_HANDLE;
@@ -179,6 +180,8 @@ class NativeCommandProcessor : public CommandProcessor {
   // Whether VK_FORMAT_D24_UNORM_S8_UINT supports optimal-tiling sampled image
   // and depth/stencil attachment usage on this device.
   bool depth_unorm24_supported_ = false;
+  uint32_t draw_resolution_scale_x_ = 1;
+  uint32_t draw_resolution_scale_y_ = 1;
   VkCommandPool command_pool_ = VK_NULL_HANDLE;
   VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
   VkFence fence_ = VK_NULL_HANDLE;

@@ -12,8 +12,10 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/edram_layout.h>
+#include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
 #include <rex/system/xmemory.h>
 #include <rex/ui/vulkan/instance.h>
@@ -27,6 +29,7 @@
 
 REXCVAR_DEFINE_STRING(native_frame_timing_path, "", "GPU/Native",
                       "Optional CSV for native Vulkan guest-output frame timing");
+REXCVAR_DECLARE(bool, present_use_actual_aspect);
 
 namespace rex::graphics::native {
 namespace {
@@ -243,8 +246,20 @@ bool NativeCommandProcessor::SetupContext() {
     return false;
   }
 
+  TextureCache::GetConfigDrawResolutionScale(draw_resolution_scale_x_, draw_resolution_scale_y_);
+  const uint32_t max_w = std::min(vulkan_device_->properties().maxImageDimension2D,
+                                  vulkan_device_->properties().maxFramebufferWidth);
+  const uint32_t max_h = std::min(vulkan_device_->properties().maxImageDimension2D,
+                                  vulkan_device_->properties().maxFramebufferHeight);
+  while (draw_resolution_scale_x_ > 1 && 1280u * draw_resolution_scale_x_ > max_w) {
+    --draw_resolution_scale_x_;
+  }
+  while (draw_resolution_scale_y_ > 1 && 720u * draw_resolution_scale_y_ > max_h) {
+    --draw_resolution_scale_y_;
+  }
   translator_ =
-      std::make_unique<Translator>(Translator::Features(vulkan_device_), false, false, false);
+      std::make_unique<Translator>(Translator::Features(vulkan_device_), false, false, false,
+                                   draw_resolution_scale_x_, draw_resolution_scale_y_);
   VkPipelineCacheCreateInfo pipeline_cache{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
   draw_uploads_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
       vulkan_device_, kDrawUploadUsage, kDrawUploadPageSize);
@@ -289,7 +304,8 @@ bool NativeCommandProcessor::SetupContext() {
     return false;
   }
   SetActiveEdramLayout(RequestedEdramLayout());
-  REXLOG_INFO("Native Vulkan: command processor initialized");
+  REXLOG_INFO("Native Vulkan: command processor initialized ({}x{} scale)", draw_resolution_scale_x_,
+              draw_resolution_scale_y_);
   return true;
 }
 
@@ -514,6 +530,9 @@ bool NativeCommandProcessor::ReadTextures(const SpirvShader& shader, DrawInput& 
       if (!use_fallback) {
         input.system.texture_swizzled_signs[slot / 4] |= uint32_t(texture_util::SwizzleSigns(fetch))
                                                          << ((slot % 4) * 8);
+        if (texture.resolution_scaled) {
+          input.system.textures_resolution_scaled |= uint32_t(1) << slot;
+        }
       }
       indices[slot] = int(input.textures.size() - 1);
     }
@@ -823,6 +842,9 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
     return false;
   }
   const uint32_t address = base_page << 12;
+  const uint32_t scaled_width = texture.width * draw_resolution_scale_x_;
+  const uint32_t scaled_height = texture.height * draw_resolution_scale_y_;
+  const bool is_scaled = draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1;
   auto resolved = resolved_images_.find(address);
   if (cube && !mip_max && resolved != resolved_images_.end()) {
     // Some titles render each cube face as a separate small color target and
@@ -847,7 +869,8 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
       auto& entry = face_resolved->second;
       const auto face_extent = entry.image->extent();
       if (!CanUseResolvedCubeFace(texture.format == entry.image->format(), face_extent.width,
-                                  face_extent.height, texture.width, texture.height)) {
+                                  face_extent.height, scaled_width, scaled_height,
+                                  draw_resolution_scale_x_, draw_resolution_scale_y_)) {
         faces_usable = false;
         break;
       }
@@ -863,8 +886,11 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
       entry.last_use_submission = next_submission_;
     }
     if (faces_usable) {
+      texture.width = scaled_width;
+      texture.height = scaled_height;
+      texture.resolution_scaled = is_scaled;
       texture.swizzle = MakeTextureComponentMapping(fetch.swizzle, channel_count, *face_swap);
-      const ResolvedCubeKey cube_key{address, texture.width, texture.height, texture.format};
+      const ResolvedCubeKey cube_key{address, scaled_width, scaled_height, texture.format};
       std::shared_ptr<CachedTexture> entry;
       if (auto found = resolved_cubes_.find(cube_key); found != resolved_cubes_.end()) {
         entry = found->second.texture;
@@ -888,7 +914,7 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
           image.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
           image.imageType = VK_IMAGE_TYPE_2D;
           image.format = texture.format;
-          image.extent = {texture.width, texture.height, 1};
+          image.extent = {scaled_width, scaled_height, 1};
           image.mipLevels = 1;
           image.arrayLayers = kTextureCubeArrayLayers;
           image.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -942,8 +968,11 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
     const bool swap_red_blue =
         !depth_texture && reg::RB_COPY_DEST_INFO{resolved->second.dest_info}.copy_dest_swap != 0;
     const auto extent = resolved->second.image->extent();
-    if (extent.width == texture.width && extent.height == texture.height) {
+    if (extent.width == scaled_width && extent.height == scaled_height) {
       resolved->second.last_use_submission = next_submission_;
+      texture.width = scaled_width;
+      texture.height = scaled_height;
+      texture.resolution_scaled = is_scaled;
       texture.swizzle =
           MakeTextureComponentMapping(fetch.swizzle, channel_count, swap_red_blue);
       texture.resolved_image = resolved->second.image;
@@ -951,12 +980,18 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
     }
     // Resolves are 8x8-aligned, so the cached image can be up to one alignment
     // unit larger than the texture. Crop its top-left corner during the upload.
-    if (!CanCropAlignedResolve(extent.width, extent.height, texture.width, texture.height)) {
+    const uint32_t alignment = resolved->second.tiled_destination ? xenos::kTextureTileWidthHeight
+                                                                  : xenos::kResolveAlignmentPixels;
+    if (!CanCropAlignedResolve(extent.width, extent.height, scaled_width, scaled_height,
+                               draw_resolution_scale_x_, draw_resolution_scale_y_, alignment)) {
       return false;
     }
     resolved->second.last_use_submission = next_submission_;
+    texture.width = scaled_width;
+    texture.height = scaled_height;
+    texture.resolution_scaled = is_scaled;
     texture.swizzle = MakeTextureComponentMapping(fetch.swizzle, channel_count, swap_red_blue);
-    const ResolvedCropKey crop_key{address, texture.width, texture.height, texture.format};
+    const ResolvedCropKey crop_key{address, scaled_width, scaled_height, texture.format};
     std::shared_ptr<CachedTexture> entry;
     if (auto found = resolved_crops_.find(crop_key); found != resolved_crops_.end()) {
       entry = found->second.texture;
@@ -979,7 +1014,7 @@ bool NativeCommandProcessor::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fe
         VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         image.imageType = VK_IMAGE_TYPE_2D;
         image.format = texture.format;
-        image.extent = {texture.width, texture.height, 1};
+        image.extent = {scaled_width, scaled_height, 1};
         image.mipLevels = 1;
         image.arrayLayers = 1;
         image.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1413,10 +1448,15 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return false;
   }
   const auto& properties = vulkan_device_->properties();
-  draw_util::GetHostViewportInfo(regs, 1, 1, false, properties.maxViewportDimensions[0],
+  draw_util::GetHostViewportInfo(regs, draw_resolution_scale_x_, draw_resolution_scale_y_, false,
+                                 properties.maxViewportDimensions[0],
                                  properties.maxViewportDimensions[1], true, depth_control,
                                  float_depth, true, ps && ps->writes_depth(), input.viewport);
   draw_util::GetScissor(regs, input.scissor);
+  input.scissor.offset[0] *= draw_resolution_scale_x_;
+  input.scissor.offset[1] *= draw_resolution_scale_y_;
+  input.scissor.extent[0] *= draw_resolution_scale_x_;
+  input.scissor.extent[1] *= draw_resolution_scale_y_;
   if (!input.viewport.xy_extent[0] || !input.viewport.xy_extent[1] || !input.scissor.extent[0] ||
       !input.scissor.extent[1]) {
     return true;
@@ -1463,8 +1503,10 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     input.system.point_vertex_diameter_max = float(minmax.max_size) / 8.0f;
     input.system.point_constant_diameter[0] = float(size.width) / 8.0f;
     input.system.point_constant_diameter[1] = float(size.height) / 8.0f;
-    input.system.point_screen_diameter_to_ndc_radius[0] = 1.0f / float(input.viewport.xy_extent[0]);
-    input.system.point_screen_diameter_to_ndc_radius[1] = 1.0f / float(input.viewport.xy_extent[1]);
+    input.system.point_screen_diameter_to_ndc_radius[0] =
+        float(draw_resolution_scale_x_) / float(input.viewport.xy_extent[0]);
+    input.system.point_screen_diameter_to_ndc_radius[1] =
+        float(draw_resolution_scale_y_) / float(input.viewport.xy_extent[1]);
   }
   input.system.alpha_test_reference = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
   input.system.alpha_to_mask = color.alpha_to_mask_enable ? (color.value >> 24) | (1u << 8) : 0;
@@ -1962,13 +2004,19 @@ std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, ui
     targets_.erase(*victim);
   }
   const auto& properties = vulkan_device_->properties();
+  const uint32_t max_width = std::min(properties.maxImageDimension2D,
+                                      properties.maxFramebufferWidth);
   const uint32_t max_height = std::min(properties.maxImageDimension2D,
                                        properties.maxFramebufferHeight);
+  if (uint64_t(pitch) * draw_resolution_scale_x_ > max_width) {
+    return {};
+  }
   const uint32_t height =
-      GetTargetHeight(pitch, samples, ActiveEdramLayout().tile_count, max_height, is_64bpp);
+      GetTargetHeight(pitch, samples, ActiveEdramLayout().tile_count,
+                      max_height / draw_resolution_scale_y_, is_64bpp);
   auto image = std::make_shared<ColorImage>(*vulkan_device_);
-  if (!image->Initialize({pitch, height}, format, VkSampleCountFlagBits(1u << uint32_t(samples)),
-                         aspects)) {
+  if (!image->Initialize({pitch * draw_resolution_scale_x_, height * draw_resolution_scale_y_},
+                         format, VkSampleCountFlagBits(1u << uint32_t(samples)), aspects)) {
     return {};
   }
   // shortcut: separate host images, share overlapping tiles when ownership tracking is added.
@@ -1990,7 +2038,8 @@ bool NativeCommandProcessor::IssueCopy() {
   const auto& regs = *register_file_;
   const EdramLayout layout = ActiveEdramLayout();
   draw_util::ResolveInfo copy;
-  if (!draw_util::GetResolveInfo(regs, *memory_, 1, 1, false, false, layout, copy)) {
+  if (!draw_util::GetResolveInfo(regs, *memory_, draw_resolution_scale_x_,
+                                 draw_resolution_scale_y_, false, false, layout, copy)) {
     return false;
   }
   if (!copy.coordinate_info.width_div_8 || !copy.height_div_8) {
@@ -2007,7 +2056,8 @@ bool NativeCommandProcessor::IssueCopy() {
       return false;
     }
     const auto extent = depth->extent();
-    const auto rect = GetResolveRectangle(copy, layout, extent.width, extent.height, true);
+    const auto rect = GetResolveRectangle(copy, layout, extent.width, extent.height, true,
+                                          draw_resolution_scale_x_, draw_resolution_scale_y_);
     if (!rect) {
       return false;
     }
@@ -2081,31 +2131,87 @@ bool NativeCommandProcessor::IssueCopy() {
   }
   const auto source_extent = source->extent();
   const auto rect =
-      GetResolveRectangle(copy, layout, source_extent.width, source_extent.height, depth);
+      GetResolveRectangle(copy, layout, source_extent.width, source_extent.height, depth,
+                          draw_resolution_scale_x_, draw_resolution_scale_y_);
   if (!rect) {
     return false;
   }
   const VkExtent2D extent{rect->width, rect->height};
 
   const uint32_t dest_info = copy.copy_dest_info.value;
-  const uint32_t dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>().value;
+  const auto dest_pitch_reg = regs.Get<reg::RB_COPY_DEST_PITCH>();
+  const uint32_t dest_pitch = dest_pitch_reg.value;
+  const uint32_t guest_width =
+      uint32_t(copy.coordinate_info.width_div_8) << xenos::kResolveAlignmentPixelsLog2;
+  const uint32_t guest_height = copy.height_div_8 << xenos::kResolveAlignmentPixelsLog2;
+  const VkExtent2D target_extent = GetResolveDestinationExtent(
+      guest_width, guest_height, dest_pitch_reg.copy_dest_pitch,
+      dest_pitch_reg.copy_dest_height, draw_resolution_scale_x_, draw_resolution_scale_y_);
+  bool tiled_destination =
+      target_extent.width != extent.width || target_extent.height != extent.height;
   const bool has_offset = copy.copy_dest_x || copy.copy_dest_y;
   auto existing = resolved_images_.find(resolve_address);
   std::shared_ptr<ColorImage> destination;
   VkOffset2D destination_offset{};
+  uint32_t dest_resolve_address = resolve_address;
+  uint32_t dest_pitch_to_store = dest_pitch;
   if (existing != resolved_images_.end() && existing->second.image->format() == output_format) {
     const auto existing_extent = existing->second.image->extent();
-    if (!has_offset && existing_extent.width == extent.width &&
-        existing_extent.height == extent.height) {
+    if (!has_offset && existing_extent.width == target_extent.width &&
+        existing_extent.height == target_extent.height) {
       destination = existing->second.image;
-    } else if (has_offset && !depth && existing->second.image->initialized() &&
-               existing->second.dest_info == dest_info &&
-               existing->second.dest_pitch == dest_pitch) {
+    } else if (has_offset && existing->second.dest_info == dest_info &&
+               reg::RB_COPY_DEST_PITCH{existing->second.dest_pitch}.copy_dest_pitch ==
+                   dest_pitch_reg.copy_dest_pitch) {
       const auto placed =
-          GetCachedResolveRectangle(copy, existing_extent.width, existing_extent.height);
+          GetCachedResolveRectangle(copy, existing_extent.width, existing_extent.height,
+                                    draw_resolution_scale_x_, draw_resolution_scale_y_);
       if (placed) {
         destination = existing->second.image;
         destination_offset = {int32_t(placed->x), int32_t(placed->y)};
+        dest_pitch_to_store = existing->second.dest_pitch;
+        tiled_destination |= existing->second.tiled_destination;
+      }
+    }
+  }
+  if (!destination && dest_pitch_reg.copy_dest_pitch != 0) {
+    const uint32_t bpp_log2 = GetResolveBytesPerBlockLog2(output_format);
+    uint64_t best_version = 0;
+    for (const auto& [base_addr, entry] : resolved_images_) {
+      if (!entry.tiled_destination || base_addr >= resolve_address ||
+          entry.last_use_submission + 4 < next_submission_ ||
+          entry.image->format() != output_format || entry.dest_info != dest_info ||
+          reg::RB_COPY_DEST_PITCH{entry.dest_pitch}.copy_dest_pitch !=
+              dest_pitch_reg.copy_dest_pitch) {
+        continue;
+      }
+      uint32_t tile_x = 0;
+      uint32_t tile_y = 0;
+      const uint32_t delta = resolve_address - base_addr;
+      if (!TryGetTiledResolveOffset2D(delta, dest_pitch_reg.copy_dest_pitch, bpp_log2,
+                                      tile_x, tile_y)) {
+        continue;
+      }
+      if (texture_util::GetTiledOffset2D(int32_t(tile_x), int32_t(tile_y),
+                                         dest_pitch_reg.copy_dest_pitch, bpp_log2) !=
+          int32_t(delta)) {
+        continue;
+      }
+      const uint64_t dest_x = uint64_t(tile_x + copy.copy_dest_x) * draw_resolution_scale_x_;
+      const uint64_t dest_y = uint64_t(tile_y + copy.copy_dest_y) * draw_resolution_scale_y_;
+      const auto entry_extent = entry.image->extent();
+      if (dest_x > entry_extent.width || dest_y > entry_extent.height ||
+          extent.width > entry_extent.width - dest_x ||
+          extent.height > entry_extent.height - dest_y) {
+        continue;
+      }
+      if (!destination || entry.version > best_version) {
+        destination = entry.image;
+        destination_offset = {int32_t(dest_x), int32_t(dest_y)};
+        dest_resolve_address = base_addr;
+        dest_pitch_to_store = entry.dest_pitch;
+        tiled_destination = true;
+        best_version = entry.version;
       }
     }
   }
@@ -2133,7 +2239,7 @@ bool NativeCommandProcessor::IssueCopy() {
       resolved_images_.erase(*victim);
     }
     destination = std::make_shared<ColorImage>(*vulkan_device_);
-    if (!destination->Initialize(extent, output_format)) {
+    if (!destination->Initialize(target_extent, output_format)) {
       return false;
     }
   }
@@ -2143,10 +2249,11 @@ bool NativeCommandProcessor::IssueCopy() {
     return false;
   }
   resolved_images_.insert_or_assign(
-      resolve_address, CachedResolve{{destination, next_submission_},
-                                     dest_info,
-                                     dest_pitch,
-                                     next_resolve_version_++});
+      dest_resolve_address, CachedResolve{{destination, next_submission_},
+                                          dest_info,
+                                          dest_pitch_to_store,
+                                          next_resolve_version_++,
+                                          tiled_destination});
   const size_t resolve_index = pending_.size();
   pending_.emplace_back(
       QueuedResolve{std::move(source),
@@ -2188,15 +2295,50 @@ bool NativeCommandProcessor::ReadBackResolve(const draw_util::ResolveInfo& copy,
     return true;
   }
 
+  const bool scaled = draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1;
+  const VkExtent2D guest_extent{resolve.extent.width / draw_resolution_scale_x_,
+                                resolve.extent.height / draw_resolution_scale_y_};
+  if (scaled && (!cmd_blit_image_ || !guest_extent.width || !guest_extent.height)) {
+    return false;
+  }
+  std::optional<ColorImage> downsampled;
+  if (scaled) {
+    downsampled.emplace(*vulkan_device_);
+    if (!downsampled->Initialize(guest_extent, ColorImage::kFormat)) {
+      return false;
+    }
+  }
   auto readback = std::make_unique<ImageReadback>(*vulkan_device_);
-  if (!readback->Initialize({resolve.destination_offset, resolve.extent}) || !BeginCommands()) {
+  if (!readback->Initialize(scaled ? VkRect2D{{0, 0}, guest_extent}
+                                   : VkRect2D{resolve.destination_offset, resolve.extent}) ||
+      !BeginCommands()) {
     return false;
   }
   RecordPending();
   auto& image = *resolve.destination;
   image.Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-  const bool recorded = readback->Record(command_buffer_, image.image(), image.extent());
+  bool recorded = false;
+  if (scaled) {
+    downsampled->Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[0] = {resolve.destination_offset.x, resolve.destination_offset.y, 0};
+    blit.srcOffsets[1] = {resolve.destination_offset.x + int32_t(resolve.extent.width),
+                          resolve.destination_offset.y + int32_t(resolve.extent.height), 1};
+    blit.dstOffsets[0] = {0, 0, 0};
+    blit.dstOffsets[1] = {int32_t(guest_extent.width), int32_t(guest_extent.height), 1};
+    cmd_blit_image_(command_buffer_, image.image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    downsampled->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                    VK_FILTER_LINEAR);
+    downsampled->Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    recorded = readback->Record(command_buffer_, downsampled->image(), downsampled->extent());
+  } else {
+    recorded = readback->Record(command_buffer_, image.image(), image.extent());
+  }
   image.Transition(command_buffer_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                    VK_ACCESS_SHADER_READ_BIT);
@@ -2207,8 +2349,8 @@ bool NativeCommandProcessor::ReadBackResolve(const draw_util::ResolveInfo& copy,
   if (!RetireSubmission()) {
     return false;
   }
-  const ResolveRectangle rect{copy.copy_dest_x, copy.copy_dest_y, resolve.extent.width,
-                              resolve.extent.height};
+  const ResolveRectangle rect{copy.copy_dest_x, copy.copy_dest_y, guest_extent.width,
+                              guest_extent.height};
   const bool stored =
       recorded && StoreTiledResolveRgba8({memory_->TranslatePhysical(address), end - address},
                                          pitch, rect, copy.copy_dest_info.copy_dest_endian,
@@ -2327,7 +2469,7 @@ void NativeCommandProcessor::RecordResolve(const QueuedResolve& resolve) {
                                     VK_ACCESS_SHADER_WRITE_BIT);
     depth_resolve_->Record(command_buffer_, resolve.depth_descriptor, resolve.source->depth_view(),
                            resolve.destination->depth_view(),
-                           {resolve.source_offset, resolve.extent},
+                           {resolve.source_offset, resolve.extent}, resolve.destination_offset,
                            resolve.source->samples() != VK_SAMPLE_COUNT_1_BIT, resolve.depth_sample,
                            resolve.depth_scale);
     return;
@@ -2451,12 +2593,36 @@ bool NativeCommandProcessor::RetireSubmission() {
 
 void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t width, uint32_t height) {
   auto* presenter = graphics_system_->presenter();
-  const bool ready = presenter && width && height &&
+  const uint32_t scaled_width = width * draw_resolution_scale_x_;
+  const uint32_t scaled_height = height * draw_resolution_scale_y_;
+  std::optional<VkExtent2D> resolved_extent;
+  if (const auto resolved = resolved_images_.find(frontbuffer_ptr & (kPhysicalMemorySize - 1));
+      resolved != resolved_images_.end()) {
+    resolved_extent = resolved->second.image->extent();
+  }
+  const VkExtent2D output_extent =
+      GetSwapOutputExtent({scaled_width, scaled_height}, resolved_extent);
+  uint32_t display_width = width;
+  uint32_t display_height = height;
+  if (REXCVAR_GET(present_use_actual_aspect)) {
+    int32_t configured_width = 0;
+    int32_t configured_height = 0;
+    if (video_mode_util::TryParseResolutionPreset(REXCVAR_GET(resolution), configured_width,
+                                                  configured_height) &&
+        configured_width > 0 && configured_height > 0) {
+      display_width = uint32_t(configured_width);
+      display_height = uint32_t(configured_height);
+    } else {
+      display_width = output_extent.width;
+      display_height = output_extent.height;
+    }
+  }
+  const bool ready = presenter && output_extent.width && output_extent.height &&
                      presenter->RefreshGuestOutput(
-                         width, height, width, height,
-                         [this, width, height,
+                         output_extent.width, output_extent.height, display_width, display_height,
+                         [this, output_extent,
                           frontbuffer_ptr](ui::Presenter::GuestOutputRefreshContext& context) {
-                           return RenderGuestOutput(context, {width, height}, frontbuffer_ptr);
+                           return RenderGuestOutput(context, output_extent, frontbuffer_ptr);
                          });
   const bool fresh = ready && presented_ && presented_->TakeResolvedOutput();
   if (!frame_timing_.is_open()) {
@@ -2466,7 +2632,7 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t width,
   const FrameTiming timing{
       guest_frame_count(),
       frontbuffer_ptr,
-      {width, height},
+      output_extent,
       duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count()};
   if (!ready) {
     LogFrameTiming(timing, "refresh_failed");
@@ -2629,8 +2795,8 @@ bool NativeCommandProcessor::RenderGuestOutput(ui::Presenter::GuestOutputRefresh
                        resolved->second.image->format() == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
   if (resolved != resolved_images_.end() && resolved->second.image->initialized() &&
       (resolved->second.image->format() == ColorImage::kFormat || use_pwl) &&
-      resolved->second.image->extent().width == extent.width &&
-      resolved->second.image->extent().height == extent.height) {
+      resolved->second.image->extent().width >= extent.width &&
+      resolved->second.image->extent().height >= extent.height) {
     presented_ = resolved->second.image;
     resolved->second.last_use_submission = next_submission_;
     presented_resolve_address_ = resolved->first;

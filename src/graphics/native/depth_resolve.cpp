@@ -9,6 +9,7 @@ namespace {
 
 struct ResolveConstants {
   VkOffset2D source_offset;
+  VkOffset2D destination_offset;
   VkExtent2D extent;
   uint32_t sample;
   float scale;
@@ -71,8 +72,9 @@ bool DepthResolve::Initialize() {
 }
 
 void DepthResolve::Record(VkCommandBuffer commands, size_t descriptor, VkImageView source,
-                          VkImageView destination, VkRect2D rectangle, bool multisample,
-                          uint32_t sample, float scale) {
+                          VkImageView destination, VkRect2D rectangle,
+                          VkOffset2D destination_offset, bool multisample, uint32_t sample,
+                          float scale) {
   const auto& vk = device_.functions();
   const auto set = descriptors_->Get(descriptor);
   const VkDescriptorImageInfo src{sampler_, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -87,7 +89,8 @@ void DepthResolve::Record(VkCommandBuffer commands, size_t descriptor, VkImageVi
   vk.vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[multisample]);
   vk.vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &set,
                              0, nullptr);
-  const ResolveConstants constants{rectangle.offset, rectangle.extent, sample, scale};
+  const ResolveConstants constants{rectangle.offset, destination_offset, rectangle.extent, sample,
+                                   scale};
   vk.vkCmdPushConstants(commands, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                         sizeof(constants), &constants);
   vk.vkCmdDispatch(commands, (rectangle.extent.width + 7) / 8, (rectangle.extent.height + 7) / 8,

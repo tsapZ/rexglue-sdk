@@ -79,6 +79,7 @@ struct DrawTexture {
   // Whether this draw must copy `levels` into the cached image. False when the
   // image was already uploaded by an earlier draw in the same batch.
   bool upload_cached = false;
+  bool resolution_scaled = false;
 };
 
 struct DrawInput {

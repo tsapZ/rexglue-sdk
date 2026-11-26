@@ -16,8 +16,8 @@ class DepthResolve {
   size_t Allocate() { return descriptors_->Allocate(); }
   void Free(size_t descriptor) { descriptors_->Free(descriptor); }
   void Record(VkCommandBuffer commands, size_t descriptor, VkImageView source,
-              VkImageView destination, VkRect2D rectangle, bool multisample, uint32_t sample,
-              float scale);
+              VkImageView destination, VkRect2D rectangle, VkOffset2D destination_offset,
+              bool multisample, uint32_t sample, float scale);
 
  private:
   const ui::vulkan::VulkanDevice& device_;

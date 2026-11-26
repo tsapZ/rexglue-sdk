@@ -285,10 +285,12 @@ constexpr bool ShouldUseFallbackTexture(bool fetch_is_texture, bool has_base_lev
 // one alignment unit wider and taller than the texture that samples it. Such a
 // resolve can be cropped from its top-left corner instead of being rejected.
 constexpr bool CanCropAlignedResolve(uint32_t cached_width, uint32_t cached_height,
-                                     uint32_t requested_width, uint32_t requested_height) {
+                                     uint32_t requested_width, uint32_t requested_height,
+                                     uint32_t scale_x = 1, uint32_t scale_y = 1,
+                                     uint32_t alignment = xenos::kResolveAlignmentPixels) {
   return cached_width >= requested_width && cached_height >= requested_height &&
-         cached_width - requested_width < xenos::kResolveAlignmentPixels &&
-         cached_height - requested_height < xenos::kResolveAlignmentPixels;
+         cached_width - requested_width < alignment * scale_x &&
+         cached_height - requested_height < alignment * scale_y;
 }
 
 // Cube textures are hosted as a cube-compatible image with all six faces as
@@ -327,9 +329,10 @@ constexpr uint32_t GetResolvedCubeFaceAddress(uint32_t base, uint32_t array_slic
 // exactly like a 2D resolve crop.
 constexpr bool CanUseResolvedCubeFace(bool format_matches, uint32_t face_width,
                                       uint32_t face_height, uint32_t texture_width,
-                                      uint32_t texture_height) {
-  return format_matches &&
-         CanCropAlignedResolve(face_width, face_height, texture_width, texture_height);
+                                      uint32_t texture_height, uint32_t scale_x = 1,
+                                      uint32_t scale_y = 1) {
+  return format_matches && CanCropAlignedResolve(face_width, face_height, texture_width,
+                                                 texture_height, scale_x, scale_y);
 }
 
 // A cached GPU-resolved cube only needs to re-copy its six faces when it has
@@ -627,12 +630,15 @@ std::optional<typename EntryMap::key_type> SelectRetiredEviction(
 // Place a resolve in the cached image at its absolute guest texture coordinates.
 inline std::optional<ResolveRectangle> GetCachedResolveRectangle(const draw_util::ResolveInfo& copy,
                                                                  uint32_t image_width,
-                                                                 uint32_t image_height) {
-  const uint32_t width = uint32_t(copy.coordinate_info.width_div_8)
-                         << xenos::kResolveAlignmentPixelsLog2;
-  const uint32_t height = copy.height_div_8 << xenos::kResolveAlignmentPixelsLog2;
-  const uint32_t x = copy.copy_dest_x;
-  const uint32_t y = copy.copy_dest_y;
+                                                                 uint32_t image_height,
+                                                                 uint32_t scale_x = 1,
+                                                                 uint32_t scale_y = 1) {
+  const uint32_t width = (uint32_t(copy.coordinate_info.width_div_8)
+                          << xenos::kResolveAlignmentPixelsLog2) *
+                         scale_x;
+  const uint32_t height = (copy.height_div_8 << xenos::kResolveAlignmentPixelsLog2) * scale_y;
+  const uint32_t x = copy.copy_dest_x * scale_x;
+  const uint32_t y = copy.copy_dest_y * scale_y;
   if (!width || !height || x > image_width || y > image_height || width > image_width - x ||
       height > image_height - y) {
     return std::nullopt;
@@ -642,7 +648,9 @@ inline std::optional<ResolveRectangle> GetCachedResolveRectangle(const draw_util
 
 inline std::optional<ResolveRectangle> GetResolveRectangle(const draw_util::ResolveInfo& copy,
                                                            EdramLayout layout, uint32_t width,
-                                                           uint32_t height, bool depth = false) {
+                                                           uint32_t height, bool depth = false,
+                                                           uint32_t scale_x = 1,
+                                                           uint32_t scale_y = 1) {
   const auto& target = depth ? copy.depth_edram_info : copy.color_edram_info;
   const uint32_t pitch = target.pitch_tiles;
   if (!pitch) {
@@ -658,14 +666,87 @@ inline std::optional<ResolveRectangle> GetResolveRectangle(const draw_util::Reso
   const uint32_t tile_height =
       xenos::kEdramTileHeightSamples >> (target.msaa_samples >= xenos::MsaaSamples::k2X);
   const ResolveRectangle rect{
-      tiles % pitch * tile_width + copy.coordinate_info.edram_offset_x_div_8 * 8,
-      tiles / pitch * tile_height + copy.coordinate_info.edram_offset_y_div_8 * 8,
-      uint32_t(copy.coordinate_info.width_div_8) * 8, copy.height_div_8 * 8};
+      (tiles % pitch * tile_width + copy.coordinate_info.edram_offset_x_div_8 * 8) * scale_x,
+      (tiles / pitch * tile_height + copy.coordinate_info.edram_offset_y_div_8 * 8) * scale_y,
+      uint32_t(copy.coordinate_info.width_div_8) * 8 * scale_x,
+      copy.height_div_8 * 8 * scale_y};
   if (rect.x > width || rect.y > height || !rect.width || !rect.height ||
       rect.width > width - rect.x || rect.height > height - rect.y) {
     return std::nullopt;
   }
   return rect;
+}
+
+// Destination image extent for a resolve: a single-pass resolve uses the
+// resolve rectangle directly (preserving 8px alignment for crop checks),
+// while a predicated-tiling pass whose destination surface is at least one
+// 32px texture tile wider or taller than the first strip allocates the full
+// destination surface so subsequent strips land inside the same image.
+constexpr VkExtent2D GetResolveDestinationExtent(uint32_t guest_width, uint32_t guest_height,
+                                                 uint32_t copy_dest_pitch,
+                                                 uint32_t copy_dest_height, uint32_t scale_x = 1,
+                                                 uint32_t scale_y = 1) {
+  const uint32_t width = copy_dest_pitch >= guest_width + xenos::kTextureTileWidthHeight
+                             ? copy_dest_pitch
+                             : guest_width;
+  const uint32_t height = copy_dest_height >= guest_height + xenos::kTextureTileWidthHeight
+                              ? copy_dest_height
+                              : guest_height;
+  return {width * scale_x, height * scale_y};
+}
+
+constexpr uint32_t GetResolveBytesPerBlockLog2(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R8_UNORM:
+      return 0;
+    case VK_FORMAT_R8G8_UNORM:
+      return 1;
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+      return 3;
+    default:
+      return 2;
+  }
+}
+
+// Exact inverse of texture_util::GetTiledOffset2D for 32x32 macro-tile origins
+// (x and y multiples of 32). Returns false when delta_bytes is not a valid
+// 32x32 macro-tile byte offset for pitch and bytes_per_block_log2.
+constexpr bool TryGetTiledResolveOffset2D(uint32_t delta_bytes, uint32_t pitch,
+                                          uint32_t bytes_per_block_log2, uint32_t& x_out,
+                                          uint32_t& y_out) {
+  if (!pitch || bytes_per_block_log2 > 4 || (delta_bytes & 0x8FFu) != 0) {
+    return false;
+  }
+  const uint32_t aligned_pitch =
+      (pitch + (xenos::kTextureTileWidthHeight - 1)) & ~(xenos::kTextureTileWidthHeight - 1);
+  const uint32_t tiles_per_row = aligned_pitch >> xenos::kTextureTileWidthHeightLog2;
+  if (!tiles_per_row) {
+    return false;
+  }
+  const uint32_t macro = ((delta_bytes >> 3) & ~0x1FFu) | ((delta_bytes >> 2) & 0x1C0u);
+  const uint32_t shift = bytes_per_block_log2 + 7;
+  if ((macro & ((1u << shift) - 1)) != 0) {
+    return false;
+  }
+  const uint32_t tile_index = macro >> shift;
+  x_out = (tile_index % tiles_per_row) << xenos::kTextureTileWidthHeightLog2;
+  y_out = (tile_index / tiles_per_row) << xenos::kTextureTileWidthHeightLog2;
+  return true;
+}
+
+// Active swap output extent: clamp the scaled swap packet extent to the
+// resolved frontbuffer image so 8px-padded resolves (e.g. 900p -> 904,
+// 1080p -> 1088) crop cleanly and smaller guest frontbuffers still present.
+constexpr VkExtent2D GetSwapOutputExtent(VkExtent2D requested,
+                                         std::optional<VkExtent2D> resolved) {
+  if (!requested.width || !requested.height) {
+    return {};
+  }
+  if (!resolved || !resolved->width || !resolved->height) {
+    return requested;
+  }
+  return {std::min(requested.width, resolved->width),
+          std::min(requested.height, resolved->height)};
 }
 
 }  // namespace rex::graphics::native

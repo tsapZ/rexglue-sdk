@@ -9,6 +9,7 @@ layout(set = 0, binding = 0) uniform sampler2D source_depth;
 layout(r32f, set = 0, binding = 1) uniform writeonly image2D destination;
 layout(push_constant) uniform Resolve {
   ivec2 source_offset;
+  ivec2 destination_offset;
   ivec2 extent;
   int sample_index;
   float depth_scale;
@@ -25,5 +26,5 @@ void main() {
 #else
   float depth = texelFetch(source_depth, source, 0).r;
 #endif
-  imageStore(destination, pixel, vec4(depth * resolve.depth_scale, 0, 0, 1));
+  imageStore(destination, resolve.destination_offset + pixel, vec4(depth * resolve.depth_scale, 0, 0, 1));
 }

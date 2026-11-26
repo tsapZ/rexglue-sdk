@@ -850,3 +850,134 @@ TEST_CASE("Native invalidation widening respects protected texture pages", "[gpu
   CHECK(end_clamped.first == native::kPhysicalMemorySize - 4096u);
   CHECK(end_clamped.second == 4096u);
 }
+
+TEST_CASE("Native draw resolution scale rect and crop helpers", "[gpu][native]") {
+  CHECK(native::CanCropAlignedResolve(3840, 2160, 3840 - 3, 2160 - 3, 3, 3));
+  CHECK_FALSE(native::CanCropAlignedResolve(3840, 2160, 3840 - 24, 2160, 3, 3));
+  CHECK(native::CanUseResolvedCubeFace(true, 384, 384, 384 - 9, 384 - 9, 3, 3));
+  CHECK_FALSE(native::CanUseResolvedCubeFace(true, 384, 384, 384 - 24, 384, 3, 3));
+
+  draw_util::ResolveInfo copy{};
+  copy.color_original_base = 0;
+  copy.color_edram_info.base_tiles = 0;
+  copy.color_edram_info.pitch_tiles = 16;
+  copy.color_edram_info.msaa_samples = xenos::MsaaSamples::k1X;
+  copy.color_edram_info.format = uint32_t(xenos::ColorRenderTargetFormat::k_8_8_8_8);
+  copy.coordinate_info.edram_offset_x_div_8 = 1;
+  copy.coordinate_info.edram_offset_y_div_8 = 1;
+  copy.coordinate_info.width_div_8 = 160;
+  copy.height_div_8 = 90;
+  copy.copy_dest_x = 16;
+  copy.copy_dest_y = 24;
+
+  const EdramLayout layout{};
+  const auto rect = native::GetResolveRectangle(copy, layout, 3864, 2184, false, 3, 3);
+  REQUIRE(rect.has_value());
+  CHECK(rect->x == 24u);
+  CHECK(rect->y == 24u);
+  CHECK(rect->width == 3840u);
+  CHECK(rect->height == 2160u);
+  CHECK_FALSE(native::GetResolveRectangle(copy, layout, 3840, 2160, false, 3, 3).has_value());
+  CHECK_FALSE(native::GetResolveRectangle(copy, layout, 3864, 2184, false, 4, 4).has_value());
+
+  const auto cached = native::GetCachedResolveRectangle(copy, 3888, 2232, 3, 3);
+  REQUIRE(cached.has_value());
+  CHECK(cached->x == 48u);
+  CHECK(cached->y == 72u);
+  CHECK(cached->width == 3840u);
+  CHECK(cached->height == 2160u);
+  CHECK_FALSE(native::GetCachedResolveRectangle(copy, 3840, 2160, 3, 3).has_value());
+
+  const auto swap_720p =
+      native::GetSwapOutputExtent({1280u, 720u}, VkExtent2D{1280u, 720u});
+  CHECK(swap_720p.width == 1280u);
+  CHECK(swap_720p.height == 720u);
+
+  const auto swap_900p =
+      native::GetSwapOutputExtent({1600u, 900u}, VkExtent2D{1600u, 904u});
+  CHECK(swap_900p.width == 1600u);
+  CHECK(swap_900p.height == 900u);
+
+  const auto swap_1080p_padded =
+      native::GetSwapOutputExtent({1920u, 1080u}, VkExtent2D{1920u, 1088u});
+  CHECK(swap_1080p_padded.width == 1920u);
+  CHECK(swap_1080p_padded.height == 1080u);
+
+  const auto swap_1080p_small_fb =
+      native::GetSwapOutputExtent({1920u, 1080u}, VkExtent2D{1280u, 720u});
+  CHECK(swap_1080p_small_fb.width == 1280u);
+  CHECK(swap_1080p_small_fb.height == 720u);
+
+  const auto swap_1440p =
+      native::GetSwapOutputExtent({2560u, 1440u}, VkExtent2D{2560u, 1440u});
+  CHECK(swap_1440p.width == 2560u);
+  CHECK(swap_1440p.height == 1440u);
+
+  const auto swap_1800p =
+      native::GetSwapOutputExtent({3200u, 1800u}, VkExtent2D{3200u, 1808u});
+  CHECK(swap_1800p.width == 3200u);
+  CHECK(swap_1800p.height == 1800u);
+
+  const auto swap_4k =
+      native::GetSwapOutputExtent({3840u, 2160u}, VkExtent2D{3840u, 2160u});
+  CHECK(swap_4k.width == 3840u);
+  CHECK(swap_4k.height == 2160u);
+
+  const auto single_720p = native::GetResolveDestinationExtent(1280, 720, 1280, 736, 1, 1);
+  CHECK(single_720p.width == 1280u);
+  CHECK(single_720p.height == 720u);
+
+  const auto single_crop = native::GetResolveDestinationExtent(504, 304, 512, 320, 1, 1);
+  CHECK(single_crop.width == 504u);
+  CHECK(single_crop.height == 304u);
+
+  const auto tiled_1080p_2x = native::GetResolveDestinationExtent(544, 1080, 1920, 1088, 2, 2);
+  CHECK(tiled_1080p_2x.width == 3840u);
+  CHECK(tiled_1080p_2x.height == 2160u);
+
+  const auto tiled_1080p_3x = native::GetResolveDestinationExtent(544, 1080, 1920, 1088, 3, 3);
+  CHECK(tiled_1080p_3x.width == 5760u);
+  CHECK(tiled_1080p_3x.height == 3240u);
+
+  const auto tiled_horiz = native::GetResolveDestinationExtent(1920, 544, 1920, 1088, 1, 1);
+  CHECK(tiled_horiz.width == 1920u);
+  CHECK(tiled_horiz.height == 1088u);
+  CHECK(native::CanCropAlignedResolve(1920, 1088, 1920, 1080, 1, 1,
+                                      xenos::kTextureTileWidthHeight));
+}
+
+TEST_CASE("Native tiled resolve offset inverse matches GetTiledOffset2D", "[gpu][native]") {
+  CHECK(native::GetResolveBytesPerBlockLog2(VK_FORMAT_R8_UNORM) == 0u);
+  CHECK(native::GetResolveBytesPerBlockLog2(VK_FORMAT_R8G8_UNORM) == 1u);
+  CHECK(native::GetResolveBytesPerBlockLog2(VK_FORMAT_R8G8B8A8_UNORM) == 2u);
+  CHECK(native::GetResolveBytesPerBlockLog2(VK_FORMAT_A2B10G10R10_UNORM_PACK32) == 2u);
+  CHECK(native::GetResolveBytesPerBlockLog2(VK_FORMAT_R32_SFLOAT) == 2u);
+  CHECK(native::GetResolveBytesPerBlockLog2(VK_FORMAT_R16G16B16A16_SFLOAT) == 3u);
+
+  const std::array<std::pair<uint32_t, uint32_t>, 7> coords{
+      {{0, 0}, {32, 0}, {544, 0}, {1088, 0}, {1632, 0}, {0, 544}, {640, 320}}};
+  for (uint32_t bpp_log2 = 0; bpp_log2 <= 3; ++bpp_log2) {
+    for (uint32_t pitch : {1920u, 1904u}) {
+      for (const auto& [expected_x, expected_y] : coords) {
+        const uint32_t delta = uint32_t(texture_util::GetTiledOffset2D(
+            int32_t(expected_x), int32_t(expected_y), pitch, bpp_log2));
+        uint32_t x = 0;
+        uint32_t y = 0;
+        REQUIRE(native::TryGetTiledResolveOffset2D(delta, pitch, bpp_log2, x, y));
+        CHECK(x == expected_x);
+        CHECK(y == expected_y);
+      }
+    }
+  }
+
+  uint32_t x = 0;
+  uint32_t y = 0;
+  CHECK_FALSE(native::TryGetTiledResolveOffset2D(0u, 0u, 2u, x, y));
+  CHECK_FALSE(native::TryGetTiledResolveOffset2D(0u, 1920u, 5u, x, y));
+  CHECK_FALSE(native::TryGetTiledResolveOffset2D(0x1u, 1920u, 2u, x, y));
+  CHECK_FALSE(native::TryGetTiledResolveOffset2D(0x100u, 1920u, 2u, x, y));
+  CHECK_FALSE(native::TryGetTiledResolveOffset2D(0x800u, 1920u, 2u, x, y));
+  CHECK_FALSE(native::TryGetTiledResolveOffset2D(0x200u, 1920u, 1u, x, y));
+  CHECK_FALSE(native::TryGetTiledResolveOffset2D(0x400u, 1920u, 2u, x, y));
+  CHECK_FALSE(native::TryGetTiledResolveOffset2D(0x1000u, 1920u, 3u, x, y));
+}
