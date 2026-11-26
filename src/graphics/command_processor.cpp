@@ -415,11 +415,16 @@ void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cach
                                                uint32_t title_id, bool blocking) {}
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
-  if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
-    fn();
-  } else {
-    pending_fns_.push(std::move(fn));
+  {
+    std::lock_guard lock(pending_fns_mutex_);
+    if (!pending_fns_.empty() || !system::XThread::IsInThread(worker_thread_.get())) {
+      pending_fns_.push(std::move(fn));
+      has_pending_fns_.store(true, std::memory_order_release);
+      write_ptr_index_event_->Set();
+      return;
+    }
   }
+  fn();
 }
 
 void CommandProcessor::ClearCaches() {}
@@ -583,9 +588,14 @@ void CommandProcessor::WorkerThreadMain() {
   }
 
   while (worker_running_) {
-    while (!pending_fns_.empty()) {
-      auto fn = std::move(pending_fns_.front());
-      pending_fns_.pop();
+    while (has_pending_fns_.load(std::memory_order_acquire)) {
+      std::function<void()> fn;
+      {
+        std::lock_guard lock(pending_fns_mutex_);
+        fn = std::move(pending_fns_.front());
+        pending_fns_.pop();
+        has_pending_fns_.store(!pending_fns_.empty(), std::memory_order_release);
+      }
       fn();
     }
     if (HasReadBackRequest()) {
@@ -595,26 +605,19 @@ void CommandProcessor::WorkerThreadMain() {
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
-      // We've run out of commands to execute.
-      // We spin here waiting for new ones, as the overhead of waiting on our
-      // event is too high.
       PrepareForWait();
-      uint32_t loop_count = 0;
-      do {
-        // If we spin around too much, revert to a "low-power" state.
-        if (loop_count > 500) {
-          const int wait_time_ms = 5;
-          rex::thread::Wait(write_ptr_index_event_.get(), true,
-                            std::chrono::milliseconds(wait_time_ms));
-        }
-
-        rex::thread::MaybeYield();
-        loop_count++;
+      // Commands, host callbacks, readback and shutdown each signal the event.
+      // Keep the Windows alertable wait. This host worker can use a plain
+      // wait on POSIX, where alertable waits poll for guest APCs.
+      while (worker_running_ && !has_pending_fns_.load(std::memory_order_acquire) &&
+             !HasReadBackRequest() &&
+             (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index)) {
+        rex::thread::Wait(write_ptr_index_event_.get(), REX_PLATFORM_WIN32);
         write_ptr_index = write_ptr_index_.load();
-      } while (worker_running_ && pending_fns_.empty() && !HasReadBackRequest() &&
-               (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+      }
       ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty() || HasReadBackRequest()) {
+      if (!worker_running_ || has_pending_fns_.load(std::memory_order_acquire) ||
+          HasReadBackRequest()) {
         continue;
       }
     }
