@@ -84,22 +84,16 @@ bool ColorImage::Initialize(VkExtent2D extent, VkFormat format, VkSampleCountFla
   info.arrayLayers = array_layers;
   info.samples = samples;
   info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-  if (aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
-    info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                  VK_IMAGE_USAGE_SAMPLED_BIT;
-  } else {
-    info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-  }
   // Compute resolves write single-sample color images as storage images.
+  bool storage_supported = false;
   if ((aspects & VK_IMAGE_ASPECT_COLOR_BIT) && samples == VK_SAMPLE_COUNT_1_BIT) {
     VkFormatProperties format_properties{};
     device_.vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
         device_.physical_device(), format, &format_properties);
-    if (format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
-      info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-    }
+    storage_supported =
+        (format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
   }
+  info.usage = GetColorImageUsage(aspects, storage_supported);
   if (!CreateDeviceImage(device_, allocator_, info, image_, memory_, allocation_)) {
     return false;
   }

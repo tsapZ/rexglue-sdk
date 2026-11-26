@@ -1188,9 +1188,10 @@ TEST_CASE("Native draw state tracking elides redundant binds", "[gpu][native]") 
                                                state.stencil_reference_valid, {3, 2}) == 1);
 
   const VkBuffer buffer = handle(VkBuffer{}, 0x50);
-  CHECK(state.SetIndexBuffer(buffer, 64));
-  CHECK_FALSE(state.SetIndexBuffer(buffer, 64));
-  CHECK(state.SetIndexBuffer(buffer, 128));
+  CHECK(state.SetIndexBuffer(buffer, 64, VK_INDEX_TYPE_UINT32));
+  CHECK_FALSE(state.SetIndexBuffer(buffer, 64, VK_INDEX_TYPE_UINT32));
+  CHECK(state.SetIndexBuffer(buffer, 128, VK_INDEX_TYPE_UINT32));
+  CHECK(state.SetIndexBuffer(buffer, 128, VK_INDEX_TYPE_UINT16));
 }
 
 TEST_CASE("Native samplers normalize guest address, anisotropy and filtering", "[gpu][native]") {
@@ -1406,4 +1407,127 @@ TEST_CASE("Native pipeline cache files are validated before merging", "[gpu][nat
   auto corrupt = file;
   corrupt.back() ^= 0xFF;
   CHECK(native::GetPipelineCacheFileData(corrupt, 0x10DE, 0x2684, uuid).empty());
+}
+
+TEST_CASE("Native color and depth images include transfer-source usage", "[gpu][native]") {
+  const VkImageUsageFlags color_usage =
+      native::GetColorImageUsage(VK_IMAGE_ASPECT_COLOR_BIT, true);
+  CHECK((color_usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0);
+  CHECK((color_usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0);
+  CHECK((color_usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0);
+  CHECK((color_usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0);
+
+  const VkImageUsageFlags depth_usage =
+      native::GetColorImageUsage(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, false);
+  CHECK((depth_usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0);
+  CHECK((depth_usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0);
+  CHECK((depth_usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0);
+  CHECK((depth_usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0);
+}
+
+TEST_CASE("Native inline 2D tiling and block swap match reference", "[gpu][native]") {
+  for (uint32_t bpb_log2 = 0; bpb_log2 <= 4; ++bpb_log2) {
+    for (uint32_t pitch : {32u, 64u, 96u, 160u}) {
+      for (int32_t y : {0, 1, 7, 15, 16, 31, 32, 47}) {
+        for (int32_t x : {0, 1, 3, 7, 8, 15, 31, 32, 63}) {
+          CHECK(native::GetTiledOffset2DInline(x, y, pitch, bpb_log2) ==
+                texture_util::GetTiledOffset2D(x, y, pitch, bpb_log2));
+        }
+      }
+    }
+  }
+
+  std::array<uint8_t, 32> src{};
+  for (size_t i = 0; i < src.size(); ++i) {
+    src[i] = uint8_t(i + 1);
+  }
+  auto check_swap = [&](auto tag_bs, auto tag_sw, uint32_t offset) {
+    constexpr uint32_t bs = decltype(tag_bs)::value;
+    constexpr size_t sw = decltype(tag_sw)::value;
+    std::array<uint8_t, bs> got{};
+    std::array<uint8_t, bs> ref{};
+    native::CopySwapBlock<bs, sw>(src.data(), offset, got.data());
+    for (uint32_t i = 0; i < bs; ++i) {
+      ref[i] = src[(offset + i) ^ sw];
+    }
+    CHECK(got == ref);
+  };
+  for (size_t off1 = 0; off1 < 8; ++off1) {
+    check_swap(std::integral_constant<uint32_t, 1>{}, std::integral_constant<size_t, 0>{}, off1);
+    check_swap(std::integral_constant<uint32_t, 1>{}, std::integral_constant<size_t, 1>{}, off1);
+    check_swap(std::integral_constant<uint32_t, 1>{}, std::integral_constant<size_t, 2>{}, off1);
+    check_swap(std::integral_constant<uint32_t, 1>{}, std::integral_constant<size_t, 3>{}, off1);
+  }
+  for (uint32_t off2 : {0u, 2u, 4u, 6u}) {
+    check_swap(std::integral_constant<uint32_t, 2>{}, std::integral_constant<size_t, 0>{}, off2);
+    check_swap(std::integral_constant<uint32_t, 2>{}, std::integral_constant<size_t, 1>{}, off2);
+    check_swap(std::integral_constant<uint32_t, 2>{}, std::integral_constant<size_t, 2>{}, off2);
+    check_swap(std::integral_constant<uint32_t, 2>{}, std::integral_constant<size_t, 3>{}, off2);
+  }
+  for (uint32_t off4 : {0u, 4u}) {
+    check_swap(std::integral_constant<uint32_t, 4>{}, std::integral_constant<size_t, 0>{}, off4);
+    check_swap(std::integral_constant<uint32_t, 4>{}, std::integral_constant<size_t, 1>{}, off4);
+    check_swap(std::integral_constant<uint32_t, 4>{}, std::integral_constant<size_t, 2>{}, off4);
+    check_swap(std::integral_constant<uint32_t, 4>{}, std::integral_constant<size_t, 3>{}, off4);
+    check_swap(std::integral_constant<uint32_t, 8>{}, std::integral_constant<size_t, 3>{}, off4);
+    check_swap(std::integral_constant<uint32_t, 16>{}, std::integral_constant<size_t, 3>{}, off4);
+  }
+}
+
+TEST_CASE("Native EDRAM tile interval splicing tracks ownership and splits", "[gpu][native]") {
+  std::vector<native::TileRun> runs;
+  struct Overwrite {
+    uint64_t prev_owner;
+    uint32_t start;
+    uint32_t end;
+  };
+  std::vector<Overwrite> overwrites;
+  auto claim = [&](uint32_t start, uint32_t end, uint64_t owner, uint32_t base,
+                   bool scaled = true) {
+    overwrites.clear();
+    return native::SpliceTileRun(
+        runs,
+        native::TileRun{start, end, owner, base, 16, xenos::MsaaSamples::k1X,
+                        VK_FORMAT_R8G8B8A8_UNORM, false, scaled},
+        [&](const native::TileRun& prev, uint32_t s, uint32_t e) {
+          overwrites.push_back({prev.owner_id, s, e});
+        });
+  };
+  CHECK(claim(0, 100, 1, 0));
+  CHECK(runs.size() == 1);
+  // Same owner/attributes is a no-op.
+  CHECK_FALSE(claim(10, 50, 1, 0));
+  // Split middle with owner 2.
+  CHECK(claim(20, 60, 2, 20));
+  REQUIRE(runs.size() == 3);
+  CHECK(runs[0].start == 0);
+  CHECK(runs[0].end == 20);
+  CHECK(runs[0].owner_id == 1);
+  CHECK(runs[1].start == 20);
+  CHECK(runs[1].end == 60);
+  CHECK(runs[1].owner_id == 2);
+  CHECK(runs[2].start == 60);
+  CHECK(runs[2].end == 100);
+  CHECK(runs[2].owner_id == 1);
+  REQUIRE(overwrites.size() == 1);
+  CHECK(overwrites[0].prev_owner == 1);
+  CHECK(overwrites[0].start == 20);
+  CHECK(overwrites[0].end == 60);
+
+  // Reclaim across the gap with owner 1, base 0 -> merges all 3 back into 1!
+  CHECK(claim(20, 60, 1, 0));
+  CHECK(runs.size() == 1);
+  CHECK(runs[0].start == 0);
+  CHECK(runs[0].end == 100);
+  CHECK(runs[0].owner_id == 1);
+}
+
+TEST_CASE("Native draw_resolution_scale_threshold classifies pitches", "[gpu][native]") {
+  using xenos::MsaaSamples;
+  CHECK_FALSE(native::IsDrawScaleNativeForPitch(640, MsaaSamples::k1X, 0, 2, 2));
+  CHECK_FALSE(native::IsDrawScaleNativeForPitch(640, MsaaSamples::k1X, 640, 1, 1));
+  CHECK(native::IsDrawScaleNativeForPitch(640, MsaaSamples::k1X, 640, 2, 2));
+  CHECK(native::IsDrawScaleNativeForPitch(640, MsaaSamples::k2X, 640, 3, 3));
+  CHECK_FALSE(native::IsDrawScaleNativeForPitch(1280, MsaaSamples::k1X, 640, 2, 2));
+  CHECK_FALSE(native::IsDrawScaleNativeForPitch(641, MsaaSamples::k1X, 640, 2, 2));
 }

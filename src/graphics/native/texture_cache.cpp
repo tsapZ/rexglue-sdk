@@ -211,7 +211,9 @@ void NativeTextureCache::RecordNullTextureInitialization(VkCommandBuffer command
   null_textures_initialized_ = true;
 }
 
-bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, DrawInput& input) {
+bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, DrawInput& input,
+                                      ui::vulkan::VulkanUploadBufferPool* uploads,
+                                      uint64_t submission) {
   const auto& textures = shader.GetTextureBindingsAfterTranslation();
   const auto& samplers = shader.GetSamplerBindingsAfterTranslation();
   const auto& properties = device_.properties();
@@ -224,7 +226,7 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, Dr
   const auto read = [&](uint32_t slot, const xenos::xe_gpu_texture_fetch_t& fetch,
                         bool signed_variant) {
     auto& texture = input.textures.emplace_back();
-    if (!ReadTexture(fetch, texture, signed_variant)) {
+    if (!ReadTexture(fetch, texture, signed_variant, uploads, submission)) {
       REXGPU_DEBUG(
           "Native Vulkan texture {} unsupported: format={} dimension={} base={:05X} "
           "flags={:08X}/{:08X}",
@@ -338,9 +340,9 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, Dr
     const TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
     const bool any_signed = texture_util::IsAnySignSigned(texture_util::SwizzleSigns(fetch));
     const bool linear_filterable =
-        info.format != VK_FORMAT_UNDEFINED && IsLinearFilterable(info.format) &&
+        info.format != VK_FORMAT_UNDEFINED && IsLinearFilterable(fetch.format, info.format) &&
         (!any_signed || info.signed_format == VK_FORMAT_UNDEFINED ||
-         IsLinearFilterable(info.signed_format));
+         IsLinearFilterable(fetch.format, info.signed_format));
     const VkSampler handle = GetSampler(NormalizeDrawSampler(out, linear_filterable));
     if (handle == VK_NULL_HANDLE) {
       return false;
@@ -368,16 +370,20 @@ bool NativeTextureCache::MakeSignedView(DrawTexture& texture, VkFormat signed_fo
   return texture.cached_view != VK_NULL_HANDLE;
 }
 
-bool NativeTextureCache::IsLinearFilterable(VkFormat format) {
-  auto [it, inserted] = linear_filterable_.try_emplace(uint32_t(format), false);
-  if (inserted) {
-    VkFormatProperties format_properties{};
-    device_.vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
-        device_.physical_device(), format, &format_properties);
-    it->second = (format_properties.optimalTilingFeatures &
-                  VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+bool NativeTextureCache::IsLinearFilterable(xenos::TextureFormat guest_format, VkFormat format) {
+  const size_t idx = size_t(guest_format);
+  if (idx < linear_filterable_.size() && linear_filterable_[idx] >= 0) {
+    return linear_filterable_[idx] != 0;
   }
-  return it->second;
+  VkFormatProperties format_properties{};
+  device_.vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+      device_.physical_device(), format, &format_properties);
+  const bool supported = (format_properties.optimalTilingFeatures &
+                          VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+  if (idx < linear_filterable_.size()) {
+    linear_filterable_[idx] = supported ? 1 : 0;
+  }
+  return supported;
 }
 
 VkSampler NativeTextureCache::GetSampler(const DrawSampler& key) {
@@ -457,6 +463,12 @@ VkSampler NativeTextureCache::GetSampler(const DrawSampler& key) {
 }
 
 void NativeTextureCache::InvalidateTextures(uint32_t start, uint32_t length) {
+  if (!cached_texture_pages_.empty()) {
+    const auto [first_page, page_count] = GetPhysicalPageRange(start, length);
+    if (!HasAnyPageBitSet(cached_texture_pages_, first_page, page_count)) {
+      return;
+    }
+  }
   bool erased = false;
   for (auto it = cached_textures_.begin(); it != cached_textures_.end();) {
     const CachedTexture& texture = *it->second.texture;
@@ -498,6 +510,12 @@ void NativeTextureCache::PruneResolvedDependents() {
 }
 
 void NativeTextureCache::InvalidateResolvedTextures(uint32_t start, uint32_t length) {
+  if (!cached_texture_pages_.empty()) {
+    const auto [first_page, page_count] = GetPhysicalPageRange(start, length);
+    if (!HasAnyPageBitSet(cached_texture_pages_, first_page, page_count)) {
+      return;
+    }
+  }
   bool erased = false;
   for (auto it = resolved_images_.begin(); it != resolved_images_.end();) {
     if (RangesOverlap(start, length, it->second.guest_start, it->second.guest_length)) {
@@ -575,7 +593,9 @@ std::shared_ptr<CachedTexture> NativeTextureCache::GetOrCreateCachedTexture(
 }
 
 bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
-                                     DrawTexture& texture, bool signed_variant) {
+                                     DrawTexture& texture, bool signed_variant,
+                                     ui::vulkan::VulkanUploadBufferPool* uploads,
+                                     uint64_t submission) {
   const TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
   if (fetch.type != xenos::FetchConstantType::kTexture || info.format == VK_FORMAT_UNDEFINED) {
     return false;
@@ -615,9 +635,6 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
   // RGBA otherwise. Block sizes don't map to channels, so use the count.
   const uint32_t channel_count = TextureChannelCount(fetch.format);
   const uint32_t address = base_page << 12;
-  const uint32_t scaled_width = texture.width * draw_resolution_scale_x_;
-  const uint32_t scaled_height = texture.height * draw_resolution_scale_y_;
-  const bool is_scaled = draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1;
   const bool use_view_swizzle = device_.properties().imageViewFormatSwizzle;
   auto resolved = resolvable ? resolved_images_.find(address) : resolved_images_.end();
   // ponytail: array resolves stay in their cached layers; 3D textures decode guest memory.
@@ -625,6 +642,11 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
     resolved = resolved_images_.end();
   }
   if (cube && resolved != resolved_images_.end()) {
+    const uint32_t res_sx = resolved->second.resolution_scaled ? draw_resolution_scale_x_ : 1;
+    const uint32_t res_sy = resolved->second.resolution_scaled ? draw_resolution_scale_y_ : 1;
+    const uint32_t scaled_width = texture.width * res_sx;
+    const uint32_t scaled_height = texture.height * res_sy;
+    const bool is_scaled = res_sx > 1 || res_sy > 1;
     // Some titles render each cube face as a separate small color target and
     // resolve it to its own slice of the guest layout, leaving guest memory
     // zero. Assemble and cache a cube image from those six resolved faces,
@@ -649,8 +671,8 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
       auto& entry = face_resolved->second;
       const auto face_extent = entry.image->extent();
       if (!CanUseResolvedCubeFace(texture.format == entry.image->format(), face_extent.width,
-                                  face_extent.height, scaled_width, scaled_height,
-                                  draw_resolution_scale_x_, draw_resolution_scale_y_)) {
+                                  face_extent.height, scaled_width, scaled_height, res_sx,
+                                  res_sy)) {
         faces_usable = false;
         break;
       }
@@ -716,6 +738,11 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
   }
   if (!cube && resolved != resolved_images_.end() &&
       texture.format == resolved->second.image->format()) {
+    const uint32_t res_sx = resolved->second.resolution_scaled ? draw_resolution_scale_x_ : 1;
+    const uint32_t res_sy = resolved->second.resolution_scaled ? draw_resolution_scale_y_ : 1;
+    const uint32_t scaled_width = texture.width * res_sx;
+    const uint32_t scaled_height = texture.height * res_sy;
+    const bool is_scaled = res_sx > 1 || res_sy > 1;
     // A 32bpp 3/4-channel resolve copied with copy_dest_swap keeps the EDRAM
     // red/blue order, while the guest fetch swizzle expects them swapped in
     // memory, so apply that swap to the host view instead.
@@ -739,8 +766,8 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
     // the same address with a different size is not dropped.
     const uint32_t alignment = resolved->second.tiled_destination ? xenos::kTextureTileWidthHeight
                                                                   : xenos::kResolveAlignmentPixels;
-    if (CanCropAlignedResolve(extent.width, extent.height, scaled_width, scaled_height,
-                              draw_resolution_scale_x_, draw_resolution_scale_y_, alignment)) {
+    if (CanCropAlignedResolve(extent.width, extent.height, scaled_width, scaled_height, res_sx,
+                              res_sy, alignment)) {
       resolved->second.last_use_submission = clock_.next;
       texture.width = scaled_width;
       texture.height = scaled_height;
@@ -918,7 +945,7 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
 
   const bool upload = !entry || !entry->uploaded;
   if (upload && !DecodeTextureLevels(fetch, info, layout, address, mip_page, signed_variant,
-                                     texture)) {
+                                     texture, uploads, submission)) {
     return false;
   }
 
@@ -936,11 +963,121 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
   return true;
 }
 
+namespace {
+
+template <uint32_t BlockSize, size_t Swap>
+void DecodeTiled2DCopyLevel(const uint8_t* __restrict source, size_t source_size,
+                            uint8_t* __restrict dst, uint32_t slices, uint32_t blocks_x,
+                            uint32_t blocks_y, uint32_t start_x, uint32_t start_y,
+                            uint32_t pitch_aligned, uint32_t bpb_log2,
+                            size_t slice_stride_bytes, size_t dst_slice_bytes) {
+  for (uint32_t slice = 0; slice < slices; ++slice) {
+    const size_t slice_base = size_t(slice) * slice_stride_bytes;
+    uint8_t* slice_dst = dst + size_t(slice) * dst_slice_bytes;
+    for (uint32_t y = 0; y < blocks_y; ++y) {
+      const auto row = MakeTiled2DRowState(int32_t(y + start_y), pitch_aligned, bpb_log2);
+      uint8_t* row_dst = slice_dst + size_t(y) * blocks_x * BlockSize;
+      for (uint32_t x = 0; x < blocks_x; ++x) {
+        const size_t offset =
+            slice_base +
+            size_t(GetTiledOffset2DFromRow(int32_t(x + start_x), row, bpb_log2));
+        if (offset <= source_size && BlockSize <= source_size - offset) {
+          CopySwapBlock<BlockSize, Swap>(source, offset, row_dst + size_t(x) * BlockSize);
+        }
+      }
+    }
+  }
+}
+
+template <uint32_t BlockSize, size_t Swap>
+void DecodeLinear2DCopyLevel(const uint8_t* __restrict source, uint8_t* __restrict dst,
+                             uint32_t slices, uint32_t blocks_x, uint32_t blocks_y,
+                             uint32_t start_x, uint32_t start_y, uint32_t row_pitch_bytes,
+                             size_t slice_stride_bytes, size_t dst_slice_bytes) {
+  const size_t row_copy_bytes = size_t(blocks_x) * BlockSize;
+  for (uint32_t slice = 0; slice < slices; ++slice) {
+    const size_t slice_base = size_t(slice) * slice_stride_bytes;
+    uint8_t* slice_dst = dst + size_t(slice) * dst_slice_bytes;
+    for (uint32_t y = 0; y < blocks_y; ++y) {
+      const size_t row_src_offset =
+          slice_base + size_t(y + start_y) * row_pitch_bytes + size_t(start_x) * BlockSize;
+      uint8_t* row_dst = slice_dst + size_t(y) * row_copy_bytes;
+      if constexpr (Swap == 0) {
+        std::memcpy(row_dst, source + row_src_offset, row_copy_bytes);
+      } else {
+        for (uint32_t x = 0; x < blocks_x; ++x) {
+          CopySwapBlock<BlockSize, Swap>(source, row_src_offset + size_t(x) * BlockSize,
+                                         row_dst + size_t(x) * BlockSize);
+        }
+      }
+    }
+  }
+}
+
+template <uint32_t BlockSize>
+void Dispatch2DCopyBySwap(size_t swap, bool tiled, const uint8_t* source, size_t source_size,
+                          uint8_t* dst, uint32_t slices, uint32_t blocks_x, uint32_t blocks_y,
+                          uint32_t start_x, uint32_t start_y, uint32_t row_pitch_bytes,
+                          uint32_t pitch_aligned, uint32_t bpb_log2, size_t slice_stride_bytes,
+                          size_t dst_slice_bytes) {
+  if (tiled) {
+    switch (swap) {
+      case 0:
+        DecodeTiled2DCopyLevel<BlockSize, 0>(source, source_size, dst, slices, blocks_x, blocks_y,
+                                             start_x, start_y, pitch_aligned, bpb_log2,
+                                             slice_stride_bytes, dst_slice_bytes);
+        return;
+      case 1:
+        DecodeTiled2DCopyLevel<BlockSize, 1>(source, source_size, dst, slices, blocks_x, blocks_y,
+                                             start_x, start_y, pitch_aligned, bpb_log2,
+                                             slice_stride_bytes, dst_slice_bytes);
+        return;
+      case 2:
+        DecodeTiled2DCopyLevel<BlockSize, 2>(source, source_size, dst, slices, blocks_x, blocks_y,
+                                             start_x, start_y, pitch_aligned, bpb_log2,
+                                             slice_stride_bytes, dst_slice_bytes);
+        return;
+      default:
+        DecodeTiled2DCopyLevel<BlockSize, 3>(source, source_size, dst, slices, blocks_x, blocks_y,
+                                             start_x, start_y, pitch_aligned, bpb_log2,
+                                             slice_stride_bytes, dst_slice_bytes);
+        return;
+    }
+  } else {
+    switch (swap) {
+      case 0:
+        DecodeLinear2DCopyLevel<BlockSize, 0>(source, dst, slices, blocks_x, blocks_y, start_x,
+                                              start_y, row_pitch_bytes, slice_stride_bytes,
+                                              dst_slice_bytes);
+        return;
+      case 1:
+        DecodeLinear2DCopyLevel<BlockSize, 1>(source, dst, slices, blocks_x, blocks_y, start_x,
+                                              start_y, row_pitch_bytes, slice_stride_bytes,
+                                              dst_slice_bytes);
+        return;
+      case 2:
+        DecodeLinear2DCopyLevel<BlockSize, 2>(source, dst, slices, blocks_x, blocks_y, start_x,
+                                              start_y, row_pitch_bytes, slice_stride_bytes,
+                                              dst_slice_bytes);
+        return;
+      default:
+        DecodeLinear2DCopyLevel<BlockSize, 3>(source, dst, slices, blocks_x, blocks_y, start_x,
+                                              start_y, row_pitch_bytes, slice_stride_bytes,
+                                              dst_slice_bytes);
+        return;
+    }
+  }
+}
+
+}  // namespace
+
 bool NativeTextureCache::DecodeTextureLevels(const xenos::xe_gpu_texture_fetch_t& fetch,
                                              const TextureFormatInfo& info,
                                              const texture_util::TextureGuestLayout& layout,
                                              uint32_t address, uint32_t mip_page,
-                                             bool signed_variant, DrawTexture& texture) {
+                                             bool signed_variant, DrawTexture& texture,
+                                             ui::vulkan::VulkanUploadBufferPool* uploads,
+                                             uint64_t submission) {
   constexpr std::array<size_t, 4> byte_xor{0, 1, 3, 2};
   const size_t swap = byte_xor[uint32_t(fetch.endianness)];
   const bool is_3d = fetch.dimension == xenos::DataDimension::k3D;
@@ -948,92 +1085,210 @@ bool NativeTextureCache::DecodeTextureLevels(const xenos::xe_gpu_texture_fetch_t
   const uint32_t block_size = info.block_size;
   const uint32_t host_size = info.host_block_size();
   const uint32_t bpb_log2 = uint32_t(std::countr_zero(block_size));
+
+  // Precompute level geometry and total upload size so we can decode directly
+  // into a single frame-upload-pool slice when it fits in one page.
+  struct LevelPlan {
+    uint32_t level;
+    uint32_t level_storage;
+    std::span<const uint8_t> source;
+    uint32_t start_x = 0;
+    uint32_t start_y = 0;
+    uint32_t start_z = 0;
+    uint32_t level_width = 0;
+    uint32_t level_height = 0;
+    uint32_t blocks_x = 0;
+    uint32_t blocks_y = 0;
+    uint32_t slices = 0;
+    uint32_t host_x = 0;
+    uint32_t host_y = 0;
+    size_t slice_bytes = 0;
+    size_t total_bytes = 0;
+    VkDeviceSize pool_offset = 0;
+  };
+  std::array<LevelPlan, xenos::kTextureMaxMips + 1> plans;
+  uint32_t plan_count = 0;
+  VkDeviceSize total_upload_bytes = 0;
   for (uint32_t level = texture.first_level; level <= layout.max_level; ++level) {
-    const uint32_t level_storage = std::min(level, layout.packed_level);
-    const auto& level_layout = level ? layout.mips[level_storage] : layout.base;
+    auto& plan = plans[plan_count++];
+    plan.level = level;
+    plan.level_storage = std::min(level, layout.packed_level);
+    const auto& level_layout = level ? layout.mips[plan.level_storage] : layout.base;
     const uint64_t level_address =
-        level ? (uint64_t(mip_page) << 12) + layout.mip_offsets_bytes[level_storage] : address;
+        level ? (uint64_t(mip_page) << 12) + layout.mip_offsets_bytes[plan.level_storage] : address;
     if (level_address >= kPhysicalMemorySize) {
       return false;
     }
-    // Array slices are stored within the level, each `array_slice_stride_bytes`
-    // apart, so the last slice's data must be readable as well.
     const size_t level_read_size =
         GetTextureLevelReadSize(level_layout.array_slice_stride_bytes,
                                 level_layout.array_slice_data_extent_bytes, texture.array_layers);
-    const auto source =
+    plan.source =
         ReadGuestPhysical(memory_, uint32_t(level_address), rex::align(level_read_size, size_t(4)));
-    if (source.empty()) {
+    if (plan.source.empty()) {
       return false;
     }
-    uint32_t start_x = 0, start_y = 0, start_z = 0;
     if (level >= layout.packed_level) {
       texture_util::GetPackedMipOffset(texture.width, texture.height, texture.depth, fetch.format,
-                                       level, start_x, start_y, start_z);
+                                       level, plan.start_x, plan.start_y, plan.start_z);
     }
-    const uint32_t level_width = std::max(1u, texture.width >> level);
-    const uint32_t level_height = std::max(1u, texture.height >> level);
+    plan.level_width = std::max(1u, texture.width >> level);
+    plan.level_height = std::max(1u, texture.height >> level);
     const uint32_t level_depth = std::max(1u, texture.depth >> level);
-    const uint32_t blocks_x = (level_width + block_width - 1) / block_width;
-    const uint32_t blocks_y = (level_height + block_width - 1) / block_width;
-    // Layers of an array, or slices of a 3D level, one after another.
-    const uint32_t slices = is_3d ? level_depth : texture.array_layers;
-    // Decompressed blocks become texel rows of the level's own size.
-    const uint32_t host_x = info.decompresses_blocks() ? level_width : blocks_x;
-    const uint32_t host_y = info.decompresses_blocks() ? level_height : blocks_y;
-    auto& data = texture.levels.emplace_back(size_t(host_x) * host_y * host_size * slices);
-    const uint32_t z_stride_bytes = level_layout.row_pitch_bytes *
-                                    level_layout.z_slice_stride_block_rows;
-    for (uint32_t slice = 0; slice < slices; ++slice) {
+    plan.blocks_x = (plan.level_width + block_width - 1) / block_width;
+    plan.blocks_y = (plan.level_height + block_width - 1) / block_width;
+    plan.slices = is_3d ? level_depth : texture.array_layers;
+    plan.host_x = info.decompresses_blocks() ? plan.level_width : plan.blocks_x;
+    plan.host_y = info.decompresses_blocks() ? plan.level_height : plan.blocks_y;
+    plan.slice_bytes = size_t(plan.host_x) * plan.host_y * host_size;
+    plan.total_bytes = plan.slice_bytes * plan.slices;
+    total_upload_bytes = rex::align(total_upload_bytes, VkDeviceSize(16));
+    plan.pool_offset = total_upload_bytes;
+    total_upload_bytes += plan.total_bytes;
+  }
+
+  uint8_t* direct_base = nullptr;
+  VkBuffer direct_buffer = VK_NULL_HANDLE;
+  VkDeviceSize direct_offset = 0;
+  if (uploads && total_upload_bytes > 0 && total_upload_bytes <= kDrawUploadPageSize) {
+    direct_base = uploads->Request(submission, total_upload_bytes, 16, direct_buffer, direct_offset);
+    if (direct_base) {
+      texture.direct_upload_buffer = direct_buffer;
+      texture.direct_uploads.resize(plan_count);
+    }
+  }
+
+  for (uint32_t p = 0; p < plan_count; ++p) {
+    const auto& plan = plans[p];
+    const auto& level_layout =
+        plan.level ? layout.mips[plan.level_storage] : layout.base;
+    uint8_t* dst = nullptr;
+    if (direct_base) {
+      dst = direct_base + plan.pool_offset;
+      auto& copy = texture.direct_uploads[p];
+      copy = {};
+      copy.bufferOffset = direct_offset + plan.pool_offset;
+      copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, plan.level, 0,
+                               is_3d ? 1 : texture.array_layers};
+      copy.imageExtent = {plan.level_width, plan.level_height,
+                          is_3d ? std::max(1u, texture.depth >> plan.level) : 1};
+    } else {
+      dst = texture.levels.emplace_back(plan.total_bytes).data();
+    }
+
+    if (!is_3d && info.unpack == TextureUnpack::kCopy &&
+        (block_size == 1 || block_size == 2 || block_size == 4 || block_size == 8 ||
+         block_size == 16)) {
+      const uint32_t pitch_blocks = level_layout.row_pitch_bytes / block_size;
+      const uint32_t pitch_aligned =
+          (pitch_blocks + (xenos::kTextureTileWidthHeight - 1)) &
+          ~(xenos::kTextureTileWidthHeight - 1);
+      // Verify bounds once for untiled; tiled checks per-block inside helper.
+      if (!fetch.tiled) {
+        const size_t needed =
+            size_t(plan.slices - 1) * level_layout.array_slice_stride_bytes +
+            size_t(plan.start_y + plan.blocks_y - 1) * level_layout.row_pitch_bytes +
+            size_t(plan.start_x + plan.blocks_x) * block_size;
+        if (needed > plan.source.size()) {
+          return false;
+        }
+      }
+      switch (block_size) {
+        case 1:
+          Dispatch2DCopyBySwap<1>(swap, fetch.tiled != 0, plan.source.data(), plan.source.size(),
+                                  dst, plan.slices, plan.blocks_x, plan.blocks_y, plan.start_x,
+                                  plan.start_y, level_layout.row_pitch_bytes, pitch_aligned,
+                                  bpb_log2, level_layout.array_slice_stride_bytes,
+                                  plan.slice_bytes);
+          break;
+        case 2:
+          Dispatch2DCopyBySwap<2>(swap, fetch.tiled != 0, plan.source.data(), plan.source.size(),
+                                  dst, plan.slices, plan.blocks_x, plan.blocks_y, plan.start_x,
+                                  plan.start_y, level_layout.row_pitch_bytes, pitch_aligned,
+                                  bpb_log2, level_layout.array_slice_stride_bytes,
+                                  plan.slice_bytes);
+          break;
+        case 4:
+          Dispatch2DCopyBySwap<4>(swap, fetch.tiled != 0, plan.source.data(), plan.source.size(),
+                                  dst, plan.slices, plan.blocks_x, plan.blocks_y, plan.start_x,
+                                  plan.start_y, level_layout.row_pitch_bytes, pitch_aligned,
+                                  bpb_log2, level_layout.array_slice_stride_bytes,
+                                  plan.slice_bytes);
+          break;
+        case 8:
+          Dispatch2DCopyBySwap<8>(swap, fetch.tiled != 0, plan.source.data(), plan.source.size(),
+                                  dst, plan.slices, plan.blocks_x, plan.blocks_y, plan.start_x,
+                                  plan.start_y, level_layout.row_pitch_bytes, pitch_aligned,
+                                  bpb_log2, level_layout.array_slice_stride_bytes,
+                                  plan.slice_bytes);
+          break;
+        case 16:
+          Dispatch2DCopyBySwap<16>(swap, fetch.tiled != 0, plan.source.data(), plan.source.size(),
+                                   dst, plan.slices, plan.blocks_x, plan.blocks_y, plan.start_x,
+                                   plan.start_y, level_layout.row_pitch_bytes, pitch_aligned,
+                                   bpb_log2, level_layout.array_slice_stride_bytes,
+                                   plan.slice_bytes);
+          break;
+      }
+      continue;
+    }
+
+    const uint32_t z_stride_bytes =
+        level_layout.row_pitch_bytes * level_layout.z_slice_stride_block_rows;
+    for (uint32_t slice = 0; slice < plan.slices; ++slice) {
       const size_t slice_base =
           is_3d ? 0 : size_t(slice) * level_layout.array_slice_stride_bytes;
-      const uint32_t z = is_3d ? slice + start_z : 0;
-      // Each face is tiled independently from the origin of its own data.
-      for (uint32_t y = 0; y < blocks_y; ++y) {
-        for (uint32_t x = 0; x < blocks_x; ++x) {
-          const int32_t gx = int32_t(x + start_x);
-          const int32_t gy = int32_t(y + start_y);
+      const uint32_t z = is_3d ? slice + plan.start_z : 0;
+      uint8_t* const slice_data = dst + size_t(slice) * plan.slice_bytes;
+      for (uint32_t y = 0; y < plan.blocks_y; ++y) {
+        for (uint32_t x = 0; x < plan.blocks_x; ++x) {
+          const int32_t gx = int32_t(x + plan.start_x);
+          const int32_t gy = int32_t(y + plan.start_y);
           size_t offset = slice_base;
           if (fetch.tiled) {
             const uint32_t pitch_blocks = level_layout.row_pitch_bytes / block_size;
             offset += is_3d ? size_t(texture_util::GetTiledOffset3D(
                                   gx, gy, int32_t(z), pitch_blocks,
                                   level_layout.z_slice_stride_block_rows, bpb_log2))
-                            : size_t(texture_util::GetTiledOffset2D(gx, gy, pitch_blocks, bpb_log2));
+                            : size_t(GetTiledOffset2DInline(gx, gy, pitch_blocks, bpb_log2));
           } else {
             offset += size_t(z) * z_stride_bytes + size_t(gy) * level_layout.row_pitch_bytes +
                       size_t(gx) * block_size;
           }
-          if (offset > source.size() || block_size > source.size() - offset) {
+          if (offset > plan.source.size() || block_size > plan.source.size() - offset) {
             return false;
           }
           std::array<uint8_t, 16> block;
           for (uint32_t i = 0; i < block_size; ++i) {
-            block[i] = source[(offset + i) ^ swap];
+            block[i] = plan.source[(offset + i) ^ swap];
           }
-          uint8_t* const slice_data = data.data() + size_t(slice) * host_x * host_y * host_size;
-          if (info.decompresses_blocks()) {
+          if (info.unpack == TextureUnpack::kDxt3aToR8) {
             uint64_t bits;
             std::memcpy(&bits, block.data(), sizeof(bits));
             const auto alpha = DecodeDxt3aBlock(bits);
+            for (uint32_t texel = 0; texel < 16; ++texel) {
+              const uint32_t tx = x * 4 + texel % 4;
+              const uint32_t ty = y * 4 + texel / 4;
+              if (tx < plan.level_width && ty < plan.level_height) {
+                slice_data[size_t(ty) * plan.host_x + tx] = alpha[texel];
+              }
+            }
+            continue;
+          }
+          if (info.unpack == TextureUnpack::kCtx1ToRg8) {
+            uint64_t bits;
+            std::memcpy(&bits, block.data(), sizeof(bits));
             const auto rg = DecodeCtx1Block(bits);
             for (uint32_t texel = 0; texel < 16; ++texel) {
               const uint32_t tx = x * 4 + texel % 4;
               const uint32_t ty = y * 4 + texel / 4;
-              if (tx >= level_width || ty >= level_height) {
-                continue;
-              }
-              uint8_t* dst = slice_data + (size_t(ty) * host_x + tx) * host_size;
-              if (info.unpack == TextureUnpack::kDxt3aToR8) {
-                *dst = alpha[texel];
-              } else {
-                std::memcpy(dst, &rg[texel], sizeof(rg[texel]));
+              if (tx < plan.level_width && ty < plan.level_height) {
+                std::memcpy(slice_data + (size_t(ty) * plan.host_x + tx) * 2, &rg[texel], 2);
               }
             }
             continue;
           }
           UnpackTexel(info, signed_variant, block.data(),
-                      slice_data + (size_t(y) * host_x + x) * host_size);
+                      slice_data + (size_t(y) * plan.host_x + x) * host_size);
         }
       }
     }

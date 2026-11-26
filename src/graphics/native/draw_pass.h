@@ -3,6 +3,7 @@
 #include <array>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -98,6 +99,9 @@ struct DrawTexture {
   // image was already uploaded by an earlier draw in the same batch.
   bool upload_cached = false;
   bool resolution_scaled = false;
+  // When decoded directly into the frame upload pool, DrawPass skips levels memcpy.
+  VkBuffer direct_upload_buffer = VK_NULL_HANDLE;
+  std::vector<VkBufferImageCopy> direct_uploads;
 };
 
 struct DrawInput {
@@ -151,14 +155,10 @@ struct DrawInput {
     system = {};
     float_constants[0].clear();
     float_constants[1].clear();
-    bool_loop.fill(0);
-    fetch.fill(0);
     viewport = {};
     scissor = {};
     primitive_restart = false;
     topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    blend.fill({});
-    color_formats.fill(VK_FORMAT_UNDEFINED);
     color_count = 0;
     depth_stencil = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depth_format = VK_FORMAT_UNDEFINED;
@@ -202,11 +202,18 @@ struct DrawPipelineKey {
 // so the hash never depends on padding between the pointers and the arrays.
 struct DrawPipelineKeyHash {
   size_t operator()(const DrawPipelineKey& key) const noexcept {
-    uint64_t hash = XXH3_64bits(&key.vertex, sizeof(key.vertex));
-    hash = XXH3_64bits_withSeed(&key.pixel, sizeof(key.pixel), hash);
-    hash = XXH3_64bits_withSeed(key.state.data(), sizeof(key.state), hash);
-    hash = XXH3_64bits_withSeed(key.colors.data(), sizeof(key.colors), hash);
-    return size_t(hash);
+    uint64_t h = (uintptr_t(key.vertex) * 0x9E3779B97F4A7C15ull) ^
+                 (uintptr_t(key.pixel) * 0xBF58476D1CE4E5B9ull);
+    for (uint32_t v : key.state) {
+      h = (h ^ v) * 0x9E3779B97F4A7C15ull;
+    }
+    const uint32_t cc = std::min<uint32_t>(key.state[4], xenos::kMaxColorRenderTargets);
+    for (uint32_t c = 0; c < cc; ++c) {
+      for (uint32_t v : key.colors[c]) {
+        h = (h ^ v) * 0x94D049BB133111EBull;
+      }
+    }
+    return size_t(h ^ (h >> 32));
   }
 };
 
@@ -237,6 +244,34 @@ struct DrawBindings {
   // The single set shared by every draw for a layout without bindings, or
   // VK_NULL_HANDLE when the layout has bindings (or allocation failed).
   VkDescriptorSet GetEmptySet(size_t index);
+  // Per-frame-slot cached texture descriptor set (set 2 or 3) to elide
+  // repeated vkUpdateDescriptorSets and vkCmdBindDescriptorSets within a frame.
+  // Slot 2 holds the sets for the currently-accumulating pending_ batch until
+  // SubmitCommands commits them to the submitted FrameSlot (0 or 1).
+  static constexpr uint32_t kPendingTextureSetSlot = 2;
+  VkDescriptorSet GetOrCreateTextureSet(size_t set_slot, uint32_t frame_slot,
+                                        std::span<const VkImageView> views,
+                                        std::span<const VkSampler> samplers);
+  void CommitPendingTextureSets(uint32_t frame_slot);
+  void ReleaseFrameTextureSets(uint32_t frame_slot);
+
+  struct TextureSetKey {
+    std::vector<VkImageView> views;
+    std::vector<VkSampler> samplers;
+    bool operator==(const TextureSetKey& o) const = default;
+  };
+  struct TextureSetKeyHash {
+    size_t operator()(const TextureSetKey& k) const noexcept {
+      uint64_t h = 0x9E3779B97F4A7C15ull;
+      for (VkImageView v : k.views) {
+        h = (h ^ uint64_t(uintptr_t(v))) * 0xBF58476D1CE4E5B9ull;
+      }
+      for (VkSampler s : k.samplers) {
+        h = (h ^ uint64_t(uintptr_t(s))) * 0x94D049BB133111EBull;
+      }
+      return size_t(h ^ (h >> 32));
+    }
+  };
 
   const ui::vulkan::VulkanDevice& device;
   std::array<VkDescriptorSetLayout, 4> layouts{};
@@ -248,11 +283,21 @@ struct DrawBindings {
   size_t shared_vertex_set_index = SIZE_MAX;
   VkBuffer shared_vertex_buffer = VK_NULL_HANDLE;
   std::unordered_map<VkBuffer, size_t> constant_sets;
+  VkBuffer last_constant_buffer = VK_NULL_HANDLE;
+  VkDescriptorSet last_constant_set = VK_NULL_HANDLE;
+  // Indexed by [frame_slot][set_slot - 2] for sets 2 and 3 (slot 2 = pending_).
+  std::array<std::array<std::unordered_map<TextureSetKey, size_t, TextureSetKeyHash>, 2>, 3>
+      texture_sets_;
 };
 
 // Keyed by {shared buffer count, vertex images, vertex samplers, pixel images,
 // pixel samplers}.
 using DrawBindingCache = std::map<std::array<uint32_t, 5>, std::unique_ptr<DrawBindings>>;
+
+struct PreuploadedConstants {
+  VkBuffer buffer = VK_NULL_HANDLE;
+  std::array<uint32_t, SpirvShaderTranslator::kConstantBufferCount> dynamic_offsets{};
+};
 
 class DrawPass {
  public:
@@ -265,17 +310,21 @@ class DrawPass {
   DrawPass(const DrawPass&) = delete;
   DrawPass& operator=(const DrawPass&) = delete;
 
-  bool Initialize(const DrawInput& input, std::span<const uint32_t> indices,
+  bool Initialize(const DrawInput& input, const IndexBinding& index_binding,
+                  std::span<const uint32_t> inline_indices,
                   const Shader::Translation& vertex, const Shader::Translation* pixel,
                   uint32_t shared_buffer_count, VkPipelineCache pipeline_cache,
                   DrawPipelines& pipelines, DrawBindingCache& binding_cache,
                   ui::vulkan::VulkanUploadBufferPool& uploads, uint64_t submission,
-                  VkBuffer shared_vertex_buffer = VK_NULL_HANDLE);
+                  uint32_t frame_slot = 0, VkBuffer shared_vertex_buffer = VK_NULL_HANDLE,
+                  std::timed_mutex* pipeline_cache_mutex = nullptr,
+                  const PreuploadedConstants* preuploaded_constants = nullptr);
   // Records only the binds and dynamic state that differ from `state`.
   void Record(VkCommandBuffer commands, VkExtent2D extent, DrawRenderState& state);
   void RecordTextureUpload(VkCommandBuffer commands);
   const draw_util::Scissor& scissor() const { return scissor_; }
   bool rasterizer_discard() const { return rasterizer_discard_; }
+  bool has_texture_work() const { return has_texture_work_; }
 
  private:
   void Release();
@@ -301,6 +350,7 @@ class DrawPass {
     VmaAllocation allocation = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkImageView fallback_view = VK_NULL_HANDLE;
+    VkBuffer direct_upload_buffer = VK_NULL_HANDLE;
     VkExtent2D extent{};
     uint32_t array_layers = 1;
     uint32_t level_count = 1;
@@ -308,7 +358,10 @@ class DrawPass {
     std::vector<VkBufferImageCopy> uploads;
   };
   std::vector<Texture> textures_;
+  bool indexed_ = true;
+  VkBuffer index_buffer_ = VK_NULL_HANDLE;
   VkDeviceSize index_offset_ = 0;
+  VkIndexType index_type_ = VK_INDEX_TYPE_UINT32;
   uint32_t index_count_ = 0;
   draw_util::ViewportInfo viewport_{};
   draw_util::Scissor scissor_{};
@@ -321,6 +374,7 @@ class DrawPass {
   bool edram_depth_clear_color_ = false;
   std::array<uint32_t, 2> edram_clear_constants_{};
   bool rasterizer_discard_ = false;
+  bool has_texture_work_ = false;
 };
 
 }  // namespace rex::graphics::native

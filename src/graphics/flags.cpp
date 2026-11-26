@@ -56,6 +56,14 @@ REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU", "Draw resolution scale Y
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_INT32(draw_resolution_scale_threshold, 0, "GPU",
+                     "Render targets with a pitch at or below this many pixels skip the resolution "
+                     "scale (small post-processing chains: bloom, blur, depth of field). 0: off. The "
+                     "pitch is compared after rounding up to 80-pixel EDRAM tiles. Host render "
+                     "targets only (from Xenia Canary 74db632ab3)")
+    .range(0, 8192)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
                      "Forces anisotropic filtering for eligible textures.\n"
                      "Higher values keep textures sharper at oblique angles, but increase texture "

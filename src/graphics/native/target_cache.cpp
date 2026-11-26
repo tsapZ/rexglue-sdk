@@ -21,10 +21,17 @@ VkFormat NativeTargetCache::GetDepthFormat(xenos::DepthRenderTargetFormat format
 }
 
 DrawInput NativeTargetCache::RescaleFastClearInput(const DrawInput& base,
-                                                   xenos::MsaaSamples samples) const {
+                                                   xenos::MsaaSamples samples, bool source_scaled,
+                                                   bool target_scaled) const {
   // The 4x-MSAA clear covers the aliased target with half the horizontal pitch;
   // scale the guest-space viewport and scissor to the host pixels of the alias.
   const auto scale = GetMsaa4xAliasScale(samples);
+  uint32_t sx = scale.x;
+  uint32_t sy = scale.y;
+  if (!source_scaled && target_scaled) {
+    sx *= draw_resolution_scale_x_;
+    sy *= draw_resolution_scale_y_;
+  }
   const auto& properties = device_.properties();
   std::array<float, 3> ndc_scale;
   std::array<float, 3> ndc_offset;
@@ -39,7 +46,7 @@ DrawInput NativeTargetCache::RescaleFastClearInput(const DrawInput& base,
                                             << Translator::kSysFlag_MsaaSamples_Shift;
   input.system.flags = (base.system.flags & ~kMsaaSamplesFlagMask) |
                        (uint32_t(samples) << Translator::kSysFlag_MsaaSamples_Shift);
-  ScaleViewportAndScissor(input.viewport, input.scissor, ndc_scale, ndc_offset, scale.x, scale.y,
+  ScaleViewportAndScissor(input.viewport, input.scissor, ndc_scale, ndc_offset, sx, sy,
                           properties.maxViewportDimensions[0], properties.maxViewportDimensions[1]);
   std::copy(ndc_scale.begin(), ndc_scale.end(), input.viewport.ndc_scale);
   std::copy(ndc_offset.begin(), ndc_offset.end(), input.viewport.ndc_offset);
@@ -50,7 +57,7 @@ DrawInput NativeTargetCache::RescaleFastClearInput(const DrawInput& base,
 
 void NativeTargetCache::ReplayAliasedFastClear(const PendingFastClear& clear,
                                                const std::shared_ptr<ColorImage>& image,
-                                               xenos::MsaaSamples samples) {
+                                               xenos::MsaaSamples samples, bool target_scaled) {
   const bool depth_target = (image->aspects() & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
   std::optional<uint32_t> clear_format;
   if (!depth_target) {
@@ -59,7 +66,8 @@ void NativeTargetCache::ReplayAliasedFastClear(const PendingFastClear& clear,
       return;
     }
   }
-  DrawInput input = RescaleFastClearInput(clear.input, samples);
+  DrawInput input = RescaleFastClearInput(clear.input, samples, clear.resolution_scaled,
+                                          target_scaled);
   if (!depth_target) {
     // The clear writes a 32-bit EDRAM depth-stencil word into an aliased color
     // target; the fragment shader unpacks it for the target format.
@@ -80,7 +88,8 @@ void NativeTargetCache::ReplayAliasedFastClear(const PendingFastClear& clear,
 
 void NativeTargetCache::ApplyPendingFastClear(uint32_t tile, uint32_t pitch_tiles,
                                               xenos::MsaaSamples samples,
-                                              const std::shared_ptr<ColorImage>& image) {
+                                              const std::shared_ptr<ColorImage>& image,
+                                              bool target_scaled) {
   if (samples >= xenos::MsaaSamples::k4X) {
     return;
   }
@@ -95,20 +104,25 @@ void NativeTargetCache::ApplyPendingFastClear(uint32_t tile, uint32_t pitch_tile
                             clear.color_clear_capable &&
                             GetEdramClearColorFormatMode(image->format()).has_value();
   if (depth_target || color_target) {
-    ReplayAliasedFastClear(clear, image, samples);
+    ReplayAliasedFastClear(clear, image, samples, target_scaled);
   }
 }
 
 void NativeTargetCache::ReplayAliasedColorFastClear(const PendingColorFastClear& clear,
                                                     const std::shared_ptr<ColorImage>& image,
-                                                    xenos::MsaaSamples samples) {
-  queue_draw_(RescaleFastClearInput(clear.input, samples), clear.indices, *clear.vertex,
-              clear.pixel, clear.rt_index, image);
+                                                    xenos::MsaaSamples samples,
+                                                    bool target_scaled) {
+  const Shader::Translation* ps =
+      (target_scaled && !clear.resolution_scaled && clear.pixel_scaled) ? clear.pixel_scaled
+                                                                        : clear.pixel;
+  queue_draw_(RescaleFastClearInput(clear.input, samples, clear.resolution_scaled, target_scaled),
+              clear.indices, *clear.vertex, ps, clear.rt_index, image);
 }
 
 void NativeTargetCache::ApplyPendingColorFastClear(uint32_t tile, uint32_t pitch_tiles,
                                                    xenos::MsaaSamples samples, VkFormat format,
-                                                   const std::shared_ptr<ColorImage>& image) {
+                                                   const std::shared_ptr<ColorImage>& image,
+                                                   bool target_scaled) {
   if (samples >= xenos::MsaaSamples::k4X || !pitch_tiles) {
     return;
   }
@@ -116,7 +130,7 @@ void NativeTargetCache::ApplyPendingColorFastClear(uint32_t tile, uint32_t pitch
   if (pending == pending_color_fast_clears_.end()) {
     return;
   }
-  ReplayAliasedColorFastClear(pending->second, image, samples);
+  ReplayAliasedColorFastClear(pending->second, image, samples, target_scaled);
 }
 
 void NativeTargetCache::ErasePendingColorFastClears(uint32_t tile, uint32_t pitch_tiles) {
@@ -133,12 +147,26 @@ std::shared_ptr<ColorImage> NativeTargetCache::FindTarget(uint32_t tile, uint32_
                                                           VkImageAspectFlags aspects, bool is_64bpp,
                                                           uint32_t edram_tile_count,
                                                           const std::shared_ptr<ColorImage>& keep,
-                                                          uint32_t used_height) {
-  const auto key = std::tuple(tile, pitch, samples, format);
+                                                          uint32_t used_height,
+                                                          bool resolution_scaled) {
+  const bool scaled =
+      resolution_scaled && (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
+  const uint32_t sx = scaled ? draw_resolution_scale_x_ : 1;
+  const uint32_t sy = scaled ? draw_resolution_scale_y_ : 1;
+  const TargetKey key{tile, pitch, samples, format, scaled};
+  if (last_target_valid_ && last_target_key_ == key) {
+    last_target_->last_use_submission = clock_.next;
+    ClaimTiles(*last_target_, tile, pitch, samples, format, is_64bpp, used_height, edram_tile_count,
+               scaled);
+    return last_target_->image;
+  }
   if (auto existing = targets_.find(key); existing != targets_.end()) {
+    last_target_key_ = key;
+    last_target_ = &existing->second;
+    last_target_valid_ = true;
     existing->second.last_use_submission = clock_.next;
     ClaimTiles(existing->second, tile, pitch, samples, format, is_64bpp, used_height,
-               edram_tile_count);
+               edram_tile_count, scaled);
     return existing->second.image;
   }
   if (!pitch) {
@@ -154,45 +182,62 @@ std::shared_ptr<ColorImage> NativeTargetCache::FindTarget(uint32_t tile, uint32_
     if (!victim) {
       return {};
     }
-    targets_.erase(*victim);
+    if (auto it = targets_.find(*victim); it != targets_.end()) {
+      owners_.erase(it->second.owner_id);
+      if (last_target_valid_ && last_target_key_ == *victim) {
+        last_target_valid_ = false;
+        last_target_ = nullptr;
+      }
+      targets_.erase(it);
+    }
   }
   const auto& properties = device_.properties();
   const uint32_t max_width =
       std::min(properties.maxImageDimension2D, properties.maxFramebufferWidth);
   const uint32_t max_height =
       std::min(properties.maxImageDimension2D, properties.maxFramebufferHeight);
-  if (uint64_t(pitch) * draw_resolution_scale_x_ > max_width) {
+  if (uint64_t(pitch) * sx > max_width) {
     return {};
   }
-  const uint32_t height = GetTargetHeight(pitch, samples, edram_tile_count,
-                                          max_height / draw_resolution_scale_y_, is_64bpp);
+  const uint32_t height =
+      GetTargetHeight(pitch, samples, edram_tile_count, max_height / sy, is_64bpp);
   auto image = std::make_shared<ColorImage>(device_, allocator_);
-  if (!image->Initialize({pitch * draw_resolution_scale_x_, height * draw_resolution_scale_y_},
-                         format, VkSampleCountFlagBits(1u << uint32_t(samples)), aspects)) {
+  if (!image->Initialize({pitch * sx, height * sy}, format,
+                         VkSampleCountFlagBits(1u << uint32_t(samples)), aspects)) {
     return {};
   }
   // ponytail: only same-format, same-sample, same-pitch aliases transfer their
   // tiles; reinterpreting other formats needs transfer shaders.
-  auto& created = targets_.emplace(key, CachedTarget{{image, clock_.next}}).first->second;
+  const uint64_t owner_id = next_owner_id_++;
+  auto& created =
+      targets_.emplace(key, CachedTarget{{image, clock_.next}, owner_id}).first->second;
+  owners_.emplace(owner_id, image);
+  last_target_key_ = key;
+  last_target_ = &created;
+  last_target_valid_ = true;
   // Inherit the aliased tiles first: a fast clear still pending is newer.
-  ClaimTiles(created, tile, pitch, samples, format, is_64bpp, used_height, edram_tile_count);
+  ClaimTiles(created, tile, pitch, samples, format, is_64bpp, used_height, edram_tile_count,
+             scaled);
   if (!is_64bpp) {
-    ApplyPendingFastClear(tile, xenos::GetSurfacePitchTiles(pitch, samples, false), samples, image);
+    ApplyPendingFastClear(tile, xenos::GetSurfacePitchTiles(pitch, samples, false), samples, image,
+                          scaled);
   }
   if ((aspects & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
     ApplyPendingColorFastClear(tile, xenos::GetSurfacePitchTiles(pitch, samples, is_64bpp), samples,
-                               format, image);
+                               format, image, scaled);
   }
   return image;
 }
 
 void NativeTargetCache::ClaimTiles(CachedTarget& target, uint32_t tile, uint32_t pitch,
                                    xenos::MsaaSamples samples, VkFormat format, bool is_64bpp,
-                                   uint32_t used_height, uint32_t edram_tile_count) {
+                                   uint32_t used_height, uint32_t edram_tile_count,
+                                   bool resolution_scaled) {
   const uint32_t pitch_tiles = xenos::GetSurfacePitchTiles(pitch, samples, is_64bpp);
-  const VkExtent2D tile_extent =
-      GetEdramTileHostExtent(samples, is_64bpp, draw_resolution_scale_x_, draw_resolution_scale_y_);
-  const uint32_t guest_tile_height = tile_extent.height / draw_resolution_scale_y_;
+  const uint32_t sx = resolution_scaled ? draw_resolution_scale_x_ : 1;
+  const uint32_t sy = resolution_scaled ? draw_resolution_scale_y_ : 1;
+  const VkExtent2D tile_extent = GetEdramTileHostExtent(samples, is_64bpp, sx, sy);
+  const uint32_t guest_tile_height = tile_extent.height / sy;
   if (!used_height || !pitch_tiles || !guest_tile_height || tile >= edram_tile_count) {
     return;
   }
@@ -202,58 +247,49 @@ void NativeTargetCache::ClaimTiles(CachedTarget& target, uint32_t tile, uint32_t
   if (target.claimed_epoch == ownership_epoch_ && target.claimed_end >= end) {
     return;
   }
-  if (tile_owners_.size() < edram_tile_count) {
-    tile_owners_.resize(edram_tile_count);
-  }
   const VkExtent2D extent = target.image->extent();
-  bool changed = false;
-  for (uint32_t run_start = tile; run_start < end;) {
-    const TileOwner owner = tile_owners_[run_start];
-    uint32_t run_end = run_start + 1;
-    while (run_end < end && SameOwner(tile_owners_[run_end].image, owner.image)) {
-      ++run_end;
-    }
-    if (SameOwner(owner.image, target.image)) {
-      run_start = run_end;
-      continue;
-    }
-    const auto previous = owner.image.lock();
-    // Whether the source was ever written is only known when the copy is recorded.
-    if (previous && owner.pitch_tiles == pitch_tiles &&
-        owner.samples == samples && owner.format == format && owner.is_64bpp == is_64bpp) {
-      const VkExtent2D source_extent = previous->extent();
-      std::vector<VkImageCopy> copies;
-      for (const auto& rect : ComputeOverlappingEdramTileCopies(owner.base, tile, pitch_tiles,
-                                                                run_start, run_end)) {
-        const uint32_t src_x = rect.src_x * tile_extent.width;
-        const uint32_t src_y = rect.src_y * tile_extent.height;
-        const uint32_t dst_x = rect.dst_x * tile_extent.width;
-        const uint32_t dst_y = rect.dst_y * tile_extent.height;
-        if (src_x >= source_extent.width || src_y >= source_extent.height ||
-            dst_x >= extent.width || dst_y >= extent.height) {
-          continue;
+  const TileRun claim{tile,    end,     target.owner_id, tile,
+                      pitch_tiles, samples, format,          is_64bpp,
+                      resolution_scaled};
+  const bool changed = SpliceTileRun(
+      tile_runs_, claim, [&](const TileRun& owner, uint32_t run_start, uint32_t run_end) {
+        if (owner.pitch_tiles != pitch_tiles || owner.samples != samples ||
+            owner.format != format || owner.is_64bpp != is_64bpp ||
+            owner.resolution_scaled != resolution_scaled) {
+          return;
         }
-        VkImageCopy copy{};
-        copy.srcSubresource = copy.dstSubresource = {target.image->aspects(), 0, 0, 1};
-        copy.srcOffset = {int32_t(src_x), int32_t(src_y), 0};
-        copy.dstOffset = {int32_t(dst_x), int32_t(dst_y), 0};
-        copy.extent = {std::min({rect.width * tile_extent.width, source_extent.width - src_x,
-                                 extent.width - dst_x}),
-                       std::min({rect.height * tile_extent.height, source_extent.height - src_y,
-                                 extent.height - dst_y}),
-                       1};
-        copies.push_back(copy);
-      }
-      if (!copies.empty()) {
-        queue_transfer_(previous, target.image, std::move(copies));
-      }
-    }
-    for (uint32_t i = run_start; i < run_end; ++i) {
-      tile_owners_[i] = {target.image, tile, pitch_tiles, samples, format, is_64bpp};
-    }
-    changed = true;
-    run_start = run_end;
-  }
+        auto prev_it = owners_.find(owner.owner_id);
+        if (prev_it == owners_.end()) {
+          return;
+        }
+        const auto& previous = prev_it->second;
+        const VkExtent2D source_extent = previous->extent();
+        std::vector<VkImageCopy> copies;
+        for (const auto& rect : ComputeOverlappingEdramTileCopies(owner.base, tile, pitch_tiles,
+                                                                  run_start, run_end)) {
+          const uint32_t src_x = rect.src_x * tile_extent.width;
+          const uint32_t src_y = rect.src_y * tile_extent.height;
+          const uint32_t dst_x = rect.dst_x * tile_extent.width;
+          const uint32_t dst_y = rect.dst_y * tile_extent.height;
+          if (src_x >= source_extent.width || src_y >= source_extent.height ||
+              dst_x >= extent.width || dst_y >= extent.height) {
+            continue;
+          }
+          VkImageCopy copy{};
+          copy.srcSubresource = copy.dstSubresource = {target.image->aspects(), 0, 0, 1};
+          copy.srcOffset = {int32_t(src_x), int32_t(src_y), 0};
+          copy.dstOffset = {int32_t(dst_x), int32_t(dst_y), 0};
+          copy.extent = {std::min({rect.width * tile_extent.width, source_extent.width - src_x,
+                                   extent.width - dst_x}),
+                         std::min({rect.height * tile_extent.height, source_extent.height - src_y,
+                                   extent.height - dst_y}),
+                         1};
+          copies.push_back(copy);
+        }
+        if (!copies.empty()) {
+          queue_transfer_(previous, target.image, std::move(copies));
+        }
+      });
   if (changed) {
     ++ownership_epoch_;
   }

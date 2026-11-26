@@ -399,6 +399,12 @@ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_
   }
 }
 
+void GraphicsSystem::FlushShaderStorage() {
+  if (command_processor_) {
+    command_processor_->FlushShaderStorage();
+  }
+}
+
 void GraphicsSystem::Pause() {
   paused_ = true;
   command_processor_->Pause();

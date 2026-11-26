@@ -524,6 +524,9 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   if (runtime_ && runtime_->kernel_state()) {
     runtime_->kernel_state()->TerminateTitle();
   }
+  if (runtime_ && runtime_->graphics_system()) {
+    runtime_->graphics_system()->FlushShaderStorage();
+  }
   // Hard-exit rather than run subsystem teardown, which can deadlock on a host
   // lock still held by a straggler TerminateTitle left running. Flush (not
   // ShutdownLogging, which frees loggers a straggler may still use); the OS

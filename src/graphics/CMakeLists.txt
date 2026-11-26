@@ -191,6 +191,7 @@ if(REXGLUE_USE_VULKAN)
         native/color_resolve.cpp
         native/depth_resolve.cpp
         native/draw_pass.cpp
+        native/index_cache.cpp
         native/output_gamma.cpp
         native/image_readback.cpp
         native/shared_vertex_memory.cpp

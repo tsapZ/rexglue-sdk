@@ -85,6 +85,9 @@ DrawBindings::~DrawBindings() {
       pools[1]->Free(entry.second);
     }
   }
+  for (uint32_t f = 0; f < 3; ++f) {
+    ReleaseFrameTextureSets(f);
+  }
   for (size_t i = 0; i < empty_set_indices.size(); ++i) {
     if (empty_set_indices[i] != SIZE_MAX && pools[i]) {
       pools[i]->Free(empty_set_indices[i]);
@@ -137,8 +140,13 @@ VkDescriptorSet DrawBindings::GetOrCreateSharedVertexSet(VkBuffer buffer, uint32
 }
 
 VkDescriptorSet DrawBindings::GetOrCreateConstantSet(VkBuffer buffer) {
+  if (buffer == last_constant_buffer && last_constant_set != VK_NULL_HANDLE) {
+    return last_constant_set;
+  }
   if (auto found = constant_sets.find(buffer); found != constant_sets.end()) {
-    return pools[1]->Get(found->second);
+    last_constant_buffer = buffer;
+    last_constant_set = pools[1]->Get(found->second);
+    return last_constant_set;
   }
   const size_t index = pools[1]->Allocate();
   if (index == SIZE_MAX) {
@@ -147,6 +155,100 @@ VkDescriptorSet DrawBindings::GetOrCreateConstantSet(VkBuffer buffer) {
   const VkDescriptorSet set = pools[1]->Get(index);
   WriteConstantSet(set, buffer);
   constant_sets.emplace(buffer, index);
+  last_constant_buffer = buffer;
+  last_constant_set = set;
+  return set;
+}
+
+void DrawBindings::CommitPendingTextureSets(uint32_t frame_slot) {
+  if (frame_slot >= 2) {
+    return;
+  }
+  ReleaseFrameTextureSets(frame_slot);
+  for (size_t s = 0; s < 2; ++s) {
+    texture_sets_[frame_slot][s].swap(texture_sets_[kPendingTextureSetSlot][s]);
+  }
+}
+
+void DrawBindings::ReleaseFrameTextureSets(uint32_t frame_slot) {
+  if (frame_slot >= texture_sets_.size()) {
+    return;
+  }
+  for (size_t s = 0; s < 2; ++s) {
+    if (pools[s + 2]) {
+      for (const auto& entry : texture_sets_[frame_slot][s]) {
+        pools[s + 2]->Free(entry.second);
+      }
+    }
+    texture_sets_[frame_slot][s].clear();
+  }
+}
+
+VkDescriptorSet DrawBindings::GetOrCreateTextureSet(size_t set_slot, uint32_t frame_slot,
+                                                    std::span<const VkImageView> views,
+                                                    std::span<const VkSampler> samplers) {
+  if (set_slot < 2 || set_slot > 3 || frame_slot >= 3) {
+    return VK_NULL_HANDLE;
+  }
+  auto& cache = texture_sets_[frame_slot][set_slot - 2];
+  TextureSetKey key;
+  key.views.assign(views.begin(), views.end());
+  key.samplers.assign(samplers.begin(), samplers.end());
+  if (auto found = cache.find(key); found != cache.end()) {
+    return pools[set_slot]->Get(found->second);
+  }
+  const size_t index = pools[set_slot]->Allocate();
+  if (index == SIZE_MAX) {
+    return VK_NULL_HANDLE;
+  }
+  const VkDescriptorSet set = pools[set_slot]->Get(index);
+  const size_t total = views.size() + samplers.size();
+  constexpr size_t kInlineImageInfos = 64;
+  std::array<VkDescriptorImageInfo, kInlineImageInfos> inline_image_infos{};
+  std::vector<VkDescriptorImageInfo> heap_image_infos;
+  VkDescriptorImageInfo* image_infos = inline_image_infos.data();
+  if (total > kInlineImageInfos) {
+    heap_image_infos.resize(total);
+    image_infos = heap_image_infos.data();
+  }
+  uint32_t info_count = 0;
+  for (VkImageView view : views) {
+    image_infos[info_count++] = {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  }
+  for (VkSampler sampler : samplers) {
+    image_infos[info_count++] = {sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+  }
+  std::array<VkWriteDescriptorSet, 2> writes{};
+  uint32_t write_count = 0;
+  if (!views.empty()) {
+    writes[write_count++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                             nullptr,
+                             set,
+                             0,
+                             0,
+                             uint32_t(views.size()),
+                             VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                             image_infos,
+                             nullptr,
+                             nullptr};
+  }
+  if (!samplers.empty()) {
+    writes[write_count++] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                             nullptr,
+                             set,
+                             uint32_t(views.size()),
+                             0,
+                             uint32_t(samplers.size()),
+                             VK_DESCRIPTOR_TYPE_SAMPLER,
+                             image_infos + views.size(),
+                             nullptr,
+                             nullptr};
+  }
+  if (write_count) {
+    device.functions().vkUpdateDescriptorSets(device.device(), write_count, writes.data(), 0,
+                                              nullptr);
+  }
+  cache.emplace(std::move(key), index);
   return set;
 }
 
@@ -274,7 +376,10 @@ DrawPass& DrawPass::operator=(DrawPass&& other) noexcept {
   buffer_memory_ = std::exchange(other.buffer_memory_, VkDeviceMemory(VK_NULL_HANDLE));
   textures_ = std::move(other.textures_);
   other.textures_.clear();
+  indexed_ = other.indexed_;
+  index_buffer_ = other.index_buffer_;
   index_offset_ = other.index_offset_;
+  index_type_ = other.index_type_;
   index_count_ = other.index_count_;
   viewport_ = other.viewport_;
   scissor_ = other.scissor_;
@@ -286,6 +391,8 @@ DrawPass& DrawPass::operator=(DrawPass&& other) noexcept {
   stencil_reference_ = other.stencil_reference_;
   edram_depth_clear_color_ = other.edram_depth_clear_color_;
   edram_clear_constants_ = other.edram_clear_constants_;
+  rasterizer_discard_ = other.rasterizer_discard_;
+  has_texture_work_ = std::exchange(other.has_texture_work_, false);
   return *this;
 }
 
@@ -317,12 +424,15 @@ void DrawPass::Release() {
   }
 }
 
-bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indices,
+bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_binding,
+                          std::span<const uint32_t> inline_indices,
                           const Shader::Translation& vertex, const Shader::Translation* pixel,
                           uint32_t shared_buffer_count, VkPipelineCache pipeline_cache,
                           DrawPipelines& pipelines, DrawBindingCache& binding_cache,
                           ui::vulkan::VulkanUploadBufferPool& uploads, uint64_t submission,
-                          VkBuffer shared_vertex_buffer) {
+                          uint32_t frame_slot, VkBuffer shared_vertex_buffer,
+                          std::timed_mutex* pipeline_cache_mutex,
+                          const PreuploadedConstants* preuploaded_constants) {
   const auto& vk = device_->functions();
   const VkDevice device = device_->device();
 
@@ -337,7 +447,13 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
                            input.depth_stencil.back.compareMask};
   stencil_write_mask_ = {input.depth_stencil.front.writeMask, input.depth_stencil.back.writeMask};
   stencil_reference_ = {input.depth_stencil.front.reference, input.depth_stencil.back.reference};
-  index_count_ = uint32_t(indices.size());
+  indexed_ = index_binding.indexed;
+  index_buffer_ = index_binding.buffer;
+  index_offset_ = index_binding.offset;
+  index_type_ = index_binding.type;
+  index_count_ = indexed_ && index_buffer_ == VK_NULL_HANDLE ? uint32_t(inline_indices.size())
+                                                             : index_binding.count;
+  const bool upload_inline_indices = indexed_ && index_buffer_ == VK_NULL_HANDLE;
   edram_depth_clear_color_ = input.edram_depth_clear_color;
   edram_clear_constants_ = {input.edram_clear_stencil, input.edram_clear_format};
   rasterizer_discard_ = input.rasterizer_discard;
@@ -368,6 +484,10 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     if (i == DrawRenderState::kDynamicSet) {
       continue;
     }
+    if (i >= 2) {
+      // Texture/sampler sets (2 & 3) are cached per frame slot below.
+      continue;
+    }
     if (bindings_->empty_layouts[i]) {
       sets_[i] = bindings_->GetEmptySet(i);
       if (sets_[i] == VK_NULL_HANDLE) {
@@ -385,6 +505,7 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
 
   const auto props = device_->properties();
   const VkDeviceSize uniform_alignment = props.minUniformBufferOffsetAlignment;
+  const bool use_preuploaded_constants = preuploaded_constants != nullptr;
   const std::array<std::span<const uint8_t>, Translator::kConstantBufferCount> constants{{
       {reinterpret_cast<const uint8_t*>(&input.system), sizeof(input.system)},
       {reinterpret_cast<const uint8_t*>(input.float_constants[0].data()),
@@ -399,16 +520,25 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   VkDeviceSize size = vertex_size;
   std::array<VkDescriptorBufferInfo, Translator::kConstantBufferCount> constant_infos{};
   std::array<uint64_t, Translator::kConstantBufferCount> constant_offsets{};
-  for (size_t i = 0; i < constants.size(); ++i) {
-    size = rex::align(size, uniform_alignment);
-    constant_infos[i].offset = constant_offsets[i] = size;
-    constant_infos[i].range = std::max<size_t>(constants[i].size(), 16);
-    size += constant_infos[i].range;
+  if (!use_preuploaded_constants) {
+    for (size_t i = 0; i < constants.size(); ++i) {
+      size = rex::align(size, uniform_alignment);
+      constant_infos[i].offset = constant_offsets[i] = size;
+      constant_infos[i].range = std::max<size_t>(constants[i].size(), 16);
+      size += constant_infos[i].range;
+    }
   }
-  index_offset_ = rex::align(size, VkDeviceSize(4));
-  size = index_offset_ + indices.size_bytes();
+  if (upload_inline_indices) {
+    index_offset_ = rex::align(size, VkDeviceSize(4));
+    size = index_offset_ + inline_indices.size_bytes();
+  }
   for (size_t i = 0; i < textures_.size(); ++i) {
     const auto& input_texture = input.textures[i];
+    if (input_texture.direct_upload_buffer != VK_NULL_HANDLE) {
+      textures_[i].direct_upload_buffer = input_texture.direct_upload_buffer;
+      textures_[i].uploads = input_texture.direct_uploads;
+      continue;
+    }
     const bool is_3d = input_texture.view_type == VK_IMAGE_VIEW_TYPE_3D;
     for (uint32_t index = 0; index < input_texture.levels.size(); ++index) {
       const uint32_t level = input_texture.first_level + index;
@@ -422,58 +552,77 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
       size = copy.bufferOffset + input_texture.levels[index].size();
     }
   }
-  size = ComputeDynamicUboRequiredSize(constant_offsets, kDynamicConstantBufferRanges, size);
+  if (!use_preuploaded_constants) {
+    size = ComputeDynamicUboRequiredSize(constant_offsets, kDynamicConstantBufferRanges, size);
+  }
   const VkDeviceSize alignment =
       std::max({VkDeviceSize(16), uniform_alignment, props.minStorageBufferOffsetAlignment});
   VkDeviceSize buffer_offset = 0;
   uint8_t* bytes = nullptr;
-  if (rex::align(size, alignment) <= kDrawUploadPageSize) {
-    bytes = uploads.Request(submission, size, alignment, buffer_, buffer_offset);
-  } else {
-    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(device_, size, kDrawUploadUsage,
-                                                           ui::vulkan::util::MemoryPurpose::kUpload,
-                                                           buffer_, buffer_memory_)) {
+  if (size > 0) {
+    if (rex::align(size, alignment) <= kDrawUploadPageSize) {
+      bytes = uploads.Request(submission, size, alignment, buffer_, buffer_offset);
+    } else {
+      if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+              device_, size, kDrawUploadUsage, ui::vulkan::util::MemoryPurpose::kUpload, buffer_,
+              buffer_memory_)) {
+        return false;
+      }
+      void* mapped = nullptr;
+      if (vk.vkMapMemory(device, buffer_memory_, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
+        bytes = static_cast<uint8_t*>(mapped);
+      }
+    }
+    if (!bytes) {
       return false;
     }
-    void* mapped = nullptr;
-    if (vk.vkMapMemory(device, buffer_memory_, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
-      bytes = static_cast<uint8_t*>(mapped);
-    }
-  }
-  if (!bytes) {
-    return false;
   }
   if (vertex_size) {
     std::memcpy(bytes, input.vertices.data(), vertex_size);
   }
-  for (size_t i = 0; i < constants.size(); ++i) {
-    constant_infos[i].buffer = buffer_;
-    uint8_t* target = bytes + constant_infos[i].offset;
-    if (constants[i].empty()) {
-      std::memset(target, 0, constant_infos[i].range);
-    } else {
-      std::memcpy(target, constants[i].data(), constants[i].size());
-    }
-    constant_infos[i].offset += buffer_offset;
-    dynamic_offsets_[i] = uint32_t(constant_infos[i].offset);
-  }
-  if (buffer_memory_) {
-    // A dedicated buffer outlives no other draw, so it gets a set of its own.
-    set_indices_[1] = bindings_->pools[1]->Allocate();
-    if (set_indices_[1] == SIZE_MAX) {
-      return false;
-    }
-    sets_[1] = bindings_->pools[1]->Get(set_indices_[1]);
-    bindings_->WriteConstantSet(sets_[1], buffer_);
-  } else {
-    sets_[1] = bindings_->GetOrCreateConstantSet(buffer_);
+  if (use_preuploaded_constants) {
+    dynamic_offsets_ = preuploaded_constants->dynamic_offsets;
+    sets_[1] = bindings_->GetOrCreateConstantSet(preuploaded_constants->buffer);
     if (sets_[1] == VK_NULL_HANDLE) {
       return false;
     }
+  } else {
+    for (size_t i = 0; i < constants.size(); ++i) {
+      constant_infos[i].buffer = buffer_;
+      uint8_t* target = bytes + constant_infos[i].offset;
+      if (constants[i].empty()) {
+        std::memset(target, 0, constant_infos[i].range);
+      } else {
+        std::memcpy(target, constants[i].data(), constants[i].size());
+      }
+      constant_infos[i].offset += buffer_offset;
+      dynamic_offsets_[i] = uint32_t(constant_infos[i].offset);
+    }
+    if (buffer_memory_) {
+      // A dedicated buffer outlives no other draw, so it gets a set of its own.
+      set_indices_[1] = bindings_->pools[1]->Allocate();
+      if (set_indices_[1] == SIZE_MAX) {
+        return false;
+      }
+      sets_[1] = bindings_->pools[1]->Get(set_indices_[1]);
+      bindings_->WriteConstantSet(sets_[1], buffer_);
+    } else {
+      sets_[1] = bindings_->GetOrCreateConstantSet(buffer_);
+      if (sets_[1] == VK_NULL_HANDLE) {
+        return false;
+      }
+    }
   }
-  std::memcpy(bytes + index_offset_, indices.data(), indices.size_bytes());
-  index_offset_ += buffer_offset;
+  if (upload_inline_indices) {
+    std::memcpy(bytes + index_offset_, inline_indices.data(), inline_indices.size_bytes());
+    index_buffer_ = buffer_;
+    index_offset_ += buffer_offset;
+    index_type_ = VK_INDEX_TYPE_UINT32;
+  }
   for (size_t i = 0; i < textures_.size(); ++i) {
+    if (textures_[i].direct_upload_buffer != VK_NULL_HANDLE) {
+      continue;
+    }
     for (size_t level = 0; level < textures_[i].uploads.size(); ++level) {
       const auto& pixels = input.textures[i].levels[level];
       auto& copy = textures_[i].uploads[level];
@@ -548,18 +697,21 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     // Cached images, their views and their upload state are owned by the command
     // processor; only an entry that has not been uploaded yet records a copy.
     if (texture.cached) {
+      has_texture_work_ |= texture.upload_cached;
       texture.view = input_texture.cached_view;
       continue;
     }
     // Resolved images cache their sampler views by component mapping, so a
     // draw only borrows one instead of creating and destroying a view.
     if (texture.resolved) {
+      has_texture_work_ = true;
       texture.view = texture.resolved->GetSampledView(input_texture.swizzle);
       if (texture.view == VK_NULL_HANDLE) {
         return false;
       }
       continue;
     }
+    has_texture_work_ = true;
     const uint32_t level_count = std::max(1u, input_texture.level_count);
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.imageType =
@@ -590,51 +742,31 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
     }
   }
   // Set 2 holds the vertex shader textures, set 3 the pixel shader ones.
-  const auto write_textures = [&](VkDescriptorSet set, std::span<const uint32_t> bindings,
-                                  std::span<const VkSampler> samplers) {
-    const size_t total = bindings.size() + samplers.size();
-    if (!total) {
-      return;
+  const auto resolve_texture_set = [&](size_t set_slot, std::span<const uint32_t> bindings,
+                                       std::span<const VkSampler> samplers) -> bool {
+    if (bindings_->empty_layouts[set_slot]) {
+      sets_[set_slot] = bindings_->GetEmptySet(set_slot);
+      return sets_[set_slot] != VK_NULL_HANDLE;
     }
-    // Keep the descriptor data on the stack for the common binding counts.
-    constexpr size_t kInlineImageInfos = 64;
-    std::array<VkDescriptorImageInfo, kInlineImageInfos> inline_image_infos{};
-    std::array<VkWriteDescriptorSet, kInlineImageInfos> inline_image_writes{};
-    std::vector<VkDescriptorImageInfo> heap_image_infos;
-    std::vector<VkWriteDescriptorSet> heap_image_writes;
-    VkDescriptorImageInfo* image_infos = inline_image_infos.data();
-    VkWriteDescriptorSet* image_writes = inline_image_writes.data();
-    if (total > kInlineImageInfos) {
-      heap_image_infos.resize(total);
-      heap_image_writes.resize(total);
-      image_infos = heap_image_infos.data();
-      image_writes = heap_image_writes.data();
+    constexpr size_t kInlineViews = 32;
+    std::array<VkImageView, kInlineViews> inline_views{};
+    std::vector<VkImageView> heap_views;
+    VkImageView* view_ptr = inline_views.data();
+    if (bindings.size() > kInlineViews) {
+      heap_views.resize(bindings.size());
+      view_ptr = heap_views.data();
     }
-    uint32_t info_count = 0;
-    for (uint32_t texture_index : bindings) {
-      image_infos[info_count++] = {VK_NULL_HANDLE, textures_[texture_index].view,
-                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    for (size_t i = 0; i < bindings.size(); ++i) {
+      view_ptr[i] = textures_[bindings[i]].view;
     }
-    for (VkSampler sampler : samplers) {
-      image_infos[info_count++] = {sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
-    }
-    for (uint32_t i = 0; i < info_count; ++i) {
-      image_writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                         nullptr,
-                         set,
-                         i,
-                         0,
-                         1,
-                         i < bindings.size() ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
-                                             : VK_DESCRIPTOR_TYPE_SAMPLER,
-                         &image_infos[i],
-                         nullptr,
-                         nullptr};
-    }
-    vk.vkUpdateDescriptorSets(device, info_count, image_writes, 0, nullptr);
+    sets_[set_slot] = bindings_->GetOrCreateTextureSet(
+        set_slot, frame_slot, std::span<const VkImageView>(view_ptr, bindings.size()), samplers);
+    return sets_[set_slot] != VK_NULL_HANDLE;
   };
-  write_textures(sets_[2], input.vertex_texture_bindings, input.vertex_samplers);
-  write_textures(sets_[3], input.texture_bindings, input.samplers);
+  if (!resolve_texture_set(2, input.vertex_texture_bindings, input.vertex_samplers) ||
+      !resolve_texture_set(3, input.texture_bindings, input.samplers)) {
+    return false;
+  }
 
   const auto& depth = input.depth_stencil;
   const auto& front = depth.front;
@@ -752,8 +884,15 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
   pipeline.pColorBlendState = &blend;
   pipeline.pDynamicState = &dynamic;
   pipeline.layout = bindings_->pipeline_layout;
-  const VkResult result =
-      vk.vkCreateGraphicsPipelines(device, pipeline_cache, 1, &pipeline, nullptr, &pipeline_);
+  VkResult result;
+  if (pipeline_cache_mutex) {
+    std::lock_guard<std::timed_mutex> lock(*pipeline_cache_mutex);
+    result =
+        vk.vkCreateGraphicsPipelines(device, pipeline_cache, 1, &pipeline, nullptr, &pipeline_);
+  } else {
+    result =
+        vk.vkCreateGraphicsPipelines(device, pipeline_cache, 1, &pipeline, nullptr, &pipeline_);
+  }
   vk.vkDestroyShaderModule(device, vs, nullptr);
   vk.vkDestroyShaderModule(device, ps, nullptr);
   if (result != VK_SUCCESS) {
@@ -764,6 +903,9 @@ bool DrawPass::Initialize(const DrawInput& input, std::span<const uint32_t> indi
 }
 
 void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
+  if (!has_texture_work_) {
+    return;
+  }
   const auto& vk = device_->functions();
   for (const auto& texture : textures_) {
     if (texture.fallback_view != VK_NULL_HANDLE) {
@@ -841,7 +983,9 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
                                VK_ACCESS_SHADER_READ_BIT);
       }
     } else {
-      vk.vkCmdCopyBufferToImage(commands, buffer_, image, barrier.newLayout,
+      const VkBuffer copy_buffer =
+          texture.direct_upload_buffer != VK_NULL_HANDLE ? texture.direct_upload_buffer : buffer_;
+      vk.vkCmdCopyBufferToImage(commands, copy_buffer, image, barrier.newLayout,
                                 uint32_t(texture.uploads.size()), texture.uploads.data());
     }
     barrier.oldLayout = barrier.newLayout;
@@ -923,14 +1067,18 @@ void DrawPass::Record(VkCommandBuffer commands, VkExtent2D extent, DrawRenderSta
     set_stencil(vk.vkCmdSetStencilReference, stencil_reference_, state.stencil_reference,
                 state.stencil_reference_valid);
   }
-  if (state.SetIndexBuffer(buffer_, index_offset_)) {
-    vk.vkCmdBindIndexBuffer(commands, buffer_, index_offset_, VK_INDEX_TYPE_UINT32);
-  }
   if (edram_depth_clear_color_) {
     vk.vkCmdPushConstants(commands, bindings_->pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                           sizeof(edram_clear_constants_), edram_clear_constants_.data());
   }
-  vk.vkCmdDrawIndexed(commands, index_count_, 1, 0, 0, 0);
+  if (indexed_) {
+    if (state.SetIndexBuffer(index_buffer_, index_offset_, index_type_)) {
+      vk.vkCmdBindIndexBuffer(commands, index_buffer_, index_offset_, index_type_);
+    }
+    vk.vkCmdDrawIndexed(commands, index_count_, 1, 0, 0, 0);
+  } else {
+    vk.vkCmdDraw(commands, index_count_, 1, 0, 0);
+  }
 }
 
 }  // namespace rex::graphics::native

@@ -47,6 +47,7 @@ class NativeTextureCache {
     uint32_t copy_dest_pitch = 0;
     xenos::Endian128 endian = xenos::Endian128::kNone;
     bool rgba8_readback_valid = false;
+    bool resolution_scaled = true;
   };
   static constexpr size_t kMaxResolvedImages = 256;
 
@@ -71,7 +72,9 @@ class NativeTextureCache {
   // before any draw that may sample them.
   void RecordNullTextureInitialization(VkCommandBuffer commands);
   // Reads the textures and samplers a vertex or pixel shader binds.
-  bool ReadTextures(const SpirvShader& shader, bool vertex, DrawInput& input);
+  bool ReadTextures(const SpirvShader& shader, bool vertex, DrawInput& input,
+                    ui::vulkan::VulkanUploadBufferPool* uploads = nullptr,
+                    uint64_t submission = 0);
 
   void InvalidateTextures(uint32_t start, uint32_t length);
   void InvalidateResolvedTextures(uint32_t start, uint32_t length);
@@ -102,21 +105,24 @@ class NativeTextureCache {
     uint64_t last_use_submission = 0;
   };
   static constexpr size_t kMaxSamplers = 256;
-  static constexpr size_t kMaxCachedTextures = 1024;
+  static constexpr size_t kMaxCachedTextures = 8192;
   static constexpr size_t kMaxResolvedCubes = 64;
   static constexpr size_t kMaxResolvedCrops = 64;
 
   // signed_variant: the texels for signed components, for formats whose
   // unpacking depends on the sign.
   bool ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch, DrawTexture& texture,
-                   bool signed_variant);
+                   bool signed_variant, ui::vulkan::VulkanUploadBufferPool* uploads = nullptr,
+                   uint64_t submission = 0);
   bool DecodeTextureLevels(const xenos::xe_gpu_texture_fetch_t& fetch,
                            const TextureFormatInfo& info,
                            const texture_util::TextureGuestLayout& layout, uint32_t address,
-                           uint32_t mip_page, bool signed_variant, DrawTexture& texture);
+                           uint32_t mip_page, bool signed_variant, DrawTexture& texture,
+                           ui::vulkan::VulkanUploadBufferPool* uploads = nullptr,
+                           uint64_t submission = 0);
   // Turns a copy of an unsigned texture into its view for signed components.
   bool MakeSignedView(DrawTexture& texture, VkFormat signed_format);
-  bool IsLinearFilterable(VkFormat format);
+  bool IsLinearFilterable(xenos::TextureFormat guest_format, VkFormat format);
   VkSampler GetSampler(const DrawSampler& key);
   bool InitializeNullTextures();
   void DestroyNullTextures();
@@ -143,7 +149,11 @@ class NativeTextureCache {
   VkDeviceMemory null_texture_3d_memory_ = VK_NULL_HANDLE;
   VkImageView null_texture_3d_view_ = VK_NULL_HANDLE;
   bool null_textures_initialized_ = false;
-  std::unordered_map<uint32_t, bool> linear_filterable_;
+  std::array<int8_t, 64> linear_filterable_ = [] {
+    std::array<int8_t, 64> a{};
+    a.fill(-1);
+    return a;
+  }();
   uint32_t custom_border_color_samplers_ = 0;
   std::unordered_map<uint32_t, CachedResolve> resolved_images_;
   std::optional<uint32_t> presented_resolve_address_;

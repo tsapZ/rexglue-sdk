@@ -5,6 +5,7 @@
 #include <memory>
 #include <span>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -29,13 +30,16 @@ class NativeTargetCache {
     xenos::DepthRenderTargetFormat depth_format = xenos::DepthRenderTargetFormat::kD24S8;
     bool color_clear_capable = false;
     uint32_t clear_stencil = 0;
+    bool resolution_scaled = false;
   };
   struct PendingColorFastClear {
     DrawInput input;
     std::vector<uint32_t> indices;
     const Shader::Translation* vertex = nullptr;
     const Shader::Translation* pixel = nullptr;
+    const Shader::Translation* pixel_scaled = nullptr;
     uint32_t rt_index = 0;
+    bool resolution_scaled = false;
   };
   // Queues a replayed clear draw on `image`: color attachment `rt_index` of a
   // color image, or the depth attachment of a depth image.
@@ -48,7 +52,24 @@ class NativeTargetCache {
   using QueueTransfer = std::function<void(const std::shared_ptr<ColorImage>& source,
                                            const std::shared_ptr<ColorImage>& destination,
                                            std::vector<VkImageCopy> copies)>;
-  using TargetKey = std::tuple<uint32_t, uint32_t, xenos::MsaaSamples, VkFormat>;
+  struct TargetKey {
+    uint32_t tile = 0;
+    uint32_t pitch = 0;
+    xenos::MsaaSamples samples = xenos::MsaaSamples::k1X;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    bool resolution_scaled = false;
+    auto operator<=>(const TargetKey&) const = default;
+  };
+  struct TargetKeyHash {
+    size_t operator()(const TargetKey& k) const noexcept {
+      uint64_t h = uint64_t(k.tile) * 0x9E3779B97F4A7C15ull;
+      h ^= uint64_t(k.pitch) * 0xBF58476D1CE4E5B9ull;
+      h ^= (uint64_t(k.format) ^ (uint64_t(k.samples) << 16) ^
+            (uint64_t(k.resolution_scaled) << 20)) *
+           0x94D049BB133111EBull;
+      return size_t(h ^ (h >> 32));
+    }
+  };
 
   NativeTargetCache(const ui::vulkan::VulkanDevice& device, VmaAllocator allocator,
                     const SubmissionClock& clock, uint32_t draw_resolution_scale_x,
@@ -71,32 +92,34 @@ class NativeTargetCache {
                                          VkFormat format, VkImageAspectFlags aspects, bool is_64bpp,
                                          uint32_t edram_tile_count,
                                          const std::shared_ptr<ColorImage>& keep,
-                                         uint32_t used_height = 0);
+                                         uint32_t used_height = 0,
+                                         bool resolution_scaled = true);
   VkFormat GetDepthFormat(xenos::DepthRenderTargetFormat format) const;
 
   // Replays an aliased 4x-MSAA fast clear onto a 1x/2x target that already
   // exists (depth or color).
   void ReplayAliasedFastClear(const PendingFastClear& clear,
-                              const std::shared_ptr<ColorImage>& image, xenos::MsaaSamples samples);
+                              const std::shared_ptr<ColorImage>& image, xenos::MsaaSamples samples,
+                              bool target_scaled);
   void ReplayAliasedColorFastClear(const PendingColorFastClear& clear,
                                    const std::shared_ptr<ColorImage>& image,
-                                   xenos::MsaaSamples samples);
+                                   xenos::MsaaSamples samples, bool target_scaled);
   void ErasePendingColorFastClears(uint32_t tile, uint32_t pitch_tiles);
   // The 1x/2x targets matching predicate(tile, pitch, samples, format, image),
   // marked used; collected first so replaying never mutates targets_ while
   // iterating it.
   template <typename Predicate>
-  std::vector<std::pair<std::shared_ptr<ColorImage>, xenos::MsaaSamples>> CollectAliases(
+  std::vector<std::tuple<std::shared_ptr<ColorImage>, xenos::MsaaSamples, bool>> CollectAliases(
       Predicate&& predicate) {
-    std::vector<std::pair<std::shared_ptr<ColorImage>, xenos::MsaaSamples>> aliases;
+    std::vector<std::tuple<std::shared_ptr<ColorImage>, xenos::MsaaSamples, bool>> aliases;
     for (auto& [target_key, entry] : targets_) {
-      const auto& [tile, pitch, samples, format] = target_key;
-      if (samples >= xenos::MsaaSamples::k4X ||
-          !predicate(tile, pitch, samples, format, *entry.image)) {
+      if (target_key.samples >= xenos::MsaaSamples::k4X ||
+          !predicate(target_key.tile, target_key.pitch, target_key.samples, target_key.format,
+                     *entry.image)) {
         continue;
       }
       entry.last_use_submission = clock_.next;
-      aliases.emplace_back(entry.image, samples);
+      aliases.emplace_back(entry.image, target_key.samples, target_key.resolution_scaled);
     }
     return aliases;
   }
@@ -112,7 +135,9 @@ class NativeTargetCache {
     pending_fast_clears_.clear();
     pending_color_fast_clears_.clear();
     targets_.clear();
-    tile_owners_.clear();
+    owners_.clear();
+    tile_runs_.clear();
+    last_target_valid_ = false;
     ++ownership_epoch_;
   }
 
@@ -120,32 +145,24 @@ class NativeTargetCache {
   static constexpr size_t kMaxTargets = 64;
 
   struct CachedTarget : CachedImage {
+    uint64_t owner_id = 0;
     // The tiles up to claimed_end were owned by this target at claimed_epoch.
     uint64_t claimed_epoch = 0;
     uint32_t claimed_end = 0;
   };
-  // The target that last used an EDRAM tile.
-  struct TileOwner {
-    // Compared by control block, so a later image at the same address never
-    // looks like the owner.
-    std::weak_ptr<ColorImage> image;
-    uint32_t base = 0;
-    uint32_t pitch_tiles = 0;
-    xenos::MsaaSamples samples = xenos::MsaaSamples::k1X;
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    bool is_64bpp = false;
-  };
   void ClaimTiles(CachedTarget& target, uint32_t tile, uint32_t pitch, xenos::MsaaSamples samples,
                   VkFormat format, bool is_64bpp, uint32_t used_height,
-                  uint32_t edram_tile_count);
+                  uint32_t edram_tile_count, bool resolution_scaled);
 
-  DrawInput RescaleFastClearInput(const DrawInput& base, xenos::MsaaSamples samples) const;
+  DrawInput RescaleFastClearInput(const DrawInput& base, xenos::MsaaSamples samples,
+                                  bool source_scaled, bool target_scaled) const;
   // Finds a pending fast clear for an aliased target tile and replays it if it
   // is compatible with the newly created image, then drops it.
   void ApplyPendingFastClear(uint32_t tile, uint32_t pitch_tiles, xenos::MsaaSamples samples,
-                             const std::shared_ptr<ColorImage>& image);
+                             const std::shared_ptr<ColorImage>& image, bool target_scaled);
   void ApplyPendingColorFastClear(uint32_t tile, uint32_t pitch_tiles, xenos::MsaaSamples samples,
-                                  VkFormat format, const std::shared_ptr<ColorImage>& image);
+                                  VkFormat format, const std::shared_ptr<ColorImage>& image,
+                                  bool target_scaled);
 
   const ui::vulkan::VulkanDevice& device_;
   VmaAllocator allocator_;
@@ -157,8 +174,13 @@ class NativeTargetCache {
   bool depth_unorm24_supported_;
   QueueDraw queue_draw_;
   QueueTransfer queue_transfer_;
-  std::map<TargetKey, CachedTarget> targets_;
-  std::vector<TileOwner> tile_owners_;
+  std::unordered_map<TargetKey, CachedTarget, TargetKeyHash> targets_;
+  std::unordered_map<uint64_t, std::shared_ptr<ColorImage>> owners_;
+  std::vector<TileRun> tile_runs_;
+  uint64_t next_owner_id_ = 1;
+  TargetKey last_target_key_{};
+  CachedTarget* last_target_ = nullptr;
+  bool last_target_valid_ = false;
   // Advances whenever a tile changes owner, so targets whose tiles are all
   // still their own skip the ownership scan.
   uint64_t ownership_epoch_ = 1;

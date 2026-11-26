@@ -35,6 +35,13 @@ class SharedVertexMemory {
   VkResult FlushBinds(VkSemaphore semaphore, bool& signaled);
   void Invalidate(uint32_t start, uint32_t length);
   void InvalidateAll() { std::fill(valid_pages_.begin(), valid_pages_.end(), 0); }
+  bool ArePagesValid(uint32_t address, uint32_t size) const {
+    if (valid_pages_.empty() || !IsPhysicalRange(address, size)) {
+      return false;
+    }
+    const auto [first_page, page_count] = GetPhysicalPageRange(address, size);
+    return AreAllPageBitsSet(valid_pages_, first_page, page_count);
+  }
   // Calls upload(address, size) for every run of [address, address + size)
   // not valid on the GPU yet, at most max_chunk_size bytes at a time, and marks
   // each chunk valid once upload returns true.

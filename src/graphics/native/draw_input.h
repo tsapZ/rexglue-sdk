@@ -68,6 +68,115 @@ inline void SetPageRangeBits(std::vector<uint64_t>& valid_words, uint32_t first_
   }
 }
 
+inline bool HasAnyPageBitSet(const std::vector<uint64_t>& words, uint32_t first_page,
+                             uint32_t page_count) {
+  if (!page_count || words.empty()) {
+    return false;
+  }
+  const uint32_t end_page = std::min(first_page + page_count, uint32_t(words.size() * 64));
+  for (uint32_t page = first_page; page < end_page;) {
+    const uint32_t word = page >> 6;
+    const uint32_t bit = page & 63;
+    const uint32_t count = std::min(64 - bit, end_page - page);
+    const uint64_t mask = (count == 64 ? ~uint64_t(0) : ((uint64_t(1) << count) - 1)) << bit;
+    if ((words[word] & mask) != 0) {
+      return true;
+    }
+    page += count;
+  }
+  return false;
+}
+
+inline bool AreAllPageBitsSet(const std::vector<uint64_t>& words, uint32_t first_page,
+                              uint32_t page_count) {
+  if (!page_count) {
+    return true;
+  }
+  const uint32_t limit = uint32_t(words.size() * 64);
+  if (first_page >= limit || page_count > limit - first_page) {
+    return false;
+  }
+  const uint32_t end_page = first_page + page_count;
+  for (uint32_t page = first_page; page < end_page;) {
+    const uint32_t word = page >> 6;
+    const uint32_t bit = page & 63;
+    const uint32_t count = std::min(64 - bit, end_page - page);
+    const uint64_t mask = (count == 64 ? ~uint64_t(0) : ((uint64_t(1) << count) - 1)) << bit;
+    if ((words[word] & mask) != mask) {
+      return false;
+    }
+    page += count;
+  }
+  return true;
+}
+
+// Inline 2D Xenos texture tiling offset (matches texture_util::GetTiledOffset2D).
+struct Tiled2DRowState {
+  int32_t y_macro;
+  int32_t y_micro;
+  int32_t y_bit0;
+  int32_t y_bit4;
+  int32_t y_bit3;
+};
+
+constexpr Tiled2DRowState MakeTiled2DRowState(int32_t gy, uint32_t pitch_aligned,
+                                              uint32_t bpb_log2) {
+  return {(gy >> 5) * int32_t(pitch_aligned >> 5), (gy & 0xE) << 2, (gy & 1) << 4,
+          (gy & 16) << 7, (gy & 8) >> 2};
+}
+
+constexpr int32_t GetTiledOffset2DFromRow(int32_t gx, const Tiled2DRowState& row,
+                                          uint32_t bpb_log2) {
+  const int32_t macro = ((gx >> 5) + row.y_macro) << (bpb_log2 + 7);
+  const int32_t micro = ((gx & 7) + row.y_micro) << bpb_log2;
+  const int32_t offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + row.y_bit0;
+  return ((offset & ~0x1FF) << 3) + row.y_bit4 + ((offset & 0x1C0) << 2) +
+         (((row.y_bit3 + (gx >> 3)) & 3) << 6) + (offset & 0x3F);
+}
+
+constexpr int32_t GetTiledOffset2DInline(int32_t gx, int32_t gy, uint32_t pitch,
+                                         uint32_t bpb_log2) {
+  const uint32_t pitch_aligned =
+      (pitch + (xenos::kTextureTileWidthHeight - 1)) & ~(xenos::kTextureTileWidthHeight - 1);
+  return GetTiledOffset2DFromRow(gx, MakeTiled2DRowState(gy, pitch_aligned, bpb_log2), bpb_log2);
+}
+
+template <uint32_t BlockSize, size_t Swap>
+inline void CopySwapBlock(const uint8_t* __restrict src, size_t offset,
+                          uint8_t* __restrict dst) {
+  if constexpr (BlockSize == 1) {
+    *dst = src[offset ^ Swap];
+  } else if constexpr (BlockSize == 2) {
+    uint16_t v;
+    if constexpr (Swap == 0) {
+      std::memcpy(&v, src + offset, 2);
+    } else if constexpr (Swap == 1) {
+      std::memcpy(&v, src + offset, 2);
+      v = uint16_t((v >> 8) | (v << 8));
+    } else if constexpr (Swap == 2) {
+      std::memcpy(&v, src + (offset ^ 2), 2);
+    } else {
+      std::memcpy(&v, src + (offset ^ 2), 2);
+      v = uint16_t((v >> 8) | (v << 8));
+    }
+    std::memcpy(dst, &v, 2);
+  } else {
+    static_assert(BlockSize % 4 == 0);
+    for (uint32_t w = 0; w < BlockSize; w += 4) {
+      uint32_t v;
+      std::memcpy(&v, src + offset + w, 4);
+      if constexpr (Swap == 1) {
+        v = ((v & 0x00FF00FFu) << 8) | ((v & 0xFF00FF00u) >> 8);
+      } else if constexpr (Swap == 2) {
+        v = std::rotl(v, 16);
+      } else if constexpr (Swap == 3) {
+        v = ((v >> 24) & 0xFFu) | ((v >> 8) & 0xFF00u) | ((v & 0xFF00u) << 8) | (v << 24);
+      }
+      std::memcpy(dst + w, &v, 4);
+    }
+  }
+}
+
 inline bool FindNextInvalidPageRun(const std::vector<uint64_t>& valid_words, uint32_t& cursor,
                                    uint32_t end_page, uint32_t& run_first_page,
                                    uint32_t& run_page_count) {
@@ -158,17 +267,16 @@ struct DrawSampler {
 // same bucket regardless of any padding in the struct.
 struct DrawSamplerHash {
   size_t operator()(const DrawSampler& key) const noexcept {
-    const std::array<uint32_t, 10> fields{uint32_t(key.min_filter),
-                                          uint32_t(key.mag_filter),
-                                          uint32_t(key.mip_mode),
-                                          std::bit_cast<uint32_t>(key.max_lod),
-                                          uint32_t(key.address_u),
-                                          uint32_t(key.address_v),
-                                          uint32_t(key.address_w),
-                                          uint32_t(key.border_color),
-                                          std::bit_cast<uint32_t>(key.min_lod),
-                                          std::bit_cast<uint32_t>(key.max_anisotropy)};
-    return size_t(XXH3_64bits(fields.data(), sizeof(fields)));
+    uint64_t h = uint64_t(key.min_filter) | (uint64_t(key.mag_filter) << 4) |
+                 (uint64_t(key.mip_mode) << 8) | (uint64_t(key.address_u) << 12) |
+                 (uint64_t(key.address_v) << 16) | (uint64_t(key.address_w) << 20) |
+                 (uint64_t(key.border_color) << 24);
+    h = (h ^ uint64_t(std::bit_cast<uint32_t>(key.max_lod)) * 0x9E3779B97F4A7C15ull) *
+        0xBF58476D1CE4E5B9ull;
+    h ^= (uint64_t(std::bit_cast<uint32_t>(key.min_lod)) |
+          (uint64_t(std::bit_cast<uint32_t>(key.max_anisotropy)) << 32)) *
+         0x94D049BB133111EBull;
+    return size_t(h ^ (h >> 32));
   }
 };
 
@@ -202,22 +310,17 @@ struct GuestTextureKey {
 // the following enum can never make two identical keys hash differently.
 struct GuestTextureKeyHash {
   size_t operator()(const GuestTextureKey& key) const noexcept {
-    const std::array<uint32_t, 15> fields{key.base_page,
-                                          key.mip_page,
-                                          key.width,
-                                          key.height,
-                                          key.array_layers,
-                                          uint32_t(key.format),
-                                          uint32_t(key.dimension),
-                                          key.tiled,
-                                          key.packed_mips,
-                                          uint32_t(key.endianness),
-                                          key.pitch,
-                                          key.mip_max,
-                                          key.depth,
-                                          key.is_signed,
-                                          key.signed_view};
-    return size_t(XXH3_64bits(fields.data(), sizeof(fields)));
+    uint64_t h = (uint64_t(key.base_page) | (uint64_t(key.mip_page) << 32)) * 0x9E3779B97F4A7C15ull;
+    h ^= (uint64_t(key.width) | (uint64_t(key.height) << 16) |
+          (uint64_t(key.array_layers) << 32) | (uint64_t(key.depth) << 48)) *
+         0xBF58476D1CE4E5B9ull;
+    const uint64_t flags = uint64_t(key.format) | (uint64_t(key.dimension) << 8) |
+                           (uint64_t(key.tiled) << 12) | (uint64_t(key.packed_mips) << 13) |
+                           (uint64_t(key.endianness) << 14) | (uint64_t(key.mip_max) << 18) |
+                           (uint64_t(key.is_signed) << 24) | (uint64_t(key.signed_view) << 25) |
+                           (uint64_t(key.pitch) << 32);
+    h ^= flags * 0x94D049BB133111EBull;
+    return size_t(h ^ (h >> 32));
   }
 };
 
@@ -758,6 +861,105 @@ constexpr size_t GetTextureLevelReadSize(uint32_t array_slice_stride_bytes,
   return size_t(array_slice_stride_bytes) * (array_layers - 1) + array_slice_data_extent_bytes;
 }
 
+struct IndexBinding {
+  bool indexed = false;
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VkDeviceSize offset = 0;
+  VkIndexType type = VK_INDEX_TYPE_UINT32;
+  uint32_t count = 0;
+};
+
+inline void DecodeDmaIndices16(std::span<const uint8_t> source, xenos::Endian endian,
+                               uint16_t* __restrict dst, size_t count) {
+  const bool swap = endian == xenos::Endian::k8in16 || endian == xenos::Endian::k8in32;
+  if (!swap) {
+    std::memcpy(dst, source.data(), count * sizeof(uint16_t));
+    return;
+  }
+  const uint8_t* __restrict src = source.data();
+  for (size_t i = 0; i < count; ++i) {
+    uint16_t v;
+    std::memcpy(&v, src + i * 2, 2);
+    v = uint16_t((v >> 8) | (v << 8));
+    dst[i] = v;
+  }
+}
+
+template <bool ReplaceRestart>
+inline void DecodeDmaIndices32From16(std::span<const uint8_t> source, xenos::Endian endian,
+                                     uint32_t* __restrict dst, size_t count, uint32_t reset_value) {
+  const bool swap = endian == xenos::Endian::k8in16 || endian == xenos::Endian::k8in32;
+  const uint8_t* __restrict src = source.data();
+  for (size_t i = 0; i < count; ++i) {
+    uint16_t v;
+    std::memcpy(&v, src + i * 2, 2);
+    if (swap) {
+      v = uint16_t((v >> 8) | (v << 8));
+    }
+    const uint32_t u = uint32_t(v);
+    if constexpr (ReplaceRestart) {
+      dst[i] = (u == reset_value) ? UINT32_MAX : u;
+    } else {
+      dst[i] = u;
+    }
+  }
+}
+
+template <xenos::Endian EndianMode, bool ReplaceRestart>
+inline void DecodeDmaIndices32From32Loop(const uint8_t* __restrict src, uint32_t* __restrict dst,
+                                         size_t count, uint32_t reset_value) {
+  for (size_t i = 0; i < count; ++i) {
+    uint32_t v;
+    std::memcpy(&v, src + i * 4, 4);
+    v = xenos::GpuSwap(v, EndianMode) & xenos::kVertexIndexMask;
+    if constexpr (ReplaceRestart) {
+      dst[i] = (v == reset_value) ? UINT32_MAX : v;
+    } else {
+      dst[i] = v;
+    }
+  }
+}
+
+inline void DecodeDmaIndices32(std::span<const uint8_t> source, xenos::IndexFormat format,
+                               xenos::Endian endian, uint32_t* __restrict dst, size_t count,
+                               bool replace_restart = false, uint32_t reset_value = 0) {
+  if (format == xenos::IndexFormat::kInt16) {
+    if (replace_restart) {
+      DecodeDmaIndices32From16<true>(source, endian, dst, count, reset_value);
+    } else {
+      DecodeDmaIndices32From16<false>(source, endian, dst, count, reset_value);
+    }
+    return;
+  }
+  const uint8_t* src = source.data();
+  switch (endian) {
+    case xenos::Endian::k8in16:
+      replace_restart ? DecodeDmaIndices32From32Loop<xenos::Endian::k8in16, true>(
+                            src, dst, count, reset_value)
+                      : DecodeDmaIndices32From32Loop<xenos::Endian::k8in16, false>(
+                            src, dst, count, reset_value);
+      break;
+    case xenos::Endian::k8in32:
+      replace_restart ? DecodeDmaIndices32From32Loop<xenos::Endian::k8in32, true>(
+                            src, dst, count, reset_value)
+                      : DecodeDmaIndices32From32Loop<xenos::Endian::k8in32, false>(
+                            src, dst, count, reset_value);
+      break;
+    case xenos::Endian::k16in32:
+      replace_restart ? DecodeDmaIndices32From32Loop<xenos::Endian::k16in32, true>(
+                            src, dst, count, reset_value)
+                      : DecodeDmaIndices32From32Loop<xenos::Endian::k16in32, false>(
+                            src, dst, count, reset_value);
+      break;
+    default:
+      replace_restart ? DecodeDmaIndices32From32Loop<xenos::Endian::kNone, true>(
+                            src, dst, count, reset_value)
+                      : DecodeDmaIndices32From32Loop<xenos::Endian::kNone, false>(
+                            src, dst, count, reset_value);
+      break;
+  }
+}
+
 inline bool DecodeDmaIndices(std::span<const uint8_t> source, xenos::IndexFormat format,
                              xenos::Endian endian, std::span<uint32_t> indices) {
   const bool wide = format == xenos::IndexFormat::kInt32;
@@ -765,21 +967,7 @@ inline bool DecodeDmaIndices(std::span<const uint8_t> source, xenos::IndexFormat
   if (indices.size() > source.size() / stride) {
     return false;
   }
-  for (uint32_t& index : indices) {
-    if (wide) {
-      uint32_t value;
-      std::memcpy(&value, source.data(), sizeof(value));
-      index = xenos::GpuSwap(value, endian) & xenos::kVertexIndexMask;
-    } else {
-      uint16_t value;
-      std::memcpy(&value, source.data(), sizeof(value));
-      // Match the guest primitive processor's normalization for 16-bit DMA.
-      index = endian == xenos::Endian::k8in16 || endian == xenos::Endian::k8in32
-                  ? xenos::GpuSwap(value, xenos::Endian::k8in16)
-                  : value;
-    }
-    source = source.subspan(stride);
-  }
+  DecodeDmaIndices32(source, format, endian, indices.data(), indices.size());
   return true;
 }
 
@@ -1244,6 +1432,7 @@ struct DrawRenderState {
   uint32_t stencil_reference_valid = 0;
   VkBuffer index_buffer = VK_NULL_HANDLE;
   uint64_t index_offset = 0;
+  VkIndexType index_type = VK_INDEX_TYPE_UINT32;
 
   // Returns whether `current` must be rebound to `wanted`, updating it.
   template <typename T>
@@ -1297,12 +1486,13 @@ struct DrawRenderState {
     valid = 3;
     return faces;
   }
-  bool SetIndexBuffer(VkBuffer buffer, uint64_t offset) {
-    if (index_buffer == buffer && index_offset == offset) {
+  bool SetIndexBuffer(VkBuffer buffer, uint64_t offset, VkIndexType type) {
+    if (index_buffer == buffer && index_offset == offset && index_type == type) {
       return false;
     }
     index_buffer = buffer;
     index_offset = offset;
+    index_type = type;
     return true;
   }
 };
@@ -1419,6 +1609,125 @@ inline std::vector<EdramTileCopy> ComputeOverlappingEdramTileCopies(uint32_t src
     tile += run;
   }
   return copies;
+}
+
+// Host image usage flags for an EDRAM attachment or resolved texture. Both
+// color and depth/stencil images need TRANSFER_SRC_BIT for aliased tile copies.
+constexpr VkImageUsageFlags GetColorImageUsage(VkImageAspectFlags aspects, bool storage_supported) {
+  VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                            VK_IMAGE_USAGE_SAMPLED_BIT;
+  if (aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
+    usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (storage_supported) {
+      usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    }
+  } else {
+    usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+  }
+  return usage;
+}
+
+// Non-overlapping EDRAM tile ownership interval used by NativeTargetCache.
+struct TileRun {
+  uint32_t start = 0;
+  uint32_t end = 0;
+  uint64_t owner_id = 0;
+  uint32_t base = 0;
+  uint32_t pitch_tiles = 0;
+  xenos::MsaaSamples samples = xenos::MsaaSamples::k1X;
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  bool is_64bpp = false;
+  bool resolution_scaled = false;
+
+  bool SameAttributes(const TileRun& o) const {
+    return owner_id == o.owner_id && base == o.base && pitch_tiles == o.pitch_tiles &&
+           samples == o.samples && format == o.format && is_64bpp == o.is_64bpp &&
+           resolution_scaled == o.resolution_scaled;
+  }
+};
+
+// Splices `claim` ([claim.start, claim.end)) into sorted non-overlapping `runs`,
+// invoking `on_overwritten(previous_run, overlap_start, overlap_end)` for every
+// covered sub-interval owned by a different `owner_id`. Returns true if
+// `runs` changed.
+template <typename OnOverwritten>
+bool SpliceTileRun(std::vector<TileRun>& runs, const TileRun& claim,
+                   OnOverwritten&& on_overwritten) {
+  if (claim.start >= claim.end) {
+    return false;
+  }
+  auto it = std::lower_bound(runs.begin(), runs.end(), claim.start,
+                             [](const TileRun& r, uint32_t s) { return r.end <= s; });
+  if (it != runs.end() && it->start <= claim.start && it->end >= claim.end &&
+      it->SameAttributes(claim)) {
+    return false;
+  }
+  bool changed = false;
+  std::vector<TileRun> replacements;
+  auto erase_begin = it;
+  auto erase_end = it;
+  if (it != runs.end() && it->start < claim.start) {
+    TileRun left = *it;
+    left.end = claim.start;
+    replacements.push_back(left);
+  }
+  for (; erase_end != runs.end() && erase_end->start < claim.end; ++erase_end) {
+    const uint32_t ov_start = std::max(erase_end->start, claim.start);
+    const uint32_t ov_end = std::min(erase_end->end, claim.end);
+    if (erase_end->owner_id != claim.owner_id) {
+      on_overwritten(*erase_end, ov_start, ov_end);
+      changed = true;
+    } else if (!erase_end->SameAttributes(claim)) {
+      changed = true;
+    }
+  }
+  TileRun right{};
+  bool has_right = false;
+  if (erase_end != erase_begin) {
+    const TileRun& last = *(erase_end - 1);
+    if (last.end > claim.end) {
+      right = last;
+      right.start = claim.end;
+      has_right = true;
+    }
+  } else {
+    changed = true;
+  }
+  replacements.push_back(claim);
+  if (has_right) {
+    replacements.push_back(right);
+  }
+  // Merge adjacent runs with identical attributes inside replacements and neighbors.
+  const size_t insert_pos = size_t(erase_begin - runs.begin());
+  runs.erase(erase_begin, erase_end);
+  runs.insert(runs.begin() + ptrdiff_t(insert_pos), replacements.begin(), replacements.end());
+  size_t check_start = insert_pos > 0 ? insert_pos - 1 : 0;
+  size_t check_end = std::min(runs.size(), insert_pos + replacements.size() + 1);
+  for (size_t i = check_start; i + 1 < check_end && i + 1 < runs.size();) {
+    if (runs[i].end == runs[i + 1].start && runs[i].SameAttributes(runs[i + 1])) {
+      runs[i].end = runs[i + 1].end;
+      runs.erase(runs.begin() + ptrdiff_t(i + 1));
+      if (check_end > 0) --check_end;
+    } else {
+      ++i;
+    }
+  }
+  return changed;
+}
+
+// Whether a surface pitch qualifies for 1x rendering under draw_resolution_scale_threshold.
+constexpr bool IsDrawScaleNativeForPitch(uint32_t surface_pitch, xenos::MsaaSamples samples,
+                                         int32_t threshold, uint32_t scale_x, uint32_t scale_y) {
+  if (threshold <= 0 || (scale_x <= 1 && scale_y <= 1) || !surface_pitch) {
+    return false;
+  }
+  const uint32_t msaa_x_log2 = uint32_t(samples >= xenos::MsaaSamples::k4X);
+  const uint32_t pitch_tiles_32bpp =
+      ((surface_pitch << msaa_x_log2) + (xenos::kEdramTileWidthSamples - 1)) /
+      xenos::kEdramTileWidthSamples;
+  const uint32_t pitch_pixels_aligned =
+      pitch_tiles_32bpp * (xenos::kEdramTileWidthSamples >> msaa_x_log2);
+  return pitch_pixels_aligned <= uint32_t(threshold);
 }
 
 // Host pixels of one EDRAM tile of a target: 80x16 samples, half as wide for

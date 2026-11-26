@@ -51,6 +51,7 @@ REXCVAR_DECLARE(bool, gpu_transfer_report);
 REXCVAR_DECLARE(bool, gpu_native_surfaces);
 REXCVAR_DECLARE(bool, gpu_native_resolves);
 REXCVAR_DECLARE(bool, gpu_texture_load_report);
+REXCVAR_DECLARE(int32_t, draw_resolution_scale_threshold);
 
 // GPU Textures
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
