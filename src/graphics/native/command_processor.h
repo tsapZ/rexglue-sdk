@@ -60,11 +60,11 @@ class NativeCommandProcessor : public CommandProcessor {
  private:
   std::span<const uint8_t> ReadPhysical(uint32_t address, size_t size);
   struct QueuedDraw {
-    std::array<std::shared_ptr<ColorImage>, xenos::kMaxColorRenderTargets> colors;
-    std::shared_ptr<ColorImage> depth;
-    uint32_t color_count;
+    std::array<ColorImage*, xenos::kMaxColorRenderTargets> colors{};
+    ColorImage* depth = nullptr;
+    uint32_t color_count = 0;
     // Index into the passes recorded with the same commands.
-    size_t pass_index;
+    size_t pass_index = 0;
     bool memexport = false;
   };
   struct QueuedResolve {
@@ -181,6 +181,9 @@ class NativeCommandProcessor : public CommandProcessor {
     uint64_t submission = 0;
     std::vector<FrameCommand> commands;
     std::vector<DrawPass> passes;
+    std::vector<DrawTextureOp> texture_ops;
+    std::vector<std::shared_ptr<CachedTexture>> kept_textures;
+    std::vector<std::shared_ptr<ColorImage>> kept_images;
     std::optional<FrameTiming> frame;
   };
   // Waits for the slot's submission and releases what it kept alive.
@@ -262,8 +265,26 @@ class NativeCommandProcessor : public CommandProcessor {
   std::atomic<bool> has_pending_invalidations_{false};
   bool invalidated_since_last_draw_ = false;
   void* memory_invalidation_handle_ = nullptr;
+  void KeepAliveTexture(const std::shared_ptr<CachedTexture>& texture) {
+    if (texture && texture->last_keepalive_submission != clock_.next) {
+      texture->last_keepalive_submission = clock_.next;
+      pending_kept_textures_.push_back(texture);
+    }
+  }
+  void KeepAliveImage(const std::shared_ptr<ColorImage>& image) {
+    if (image && image->last_keepalive_submission() != clock_.next) {
+      image->set_last_keepalive_submission(clock_.next);
+      pending_kept_images_.push_back(image);
+    }
+  }
+  void ReleaseTextureOps(std::vector<DrawTextureOp>& ops);
+
   std::vector<FrameCommand> pending_;
   std::vector<DrawPass> pending_passes_;
+  std::vector<DrawTextureOp> pending_texture_ops_;
+  std::vector<std::shared_ptr<CachedTexture>> pending_kept_textures_;
+  std::vector<std::shared_ptr<ColorImage>> pending_kept_images_;
+  DrawBindingsViewPurger view_purger_{};
   // Reused by IssueDraw so decoding guest indices and building DrawInput do not allocate per draw.
   std::vector<uint32_t> scratch_indices_;
   DrawInput scratch_input_;

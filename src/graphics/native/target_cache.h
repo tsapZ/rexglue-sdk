@@ -140,6 +140,7 @@ class NativeTargetCache {
     last_target_valid_ = false;
     ++ownership_epoch_;
   }
+  void set_view_purger(const DrawBindingsViewPurger* purger) { view_purger_ = purger; }
 
  private:
   static constexpr size_t kMaxTargets = 64;
@@ -187,6 +188,7 @@ class NativeTargetCache {
   std::map<std::pair<uint32_t, uint32_t>, PendingFastClear> pending_fast_clears_;
   std::map<std::tuple<uint32_t, uint32_t, VkFormat>, PendingColorFastClear>
       pending_color_fast_clears_;
+  const DrawBindingsViewPurger* view_purger_ = nullptr;
 };
 
 }  // namespace rex::graphics::native

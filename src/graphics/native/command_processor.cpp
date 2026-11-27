@@ -35,6 +35,23 @@ REXCVAR_DECLARE(std::string, resolution);
 namespace rex::graphics::native {
 namespace {
 
+void PurgeDrawBindingsViews(void* context, std::span<const VkImageView> views) {
+  auto* cache = static_cast<DrawBindingCache*>(context);
+  for (auto& [key, bindings] : *cache) {
+    bindings->PurgeImageViews(views);
+  }
+}
+
+void PurgeDrawBindingsSampler(void* context, VkSampler sampler) {
+  auto* cache = static_cast<DrawBindingCache*>(context);
+  for (auto& [key, bindings] : *cache) {
+    bindings->PurgeSampler(sampler);
+  }
+}
+
+}  // namespace
+namespace {
+
 using Translator = SpirvShaderTranslator;
 
 // Vertex fetches read the shared vertex buffer; vertex and pixel shader memexports write it.
@@ -332,10 +349,12 @@ bool NativeCommandProcessor::SetupContext() {
     }
     builtin_quad_indices_uploaded_ = false;
   }
+  view_purger_ = {&draw_bindings_, &PurgeDrawBindingsViews, &PurgeDrawBindingsSampler};
   texture_cache_ = std::make_unique<NativeTextureCache>(*vulkan_device_, vma_allocator_, *memory_,
                                                         *register_file_,
                                                         clock_, draw_resolution_scale_x_,
                                                         draw_resolution_scale_y_, watch_cb);
+  texture_cache_->set_view_purger(&view_purger_);
   target_cache_ = std::make_unique<NativeTargetCache>(
       *vulkan_device_, vma_allocator_, clock_, draw_resolution_scale_x_, draw_resolution_scale_y_,
       depth_unorm24_supported,
@@ -348,6 +367,7 @@ bool NativeCommandProcessor::SetupContext() {
              const std::shared_ptr<ColorImage>& destination, std::vector<VkImageCopy> copies) {
         pending_.emplace_back(QueuedTileTransfer{source, destination, std::move(copies)});
       });
+  target_cache_->set_view_purger(&view_purger_);
   shader_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
   watched_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
   if (!texture_cache_->Initialize(shared_vertex_ != nullptr)) {
@@ -387,6 +407,9 @@ void NativeCommandProcessor::ShutdownContext() {
   }
   pending_.clear();
   pending_passes_.clear();
+  ReleaseTextureOps(pending_texture_ops_);
+  pending_kept_textures_.clear();
+  pending_kept_images_.clear();
   scratch_input_.Clear();
   // Pending and in-flight draws have released their shared textures by now.
   draw_uploads_.reset();
@@ -404,14 +427,15 @@ void NativeCommandProcessor::ShutdownContext() {
   }
   index_cache_.reset();
   shared_vertex_.reset();
-  presented_.reset();
-  target_cache_.reset();
-  texture_cache_.reset();
+  view_purger_.context = nullptr;
   for (const auto& entry : pipelines_) {
     vk.vkDestroyPipeline(device, entry.second, nullptr);
   }
   pipelines_.clear();
   draw_bindings_.clear();
+  presented_.reset();
+  target_cache_.reset();
+  texture_cache_.reset();
   SavePipelineCache();
   pipeline_cache_path_.clear();
   vk.vkDestroyPipelineCache(device, pipeline_cache_, nullptr);
@@ -751,17 +775,22 @@ void NativeCommandProcessor::ClearCaches() {
   WaitForAllSubmissions();
   pending_.clear();
   pending_passes_.clear();
+  ReleaseTextureOps(pending_texture_ops_);
+  pending_kept_textures_.clear();
+  pending_kept_images_.clear();
   presented_.reset();
   InvalidateGpuMemory();
   const auto& vk = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
-  texture_cache_->ClearSamplers();
+  view_purger_.context = nullptr;
   for (const auto& entry : pipelines_) {
     vk.vkDestroyPipeline(device, entry.second, nullptr);
   }
   pipelines_.clear();
   draw_bindings_.clear();
+  texture_cache_->ClearSamplers();
   target_cache_->Clear();
+  view_purger_.context = &draw_bindings_;
   InvalidateConstantState();
 }
 
@@ -1482,15 +1511,17 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     const uint32_t rt_tile = layout.DecodeBase(target.value);
     const bool rt_is_64bpp = xenos::IsColorRenderTargetFormat64bpp(target.color_format);
-    draw.colors[i] = FindTarget(rt_tile, dimensions.surface_pitch, dimensions.msaa_samples,
-                                format, VK_IMAGE_ASPECT_COLOR_BIT, rt_is_64bpp, used_height,
-                                draw_scaled);
-    if (!draw.colors[i]) {
+    auto color_target = FindTarget(rt_tile, dimensions.surface_pitch, dimensions.msaa_samples,
+                                   format, VK_IMAGE_ASPECT_COLOR_BIT, rt_is_64bpp, used_height,
+                                   draw_scaled);
+    if (!color_target) {
       return false;
     }
+    KeepAliveImage(color_target);
+    draw.colors[i] = color_target.get();
     if (std::find(draw.colors.begin(), draw.colors.begin() + i, draw.colors[i]) !=
         draw.colors.begin() + i) {
-      draw.colors[i].reset();
+      draw.colors[i] = nullptr;
       continue;
     }
     bound_rt[i] = true;
@@ -1511,13 +1542,15 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   draw.color_count = input.color_count;
   draw.memexport = memexport;
   if (use_depth) {
-    draw.depth = FindTarget(layout.DecodeBase(depth_info.value), dimensions.surface_pitch,
-                            dimensions.msaa_samples, input.depth_format,
-                            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, false,
-                            used_height, draw_scaled);
-    if (!draw.depth) {
+    auto depth_target = FindTarget(layout.DecodeBase(depth_info.value), dimensions.surface_pitch,
+                                   dimensions.msaa_samples, input.depth_format,
+                                   VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, false,
+                                   used_height, draw_scaled);
+    if (!depth_target) {
       return false;
     }
+    KeepAliveImage(depth_target);
+    draw.depth = depth_target.get();
   }
   PreuploadedConstants preuploaded_constants{};
   if (!PreparePreuploadedConstants(input, vs, ps, use_shared_vertices, preuploaded_constants)) {
@@ -1535,6 +1568,13 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // The draw, including its texture uploads, will be recorded, so later draws in
   // the same batch can sample these cached images without copying them again.
   for (const auto& texture : input.textures) {
+    KeepAliveTexture(texture.cached_texture);
+    KeepAliveImage(texture.resolved_image);
+    KeepAliveImage(texture.crop_source);
+    KeepAliveImage(texture.depth_pack_source);
+    for (const auto& face : texture.resolved_cube_faces) {
+      KeepAliveImage(face);
+    }
     if (texture.upload_cached && texture.cached_texture) {
       texture.cached_texture->uploaded = true;
       if (texture.resolved_cube_face_versions[0] != 0) {
@@ -1768,16 +1808,26 @@ std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, ui
                                    resolution_scaled);
 }
 
+void NativeCommandProcessor::ReleaseTextureOps(std::vector<DrawTextureOp>& ops) {
+  if (vulkan_device_) {
+    for (auto& op : ops) {
+      ReleaseDrawTextureOp(*vulkan_device_, vma_allocator_, depth_resolve_.get(), op);
+    }
+  }
+  ops.clear();
+}
+
 void NativeCommandProcessor::QueueReplayDraw(const DrawInput& input,
                                              std::span<const uint32_t> indices,
                                              const Shader::Translation& vertex,
                                              const Shader::Translation* pixel, uint32_t rt_index,
                                              const std::shared_ptr<ColorImage>& image) {
+  KeepAliveImage(image);
   QueuedDraw draw{};
   if (image->aspects() & VK_IMAGE_ASPECT_DEPTH_BIT) {
-    draw.depth = image;
+    draw.depth = image.get();
   } else {
-    draw.colors[rt_index] = image;
+    draw.colors[rt_index] = image.get();
     draw.color_count = rt_index + 1;
   }
   const IndexBinding index_binding{true, VK_NULL_HANDLE, 0, VK_INDEX_TYPE_UINT32,
@@ -1800,8 +1850,9 @@ size_t NativeCommandProcessor::AddPendingPass(const DrawInput& input,
   const size_t pipelines_before = pipelines_.size();
   if (!pass.Initialize(input, index_binding, inline_indices, vertex, pixel, shared_count,
                        pipeline_cache_, pipelines_, draw_bindings_, *draw_uploads_, clock_.next,
-                       DrawBindings::kPendingTextureSetSlot, shared_vertex_buffer,
-                       &pipeline_cache_mutex_, preuploaded_constants, depth_resolve_.get())) {
+                       clock_.retired, DrawBindings::kPendingTextureSetSlot, shared_vertex_buffer,
+                       &pipeline_cache_mutex_, preuploaded_constants, depth_resolve_.get(),
+                       &pending_texture_ops_)) {
     pending_passes_.pop_back();
     return SIZE_MAX;
   }
@@ -2058,6 +2109,7 @@ bool NativeCommandProcessor::IssueCopy() {
       texture_cache_->RebuildCachedTexturePages();
     }
     destination = std::make_shared<ColorImage>(*vulkan_device_, vma_allocator_);
+    destination->set_view_purger(&view_purger_);
     if (!destination->Initialize(target_extent, output_format, VK_SAMPLE_COUNT_1_BIT,
                                  VK_IMAGE_ASPECT_COLOR_BIT, dest_layers)) {
       return false;
@@ -2382,7 +2434,13 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
   const auto& vk = vulkan_device_->functions();
   const auto& draw = std::get<QueuedDraw>(commands.front());
   for (const auto& command : commands) {
-    pending_passes_[std::get<QueuedDraw>(command).pass_index].RecordTextureUpload(command_buffer_);
+    const auto& pass = pending_passes_[std::get<QueuedDraw>(command).pass_index];
+    const uint32_t first_op = pass.first_texture_op();
+    const uint32_t end_op = first_op + pass.texture_op_count();
+    for (uint32_t op_idx = first_op; op_idx < end_op; ++op_idx) {
+      RecordDrawTextureOp(*vulkan_device_, depth_resolve_.get(), command_buffer_,
+                          pending_texture_ops_[op_idx]);
+    }
   }
   std::array<VkRenderingAttachmentInfo, xenos::kMaxColorRenderTargets> colors{};
   VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -2652,16 +2710,22 @@ bool NativeCommandProcessor::RetireFrame(FrameSlot& frame) {
       color_resolve_->Free(resolve->color_descriptor);
     }
   }
-  frame.commands.clear();
-  frame.passes.clear();
-  const uint32_t frame_index = uint32_t(&frame - frames_.data());
-  for (auto& [key, bindings] : draw_bindings_) {
-    bindings->ReleaseFrameTextureSets(frame_index);
-  }
-  // A fence also waits for every earlier submission to the queue.
+  // A fence also waits for every earlier submission to the queue; advance
+  // clock_.retired BEFORE clearing kept_textures / kept_images so purges and
+  // descriptor-set reclamation see the updated retired submission.
   if (result == VK_SUCCESS) {
     clock_.retired = std::max(clock_.retired, frame.submission);
     draw_uploads_->Reclaim(clock_.retired);
+  }
+  frame.commands.clear();
+  frame.passes.clear();
+  ReleaseTextureOps(frame.texture_ops);
+  frame.kept_textures.clear();
+  frame.kept_images.clear();
+  const uint32_t frame_index = uint32_t(&frame - frames_.data());
+  for (auto& [key, bindings] : draw_bindings_) {
+    bindings->ReclaimTextureSets(clock_.retired);
+    bindings->ReleaseFrameTextureSets(frame_index);
   }
   frame.submitted = false;
   if (result == VK_ERROR_DEVICE_LOST) {
@@ -2688,10 +2752,14 @@ void NativeCommandProcessor::WaitForAllSubmissions() {
   for (auto& frame : frames_) {
     frame.commands.clear();
     frame.passes.clear();
+    ReleaseTextureOps(frame.texture_ops);
+    frame.kept_textures.clear();
+    frame.kept_images.clear();
     frame.frame.reset();
     frame.submitted = false;
   }
   for (auto& [key, bindings] : draw_bindings_) {
+    bindings->ReclaimTextureSets(clock_.retired);
     for (uint32_t f = 0; f <= DrawBindings::kPendingTextureSetSlot; ++f) {
       bindings->ReleaseFrameTextureSets(f);
     }
@@ -2990,6 +3058,9 @@ bool NativeCommandProcessor::SubmitCommands() {
   }
   frame.commands.swap(pending_);
   frame.passes.swap(pending_passes_);
+  frame.texture_ops.swap(pending_texture_ops_);
+  frame.kept_textures.swap(pending_kept_textures_);
+  frame.kept_images.swap(pending_kept_images_);
   for (auto& [key, bindings] : draw_bindings_) {
     bindings->CommitPendingTextureSets(current_frame_);
   }

@@ -2,6 +2,7 @@
 #include <cstring>
 #include <map>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 #include <catch2/catch_approx.hpp>
@@ -1627,4 +1628,49 @@ TEST_CASE("Native chunked tiled texture decode matches byte-by-byte reference", 
   CHECK(0.0f * (1.0f / 16777215.0f) == 0.0f);
   CHECK(float(0xFFFFFFu) * (1.0f / 16777215.0f) == 1.0f);
   CHECK(float(0x7FFFFFu) * (1.0f / 16777215.0f) == Catch::Approx(0x7FFFFFu / 16777215.0f));
+}
+
+TEST_CASE("Native texture descriptor set view key and keepalive dedup", "[gpu][native]") {
+  const VkImageView v1 = VkImageView(0x1111);
+  const VkImageView v2 = VkImageView(0x2222);
+  const VkSampler s1 = VkSampler(0x3333);
+  const std::array<VkImageView, 2> views{v1, v2};
+  const std::array<VkSampler, 1> samplers{s1};
+
+  native::TextureSetKey owned{{views.begin(), views.end()}, {samplers.begin(), samplers.end()}};
+  const native::TextureSetKeyView view{views, samplers};
+  native::TextureSetKeyHash hasher;
+  native::TextureSetKeyEqual eq;
+  CHECK(hasher(owned) == hasher(view));
+  CHECK(eq(owned, view));
+  CHECK(eq(view, owned));
+
+  std::unordered_map<native::TextureSetKey, size_t, native::TextureSetKeyHash,
+                     native::TextureSetKeyEqual>
+      map;
+  map.emplace(owned, 42);
+  auto found = map.find(view);
+  REQUIRE(found != map.end());
+  CHECK(found->second == 42);
+
+  const std::array<VkImageView, 2> diff_views{v2, v1};
+  const native::TextureSetKeyView diff_view{diff_views, samplers};
+  CHECK(map.find(diff_view) == map.end());
+
+  uint64_t last_keepalive_submission = 0;
+  uint64_t submission = 7;
+  size_t pushed = 0;
+  for (int draw = 0; draw < 5; ++draw) {
+    if (last_keepalive_submission != submission) {
+      last_keepalive_submission = submission;
+      ++pushed;
+    }
+  }
+  CHECK(pushed == 1);
+  submission = 8;
+  if (last_keepalive_submission != submission) {
+    last_keepalive_submission = submission;
+    ++pushed;
+  }
+  CHECK(pushed == 2);
 }

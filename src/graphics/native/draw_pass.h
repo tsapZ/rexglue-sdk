@@ -27,6 +27,7 @@ class DepthResolve;
 struct CachedTexture {
   const ui::vulkan::VulkanDevice* device = nullptr;
   VmaAllocator allocator = VK_NULL_HANDLE;
+  const DrawBindingsViewPurger* view_purger = nullptr;
   VkImage image = VK_NULL_HANDLE;
   VkDeviceMemory memory = VK_NULL_HANDLE;
   VmaAllocation allocation = VK_NULL_HANDLE;
@@ -47,6 +48,7 @@ struct CachedTexture {
   // Resolve version last copied into a cached cropped 2D GPU resolve.
   uint64_t resolved_crop_version = 0;
   uint64_t last_use_submission = 0;
+  uint64_t last_keepalive_submission = 0;
   // Keyed by format (UNORM and SNORM views share MUTABLE_FORMAT images) and
   // PackTextureComponentMapping.
   std::map<uint64_t, VkImageView> views;
@@ -256,28 +258,25 @@ struct DrawBindings {
   // Slot 2 holds the sets for the currently-accumulating pending_ batch until
   // SubmitCommands commits them to the submitted FrameSlot (0 or 1).
   static constexpr uint32_t kPendingTextureSetSlot = 2;
-  VkDescriptorSet GetOrCreateTextureSet(size_t set_slot, uint32_t frame_slot,
+  static constexpr size_t kMaxPersistentTextureSets = 2048;
+  VkDescriptorSet GetOrCreateTextureSet(size_t set_slot, uint32_t frame_slot, uint64_t submission,
+                                        uint64_t retired_submission,
                                         std::span<const VkImageView> views,
-                                        std::span<const VkSampler> samplers);
+                                        std::span<const VkSampler> samplers,
+                                        bool cacheable = true);
   void CommitPendingTextureSets(uint32_t frame_slot);
   void ReleaseFrameTextureSets(uint32_t frame_slot);
+  void ReclaimTextureSets(uint64_t retired_submission);
+  void PurgeImageViews(std::span<const VkImageView> views);
+  void PurgeSampler(VkSampler sampler);
 
-  struct TextureSetKey {
-    std::vector<VkImageView> views;
-    std::vector<VkSampler> samplers;
-    bool operator==(const TextureSetKey& o) const = default;
-  };
-  struct TextureSetKeyHash {
-    size_t operator()(const TextureSetKey& k) const noexcept {
-      uint64_t h = 0x9E3779B97F4A7C15ull;
-      for (VkImageView v : k.views) {
-        h = (h ^ uint64_t(uintptr_t(v))) * 0xBF58476D1CE4E5B9ull;
-      }
-      for (VkSampler s : k.samplers) {
-        h = (h ^ uint64_t(uintptr_t(s))) * 0x94D049BB133111EBull;
-      }
-      return size_t(h ^ (h >> 32));
-    }
+  using TextureSetKeyView = rex::graphics::native::TextureSetKeyView;
+  using TextureSetKey = rex::graphics::native::TextureSetKey;
+  using TextureSetKeyHash = rex::graphics::native::TextureSetKeyHash;
+  using TextureSetKeyEqual = rex::graphics::native::TextureSetKeyEqual;
+  struct PersistentTextureSet {
+    size_t pool_index = SIZE_MAX;
+    uint64_t last_use_submission = 0;
   };
 
   const ui::vulkan::VulkanDevice& device;
@@ -292,9 +291,13 @@ struct DrawBindings {
   std::unordered_map<VkBuffer, size_t> constant_sets;
   VkBuffer last_constant_buffer = VK_NULL_HANDLE;
   VkDescriptorSet last_constant_set = VK_NULL_HANDLE;
-  // Indexed by [frame_slot][set_slot - 2] for sets 2 and 3 (slot 2 = pending_).
-  std::array<std::array<std::unordered_map<TextureSetKey, size_t, TextureSetKeyHash>, 2>, 3>
-      texture_sets_;
+  // Persistent cross-frame sets for sets 2 and 3, plus retired/ephemeral fallbacks.
+  std::array<std::unordered_map<TextureSetKey, PersistentTextureSet, TextureSetKeyHash,
+                                TextureSetKeyEqual>,
+             2>
+      persistent_texture_sets_;
+  std::array<std::vector<std::pair<size_t, uint64_t>>, 2> retired_texture_sets_;
+  std::array<std::array<std::vector<size_t>, 2>, 3> ephemeral_texture_sets_;
 };
 
 // Keyed by {shared buffer count, vertex images, vertex samplers, pixel images,
@@ -305,6 +308,34 @@ struct PreuploadedConstants {
   VkBuffer buffer = VK_NULL_HANDLE;
   std::array<uint32_t, SpirvShaderTranslator::kConstantBufferCount> dynamic_offsets{};
 };
+
+struct DrawTextureOp {
+  ColorImage* resolved = nullptr;
+  ColorImage* crop_source = nullptr;
+  ColorImage* depth_pack_source = nullptr;
+  std::array<ColorImage*, kTextureCubeArrayLayers> resolved_cube_faces{};
+  CachedTexture* cached = nullptr;
+  VkImage image = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  VmaAllocation allocation = VK_NULL_HANDLE;
+  VkImageView view = VK_NULL_HANDLE;
+  VkImageView cached_storage_view = VK_NULL_HANDLE;
+  VkBuffer direct_upload_buffer = VK_NULL_HANDLE;
+  VkBuffer copy_buffer = VK_NULL_HANDLE;
+  VkExtent2D extent{};
+  uint32_t array_layers = 1;
+  uint32_t level_count = 1;
+  size_t depth_pack_descriptor = SIZE_MAX;
+  bool depth_pack_float = false;
+  uint32_t depth_pack_swap = 0;
+  bool upload_cached = false;
+  std::vector<VkBufferImageCopy> uploads;
+};
+
+void ReleaseDrawTextureOp(const ui::vulkan::VulkanDevice& device, VmaAllocator allocator,
+                          DepthResolve* depth_resolve, DrawTextureOp& op);
+void RecordDrawTextureOp(const ui::vulkan::VulkanDevice& device, DepthResolve* depth_resolve,
+                         VkCommandBuffer commands, const DrawTextureOp& op);
 
 class DrawPass {
  public:
@@ -323,23 +354,25 @@ class DrawPass {
                   uint32_t shared_buffer_count, VkPipelineCache pipeline_cache,
                   DrawPipelines& pipelines, DrawBindingCache& binding_cache,
                   ui::vulkan::VulkanUploadBufferPool& uploads, uint64_t submission,
-                  uint32_t frame_slot = 0, VkBuffer shared_vertex_buffer = VK_NULL_HANDLE,
+                  uint64_t retired_submission, uint32_t frame_slot = 0,
+                  VkBuffer shared_vertex_buffer = VK_NULL_HANDLE,
                   std::timed_mutex* pipeline_cache_mutex = nullptr,
                   const PreuploadedConstants* preuploaded_constants = nullptr,
-                  DepthResolve* depth_resolve = nullptr);
+                  DepthResolve* depth_resolve = nullptr,
+                  std::vector<DrawTextureOp>* texture_ops = nullptr);
   // Records only the binds and dynamic state that differ from `state`.
   void Record(VkCommandBuffer commands, VkExtent2D extent, DrawRenderState& state);
-  void RecordTextureUpload(VkCommandBuffer commands);
   const draw_util::Scissor& scissor() const { return scissor_; }
   bool rasterizer_discard() const { return rasterizer_discard_; }
-  bool has_texture_work() const { return has_texture_work_; }
+  uint32_t first_texture_op() const { return first_texture_op_; }
+  uint32_t texture_op_count() const { return texture_op_count_; }
+  bool has_texture_work() const { return texture_op_count_ != 0; }
 
  private:
   void Release();
 
   const ui::vulkan::VulkanDevice* device_;
   VmaAllocator allocator_;
-  DepthResolve* depth_resolve_ = nullptr;
   DrawBindings* bindings_ = nullptr;
   // Sets this pass allocated and frees; shared and cached sets stay SIZE_MAX.
   std::array<size_t, 4> set_indices_{SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
@@ -349,29 +382,8 @@ class DrawPass {
   std::array<float, 4> blend_constants_{};
   VkBuffer buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory buffer_memory_ = VK_NULL_HANDLE;
-  struct Texture {
-    std::shared_ptr<ColorImage> resolved;
-    std::shared_ptr<ColorImage> crop_source;
-    std::shared_ptr<ColorImage> depth_pack_source;
-    std::array<std::shared_ptr<ColorImage>, kTextureCubeArrayLayers> resolved_cube_faces;
-    std::shared_ptr<CachedTexture> cached;
-    VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    VmaAllocation allocation = VK_NULL_HANDLE;
-    VkImageView view = VK_NULL_HANDLE;
-    VkImageView fallback_view = VK_NULL_HANDLE;
-    VkImageView cached_storage_view = VK_NULL_HANDLE;
-    VkBuffer direct_upload_buffer = VK_NULL_HANDLE;
-    VkExtent2D extent{};
-    uint32_t array_layers = 1;
-    uint32_t level_count = 1;
-    size_t depth_pack_descriptor = SIZE_MAX;
-    bool depth_pack_float = false;
-    uint32_t depth_pack_swap = 0;
-    bool upload_cached = false;
-    std::vector<VkBufferImageCopy> uploads;
-  };
-  std::vector<Texture> textures_;
+  uint32_t first_texture_op_ = 0;
+  uint32_t texture_op_count_ = 0;
   bool indexed_ = true;
   VkBuffer index_buffer_ = VK_NULL_HANDLE;
   VkDeviceSize index_offset_ = 0;
@@ -388,7 +400,6 @@ class DrawPass {
   bool edram_depth_clear_color_ = false;
   std::array<uint32_t, 2> edram_clear_constants_{};
   bool rasterizer_discard_ = false;
-  bool has_texture_work_ = false;
 };
 
 }  // namespace rex::graphics::native

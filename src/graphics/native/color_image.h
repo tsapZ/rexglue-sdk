@@ -54,6 +54,11 @@ class ColorImage {
   void MarkResolved() { unpublished_resolve_ = true; }
   bool TakeResolvedOutput() { return std::exchange(unpublished_resolve_, false); }
   bool initialized() const { return layout_ != VK_IMAGE_LAYOUT_UNDEFINED; }
+  void set_view_purger(const DrawBindingsViewPurger* purger) { view_purger_ = purger; }
+  uint64_t last_keepalive_submission() const { return last_keepalive_submission_; }
+  void set_last_keepalive_submission(uint64_t submission) {
+    last_keepalive_submission_ = submission;
+  }
 
   static constexpr VkFormat kFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
@@ -77,6 +82,8 @@ class ColorImage {
   VkPipelineStageFlags stage_ = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
   VkAccessFlags access_ = 0;
   bool unpublished_resolve_ = false;
+  const DrawBindingsViewPurger* view_purger_ = nullptr;
+  uint64_t last_keepalive_submission_ = 0;
 };
 
 struct CachedImage {

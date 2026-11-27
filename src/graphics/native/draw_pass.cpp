@@ -47,6 +47,19 @@ CachedTexture::~CachedTexture() {
   if (!device) {
     return;
   }
+  if (view_purger && view_purger->purge_views) {
+    std::vector<VkImageView> dead_views;
+    dead_views.reserve(views.size() + 1);
+    for (const auto& entry : views) {
+      if (entry.second != VK_NULL_HANDLE) {
+        dead_views.push_back(entry.second);
+      }
+    }
+    if (storage_view != VK_NULL_HANDLE) {
+      dead_views.push_back(storage_view);
+    }
+    view_purger->PurgeImageViews(dead_views);
+  }
   const auto& vk = device->functions();
   const VkDevice handle = device->device();
   for (const auto& entry : views) {
@@ -184,36 +197,119 @@ void DrawBindings::CommitPendingTextureSets(uint32_t frame_slot) {
   }
   ReleaseFrameTextureSets(frame_slot);
   for (size_t s = 0; s < 2; ++s) {
-    texture_sets_[frame_slot][s].swap(texture_sets_[kPendingTextureSetSlot][s]);
+    ephemeral_texture_sets_[frame_slot][s].swap(
+        ephemeral_texture_sets_[kPendingTextureSetSlot][s]);
   }
 }
 
 void DrawBindings::ReleaseFrameTextureSets(uint32_t frame_slot) {
-  if (frame_slot >= texture_sets_.size()) {
+  if (frame_slot >= ephemeral_texture_sets_.size()) {
     return;
   }
   for (size_t s = 0; s < 2; ++s) {
     if (pools[s + 2]) {
-      for (const auto& entry : texture_sets_[frame_slot][s]) {
-        pools[s + 2]->Free(entry.second);
+      for (const size_t index : ephemeral_texture_sets_[frame_slot][s]) {
+        pools[s + 2]->Free(index);
       }
     }
-    texture_sets_[frame_slot][s].clear();
+    ephemeral_texture_sets_[frame_slot][s].clear();
+  }
+}
+
+void DrawBindings::ReclaimTextureSets(uint64_t retired_submission) {
+  for (size_t s = 0; s < 2; ++s) {
+    auto& retired = retired_texture_sets_[s];
+    if (retired.empty() || !pools[s + 2]) {
+      continue;
+    }
+    size_t keep = 0;
+    for (size_t i = 0; i < retired.size(); ++i) {
+      if (retired[i].second <= retired_submission) {
+        pools[s + 2]->Free(retired[i].first);
+      } else {
+        retired[keep++] = retired[i];
+      }
+    }
+    retired.resize(keep);
+  }
+}
+
+void DrawBindings::PurgeImageViews(std::span<const VkImageView> views) {
+  if (views.empty()) {
+    return;
+  }
+  for (size_t s = 0; s < 2; ++s) {
+    auto& cache = persistent_texture_sets_[s];
+    for (auto it = cache.begin(); it != cache.end();) {
+      const bool matches = std::ranges::any_of(it->first.views, [&](VkImageView v) {
+        return std::ranges::find(views, v) != views.end();
+      });
+      if (matches) {
+        retired_texture_sets_[s].emplace_back(it->second.pool_index,
+                                              it->second.last_use_submission);
+        it = cache.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+}
+
+void DrawBindings::PurgeSampler(VkSampler sampler) {
+  if (sampler == VK_NULL_HANDLE) {
+    return;
+  }
+  for (size_t s = 0; s < 2; ++s) {
+    auto& cache = persistent_texture_sets_[s];
+    for (auto it = cache.begin(); it != cache.end();) {
+      if (std::ranges::find(it->first.samplers, sampler) != it->first.samplers.end()) {
+        retired_texture_sets_[s].emplace_back(it->second.pool_index,
+                                              it->second.last_use_submission);
+        it = cache.erase(it);
+      } else {
+        ++it;
+      }
+    }
   }
 }
 
 VkDescriptorSet DrawBindings::GetOrCreateTextureSet(size_t set_slot, uint32_t frame_slot,
+                                                    uint64_t submission,
+                                                    uint64_t retired_submission,
                                                     std::span<const VkImageView> views,
-                                                    std::span<const VkSampler> samplers) {
+                                                    std::span<const VkSampler> samplers,
+                                                    bool cacheable) {
   if (set_slot < 2 || set_slot > 3 || frame_slot >= 3) {
     return VK_NULL_HANDLE;
   }
-  auto& cache = texture_sets_[frame_slot][set_slot - 2];
-  TextureSetKey key;
-  key.views.assign(views.begin(), views.end());
-  key.samplers.assign(samplers.begin(), samplers.end());
-  if (auto found = cache.find(key); found != cache.end()) {
-    return pools[set_slot]->Get(found->second);
+  const size_t stage = set_slot - 2;
+  auto& cache = persistent_texture_sets_[stage];
+  if (cacheable) {
+    const TextureSetKeyView key_view{views, samplers};
+    if (auto found = cache.find(key_view); found != cache.end()) {
+      found->second.last_use_submission = submission;
+      return pools[set_slot]->Get(found->second.pool_index);
+    }
+    if (cache.size() >= kMaxPersistentTextureSets) {
+      ReclaimTextureSets(retired_submission);
+      // Evict up to 4 retired LRU entries if full.
+      for (size_t pass = 0; pass < 4 && cache.size() >= kMaxPersistentTextureSets; ++pass) {
+        auto victim = cache.end();
+        uint64_t oldest = UINT64_MAX;
+        for (auto it = cache.begin(); it != cache.end(); ++it) {
+          if (it->second.last_use_submission <= retired_submission &&
+              it->second.last_use_submission < oldest) {
+            oldest = it->second.last_use_submission;
+            victim = it;
+          }
+        }
+        if (victim == cache.end()) {
+          break;
+        }
+        pools[set_slot]->Free(victim->second.pool_index);
+        cache.erase(victim);
+      }
+    }
   }
   const size_t index = pools[set_slot]->Allocate();
   if (index == SIZE_MAX) {
@@ -266,7 +362,14 @@ VkDescriptorSet DrawBindings::GetOrCreateTextureSet(size_t set_slot, uint32_t fr
     device.functions().vkUpdateDescriptorSets(device.device(), write_count, writes.data(), 0,
                                               nullptr);
   }
-  cache.emplace(std::move(key), index);
+  if (cacheable && cache.size() < kMaxPersistentTextureSets) {
+    TextureSetKey key;
+    key.views.assign(views.begin(), views.end());
+    key.samplers.assign(samplers.begin(), samplers.end());
+    cache.emplace(std::move(key), PersistentTextureSet{index, submission});
+  } else {
+    ephemeral_texture_sets_[frame_slot][stage].push_back(index);
+  }
   return set;
 }
 
@@ -384,7 +487,6 @@ DrawPass& DrawPass::operator=(DrawPass&& other) noexcept {
   Release();
   device_ = other.device_;
   allocator_ = other.allocator_;
-  depth_resolve_ = std::exchange(other.depth_resolve_, nullptr);
   bindings_ = std::exchange(other.bindings_, nullptr);
   set_indices_ = std::exchange(other.set_indices_, {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
   sets_ = other.sets_;
@@ -393,8 +495,8 @@ DrawPass& DrawPass::operator=(DrawPass&& other) noexcept {
   blend_constants_ = other.blend_constants_;
   buffer_ = other.buffer_;
   buffer_memory_ = std::exchange(other.buffer_memory_, VkDeviceMemory(VK_NULL_HANDLE));
-  textures_ = std::move(other.textures_);
-  other.textures_.clear();
+  first_texture_op_ = std::exchange(other.first_texture_op_, 0);
+  texture_op_count_ = std::exchange(other.texture_op_count_, 0);
   indexed_ = other.indexed_;
   index_buffer_ = other.index_buffer_;
   index_offset_ = other.index_offset_;
@@ -411,7 +513,6 @@ DrawPass& DrawPass::operator=(DrawPass&& other) noexcept {
   edram_depth_clear_color_ = other.edram_depth_clear_color_;
   edram_clear_constants_ = other.edram_clear_constants_;
   rasterizer_discard_ = other.rasterizer_discard_;
-  has_texture_work_ = std::exchange(other.has_texture_work_, false);
   return *this;
 }
 
@@ -426,19 +527,6 @@ void DrawPass::Release() {
       set_indices_[i] = SIZE_MAX;
     }
   }
-  for (auto& texture : textures_) {
-    if (texture.depth_pack_descriptor != SIZE_MAX && depth_resolve_) {
-      depth_resolve_->Free(texture.depth_pack_descriptor);
-      texture.depth_pack_descriptor = SIZE_MAX;
-    }
-    // Fallback views, cached views, resolved-image views, samplers and cached
-    // images are owned by the command processor, not this pass.
-    if (texture.fallback_view == VK_NULL_HANDLE && !texture.cached && !texture.resolved) {
-      vk.vkDestroyImageView(device, texture.view, nullptr);
-    }
-    DestroyDeviceImage(*device_, allocator_, texture.image, texture.memory, texture.allocation);
-  }
-  textures_.clear();
   if (buffer_memory_) {
     vk.vkDestroyBuffer(device, buffer_, nullptr);
     vk.vkFreeMemory(device, buffer_memory_, nullptr);
@@ -453,15 +541,38 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
                           uint32_t shared_buffer_count, VkPipelineCache pipeline_cache,
                           DrawPipelines& pipelines, DrawBindingCache& binding_cache,
                           ui::vulkan::VulkanUploadBufferPool& uploads, uint64_t submission,
-                          uint32_t frame_slot, VkBuffer shared_vertex_buffer,
-                          std::timed_mutex* pipeline_cache_mutex,
+                          uint64_t retired_submission, uint32_t frame_slot,
+                          VkBuffer shared_vertex_buffer, std::timed_mutex* pipeline_cache_mutex,
                           const PreuploadedConstants* preuploaded_constants,
-                          DepthResolve* depth_resolve) {
+                          DepthResolve* depth_resolve, std::vector<DrawTextureOp>* texture_ops) {
   const auto& vk = device_->functions();
   const VkDevice device = device_->device();
-  depth_resolve_ = depth_resolve;
 
-  textures_.resize(input.textures.size());
+  std::vector<DrawTextureOp> local_ops;
+  std::vector<DrawTextureOp>& ops = texture_ops ? *texture_ops : local_ops;
+  const size_t ops_start = ops.size();
+  first_texture_op_ = uint32_t(ops_start);
+  texture_op_count_ = 0;
+  std::vector<uint32_t> op_index_for_input(input.textures.size(), UINT32_MAX);
+  std::vector<VkImageView> texture_views(input.textures.size(), VK_NULL_HANDLE);
+  struct OpsGuard {
+    const ui::vulkan::VulkanDevice* dev;
+    VmaAllocator alloc;
+    DepthResolve* resolve;
+    std::vector<DrawTextureOp>& ops_ref;
+    size_t start;
+    uint32_t& count_ref;
+    bool committed = false;
+    ~OpsGuard() {
+      if (!committed) {
+        for (size_t j = start; j < ops_ref.size(); ++j) {
+          ReleaseDrawTextureOp(*dev, alloc, resolve, ops_ref[j]);
+        }
+        ops_ref.resize(start);
+        count_ref = 0;
+      }
+    }
+  } ops_guard{device_, allocator_, depth_resolve, ops, ops_start, texture_op_count_};
   blend_constants_ = input.blend_constants;
   viewport_ = input.viewport;
   scissor_ = input.scissor;
@@ -557,17 +668,45 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
     index_offset_ = rex::align(size, VkDeviceSize(4));
     size = index_offset_ + inline_indices.size_bytes();
   }
-  for (size_t i = 0; i < textures_.size(); ++i) {
+  for (size_t i = 0; i < input.textures.size(); ++i) {
     const auto& input_texture = input.textures[i];
+    if (input_texture.fallback_view != VK_NULL_HANDLE) {
+      texture_views[i] = input_texture.fallback_view;
+      continue;
+    }
+    if (input_texture.cached_texture) {
+      texture_views[i] = input_texture.cached_view;
+      if (!input_texture.upload_cached) {
+        continue;
+      }
+    }
+    const uint32_t op_idx = uint32_t(ops.size());
+    op_index_for_input[i] = op_idx;
+    auto& op = ops.emplace_back();
+    op.resolved = input_texture.resolved_image.get();
+    op.crop_source = input_texture.crop_source.get();
+    op.depth_pack_source = input_texture.depth_pack_source.get();
+    op.depth_pack_float = input_texture.depth_pack_float;
+    op.depth_pack_swap = input_texture.depth_pack_swap;
+    for (uint32_t face = 0; face < kTextureCubeArrayLayers; ++face) {
+      op.resolved_cube_faces[face] = input_texture.resolved_cube_faces[face].get();
+    }
+    op.cached = input_texture.cached_texture.get();
+    op.upload_cached = input_texture.upload_cached;
+    op.array_layers = op.resolved || input_texture.view_type == VK_IMAGE_VIEW_TYPE_3D
+                          ? 1
+                          : input_texture.array_layers;
+    op.level_count = input_texture.level_count;
+    op.extent = {input_texture.width, input_texture.height};
     if (input_texture.direct_upload_buffer != VK_NULL_HANDLE) {
-      textures_[i].direct_upload_buffer = input_texture.direct_upload_buffer;
-      textures_[i].uploads = input_texture.direct_uploads;
+      op.direct_upload_buffer = input_texture.direct_upload_buffer;
+      op.uploads = input_texture.direct_uploads;
       continue;
     }
     const bool is_3d = input_texture.view_type == VK_IMAGE_VIEW_TYPE_3D;
     for (uint32_t index = 0; index < input_texture.levels.size(); ++index) {
       const uint32_t level = input_texture.first_level + index;
-      auto& copy = textures_[i].uploads.emplace_back();
+      auto& copy = op.uploads.emplace_back();
       copy.bufferOffset = rex::align(size, VkDeviceSize(16));
       copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0,
                                is_3d ? 1 : input_texture.array_layers};
@@ -577,6 +716,7 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
       size = copy.bufferOffset + input_texture.levels[index].size();
     }
   }
+  texture_op_count_ = uint32_t(ops.size() - ops_start);
   if (!use_preuploaded_constants) {
     size = ComputeDynamicUboRequiredSize(constant_offsets, kDynamicConstantBufferRanges, size);
   }
@@ -644,13 +784,19 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
     index_offset_ += buffer_offset;
     index_type_ = VK_INDEX_TYPE_UINT32;
   }
-  for (size_t i = 0; i < textures_.size(); ++i) {
-    if (textures_[i].direct_upload_buffer != VK_NULL_HANDLE) {
+  for (size_t i = 0; i < input.textures.size(); ++i) {
+    const uint32_t op_idx = op_index_for_input[i];
+    if (op_idx == UINT32_MAX) {
       continue;
     }
-    for (size_t level = 0; level < textures_[i].uploads.size(); ++level) {
+    auto& op = ops[op_idx];
+    op.copy_buffer = op.direct_upload_buffer != VK_NULL_HANDLE ? op.direct_upload_buffer : buffer_;
+    if (op.direct_upload_buffer != VK_NULL_HANDLE) {
+      continue;
+    }
+    for (size_t level = 0; level < op.uploads.size(); ++level) {
       const auto& pixels = input.textures[i].levels[level];
-      auto& copy = textures_[i].uploads[level];
+      auto& copy = op.uploads[level];
       std::memcpy(bytes + copy.bufferOffset, pixels.data(), pixels.size());
       copy.bufferOffset += buffer_offset;
     }
@@ -699,58 +845,33 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
     vk.vkUpdateDescriptorSets(device, write_count, writes.data(), 0, nullptr);
   }
 
-  for (size_t i = 0; i < textures_.size(); ++i) {
-    const auto& input_texture = input.textures[i];
-    auto& texture = textures_[i];
-    texture.resolved = input_texture.resolved_image;
-    texture.crop_source = input_texture.crop_source;
-    texture.depth_pack_source = input_texture.depth_pack_source;
-    texture.depth_pack_float = input_texture.depth_pack_float;
-    texture.depth_pack_swap = input_texture.depth_pack_swap;
-    texture.resolved_cube_faces = input_texture.resolved_cube_faces;
-    texture.cached = input_texture.cached_texture;
-    texture.upload_cached = input_texture.upload_cached;
-    texture.fallback_view = input_texture.fallback_view;
-    texture.array_layers = texture.resolved || input_texture.view_type == VK_IMAGE_VIEW_TYPE_3D
-                               ? 1
-                               : input_texture.array_layers;
-    texture.level_count = input_texture.level_count;
-    texture.extent = {input_texture.width, input_texture.height};
-    // The fallback view is a 1x1 zero-cleared image owned by the command
-    // processor, so this pass neither allocates nor destroys anything for it.
-    if (texture.fallback_view != VK_NULL_HANDLE) {
-      texture.view = texture.fallback_view;
+  for (size_t i = 0; i < input.textures.size(); ++i) {
+    const uint32_t op_idx = op_index_for_input[i];
+    if (op_idx == UINT32_MAX) {
       continue;
     }
-    // Cached images, their views and their upload state are owned by the command
-    // processor; only an entry that has not been uploaded yet records a copy.
-    if (texture.cached) {
-      has_texture_work_ |= texture.upload_cached;
-      texture.view = input_texture.cached_view;
-      if (texture.upload_cached && texture.depth_pack_source) {
-        if (!depth_resolve_) {
+    const auto& input_texture = input.textures[i];
+    auto& op = ops[op_idx];
+    if (op.cached) {
+      if (op.upload_cached && op.depth_pack_source) {
+        if (!depth_resolve) {
           return false;
         }
-        texture.cached_storage_view = texture.cached->GetOrCreateStorageView(input_texture.format);
-        texture.depth_pack_descriptor = depth_resolve_->Allocate();
-        if (texture.cached_storage_view == VK_NULL_HANDLE ||
-            texture.depth_pack_descriptor == SIZE_MAX) {
+        op.cached_storage_view = op.cached->GetOrCreateStorageView(input_texture.format);
+        op.depth_pack_descriptor = depth_resolve->Allocate();
+        if (op.cached_storage_view == VK_NULL_HANDLE || op.depth_pack_descriptor == SIZE_MAX) {
           return false;
         }
       }
       continue;
     }
-    // Resolved images cache their sampler views by component mapping, so a
-    // draw only borrows one instead of creating and destroying a view.
-    if (texture.resolved) {
-      has_texture_work_ = true;
-      texture.view = texture.resolved->GetSampledView(input_texture.swizzle);
-      if (texture.view == VK_NULL_HANDLE) {
+    if (op.resolved) {
+      texture_views[i] = op.resolved->GetSampledView(input_texture.swizzle);
+      if (texture_views[i] == VK_NULL_HANDLE) {
         return false;
       }
       continue;
     }
-    has_texture_work_ = true;
     const uint32_t level_count = std::max(1u, input_texture.level_count);
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.imageType =
@@ -758,27 +879,26 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
     info.format = input_texture.format;
     info.extent = {input_texture.width, input_texture.height, input_texture.depth};
     info.mipLevels = level_count;
-    info.arrayLayers = texture.array_layers;
+    info.arrayLayers = op.array_layers;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    // A cropped resolve is filled by an image copy during the upload.
     info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     if (input_texture.view_type == VK_IMAGE_VIEW_TYPE_CUBE) {
       info.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     }
-    if (!CreateDeviceImage(*device_, allocator_, info, texture.image, texture.memory,
-                           texture.allocation)) {
+    if (!CreateDeviceImage(*device_, allocator_, info, op.image, op.memory, op.allocation)) {
       return false;
     }
     VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    view.image = texture.image;
+    view.image = op.image;
     view.viewType = input_texture.view_type;
     view.format = input_texture.format;
     view.components = input_texture.swizzle;
-    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, level_count, 0, texture.array_layers};
-    if (vk.vkCreateImageView(device, &view, nullptr, &texture.view) != VK_SUCCESS) {
+    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, level_count, 0, op.array_layers};
+    if (vk.vkCreateImageView(device, &view, nullptr, &op.view) != VK_SUCCESS) {
       return false;
     }
+    texture_views[i] = op.view;
   }
   // Set 2 holds the vertex shader textures, set 3 the pixel shader ones.
   const auto resolve_texture_set = [&](size_t set_slot, std::span<const uint32_t> bindings,
@@ -795,11 +915,18 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
       heap_views.resize(bindings.size());
       view_ptr = heap_views.data();
     }
+    bool stage_cacheable = true;
     for (size_t i = 0; i < bindings.size(); ++i) {
-      view_ptr[i] = textures_[bindings[i]].view;
+      const uint32_t tex_idx = bindings[i];
+      view_ptr[i] = texture_views[tex_idx];
+      if (op_index_for_input[tex_idx] != UINT32_MAX &&
+          ops[op_index_for_input[tex_idx]].view != VK_NULL_HANDLE) {
+        stage_cacheable = false;
+      }
     }
     sets_[set_slot] = bindings_->GetOrCreateTextureSet(
-        set_slot, frame_slot, std::span<const VkImageView>(view_ptr, bindings.size()), samplers);
+        set_slot, frame_slot, submission, retired_submission,
+        std::span<const VkImageView>(view_ptr, bindings.size()), samplers, stage_cacheable);
     return sets_[set_slot] != VK_NULL_HANDLE;
   };
   if (!resolve_texture_set(2, input.vertex_texture_bindings, input.vertex_samplers) ||
@@ -850,6 +977,7 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
   }
   if (auto cached = pipelines.find(key); cached != pipelines.end()) {
     pipeline_ = cached->second;
+    ops_guard.committed = true;
     return true;
   }
 
@@ -938,129 +1066,123 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
     return false;
   }
   pipelines.emplace(key, pipeline_);
+  ops_guard.committed = true;
   return true;
 }
 
-void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
-  if (!has_texture_work_) {
+void ReleaseDrawTextureOp(const ui::vulkan::VulkanDevice& device, VmaAllocator allocator,
+                          DepthResolve* depth_resolve, DrawTextureOp& op) {
+  if (op.depth_pack_descriptor != SIZE_MAX && depth_resolve) {
+    depth_resolve->Free(op.depth_pack_descriptor);
+    op.depth_pack_descriptor = SIZE_MAX;
+  }
+  if (op.view != VK_NULL_HANDLE) {
+    device.functions().vkDestroyImageView(device.device(), op.view, nullptr);
+    op.view = VK_NULL_HANDLE;
+  }
+  DestroyDeviceImage(device, allocator, op.image, op.memory, op.allocation);
+  op.image = VK_NULL_HANDLE;
+  op.memory = VK_NULL_HANDLE;
+  op.allocation = VK_NULL_HANDLE;
+}
+
+void RecordDrawTextureOp(const ui::vulkan::VulkanDevice& device, DepthResolve* depth_resolve,
+                         VkCommandBuffer commands, const DrawTextureOp& op) {
+  const auto& vk = device.functions();
+  if (op.resolved) {
+    op.resolved->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kTextureStages,
+                            VK_ACCESS_SHADER_READ_BIT);
     return;
   }
-  const auto& vk = device_->functions();
-  for (const auto& texture : textures_) {
-    if (texture.fallback_view != VK_NULL_HANDLE) {
-      // Zero-cleared and already in the shader-read layout for the device's life.
-      continue;
-    }
-    if (texture.resolved) {
-      texture.resolved->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                   kTextureStages, VK_ACCESS_SHADER_READ_BIT);
-      continue;
-    }
-    // A cached image uploaded by an earlier draw in this batch is already in the
-    // shader-read layout, so it needs no copy at all.
-    if (texture.cached && !texture.upload_cached) {
-      continue;
-    }
-    bool resolved_faces = false;
-    for (const auto& face : texture.resolved_cube_faces) {
-      resolved_faces |= face != nullptr;
-    }
-    const VkImage image = texture.cached ? texture.cached->image : texture.image;
-    if (texture.depth_pack_source) {
-      texture.depth_pack_source->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                            VK_ACCESS_SHADER_READ_BIT);
-      VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-      barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-      barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-      barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      barrier.image = image;
-      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, texture.array_layers};
-      barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-      barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-      vk.vkCmdPipelineBarrier(commands, kTextureStages | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                              &barrier);
-      depth_resolve_->RecordPackRgba8(commands, texture.depth_pack_descriptor,
-                                      texture.depth_pack_source->depth_view(),
-                                      texture.cached_storage_view, texture.extent,
-                                      texture.depth_pack_float, texture.depth_pack_swap);
-      barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-      barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-      barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-      barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-      vk.vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, kTextureStages, 0, 0,
-                              nullptr, 0, nullptr, 1, &barrier);
-      continue;
-    }
+  if (op.cached && !op.upload_cached) {
+    return;
+  }
+  bool resolved_faces = false;
+  for (const auto* face : op.resolved_cube_faces) {
+    resolved_faces |= face != nullptr;
+  }
+  const VkImage image = op.cached ? op.cached->image : op.image;
+  if (op.depth_pack_source) {
+    op.depth_pack_source->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_ACCESS_SHADER_READ_BIT);
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
-                                texture.crop_source || resolved_faces ? 1u : texture.level_count,
-                                0, texture.array_layers};
-    // A cached GPU-resolved cube or crop may have been sampled or written earlier
-    // in the same command buffer, so wait for prior shader reads and transfers
-    // before overwriting it.
-    const bool cached_resolve_upload =
-        texture.cached && (resolved_faces || texture.crop_source != nullptr);
-    const VkPipelineStageFlags src_stage =
-        cached_resolve_upload
-            ? (kTextureStages | VK_PIPELINE_STAGE_TRANSFER_BIT)
-            : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    barrier.srcAccessMask = cached_resolve_upload ? VK_ACCESS_TRANSFER_WRITE_BIT : 0;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vk.vkCmdPipelineBarrier(commands, src_stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                            nullptr, 1, &barrier);
-    if (texture.crop_source) {
-      // The resolved image may have been written earlier in this command
-      // buffer, so transition and copy it here, right before the draw.
-      texture.crop_source->Transition(commands, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                      VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                      VK_ACCESS_TRANSFER_READ_BIT);
-      VkImageCopy copy{};
-      copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-      copy.extent = {texture.extent.width, texture.extent.height, 1};
-      vk.vkCmdCopyImage(commands, texture.crop_source->image(),
-                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
-                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-      texture.crop_source->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                      kTextureStages, VK_ACCESS_SHADER_READ_BIT);
-    } else if (resolved_faces) {
-      // Each face lives in its own resolve image at up to one resolve-alignment
-      // unit larger than the face, so crop its top-left corner into the matching
-      // array layer of the uploaded cube.
-      for (uint32_t face = 0; face < kTextureCubeArrayLayers; ++face) {
-        const auto& face_image = texture.resolved_cube_faces[face];
-        if (!face_image) {
-          continue;
-        }
-        face_image->Transition(commands, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        VkImageCopy copy{};
-        copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, face, 1};
-        copy.extent = {texture.extent.width, texture.extent.height, 1};
-        vk.vkCmdCopyImage(commands, face_image->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                          image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-        face_image->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kTextureStages,
-                               VK_ACCESS_SHADER_READ_BIT);
-      }
-    } else {
-      const VkBuffer copy_buffer =
-          texture.direct_upload_buffer != VK_NULL_HANDLE ? texture.direct_upload_buffer : buffer_;
-      vk.vkCmdCopyBufferToImage(commands, copy_buffer, image, barrier.newLayout,
-                                uint32_t(texture.uploads.size()), texture.uploads.data());
-    }
-    barrier.oldLayout = barrier.newLayout;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, op.array_layers};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    vk.vkCmdPipelineBarrier(commands, kTextureStages | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                            &barrier);
+    depth_resolve->RecordPackRgba8(commands, op.depth_pack_descriptor,
+                                   op.depth_pack_source->depth_view(), op.cached_storage_view,
+                                   op.extent, op.depth_pack_float, op.depth_pack_swap);
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
     barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vk.vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, kTextureStages, 0, 0,
+    vk.vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, kTextureStages, 0, 0,
                             nullptr, 0, nullptr, 1, &barrier);
+    return;
   }
+  VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.image = image;
+  barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                              op.crop_source || resolved_faces ? 1u : op.level_count, 0,
+                              op.array_layers};
+  const bool cached_resolve_upload =
+      op.cached && (resolved_faces || op.crop_source != nullptr);
+  const VkPipelineStageFlags src_stage =
+      cached_resolve_upload
+          ? (kTextureStages | VK_PIPELINE_STAGE_TRANSFER_BIT)
+          : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+  barrier.srcAccessMask = cached_resolve_upload ? VK_ACCESS_TRANSFER_WRITE_BIT : 0;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  vk.vkCmdPipelineBarrier(commands, src_stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                          nullptr, 1, &barrier);
+  if (op.crop_source) {
+    op.crop_source->Transition(commands, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkImageCopy copy{};
+    copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.extent = {op.extent.width, op.extent.height, 1};
+    vk.vkCmdCopyImage(commands, op.crop_source->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    op.crop_source->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kTextureStages,
+                               VK_ACCESS_SHADER_READ_BIT);
+  } else if (resolved_faces) {
+    for (uint32_t face = 0; face < kTextureCubeArrayLayers; ++face) {
+      ColorImage* face_image = op.resolved_cube_faces[face];
+      if (!face_image) {
+        continue;
+      }
+      face_image->Transition(commands, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+      VkImageCopy copy{};
+      copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, face, 1};
+      copy.extent = {op.extent.width, op.extent.height, 1};
+      vk.vkCmdCopyImage(commands, face_image->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+      face_image->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kTextureStages,
+                             VK_ACCESS_SHADER_READ_BIT);
+    }
+  } else {
+    vk.vkCmdCopyBufferToImage(commands, op.copy_buffer, image, barrier.newLayout,
+                              uint32_t(op.uploads.size()), op.uploads.data());
+  }
+  barrier.oldLayout = barrier.newLayout;
+  barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  vk.vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, kTextureStages, 0, 0, nullptr,
+                          0, nullptr, 1, &barrier);
 }
 
 void DrawPass::Record(VkCommandBuffer commands, VkExtent2D extent, DrawRenderState& state) {

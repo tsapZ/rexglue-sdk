@@ -36,6 +36,22 @@ void DestroyDeviceImage(const ui::vulkan::VulkanDevice& device, VmaAllocator all
 }
 
 ColorImage::~ColorImage() {
+  if (view_purger_ && view_purger_->purge_views) {
+    std::vector<VkImageView> dead_views;
+    dead_views.reserve(sampled_views_.size() + 2);
+    if (view_ != VK_NULL_HANDLE) {
+      dead_views.push_back(view_);
+    }
+    if (depth_view_ != VK_NULL_HANDLE) {
+      dead_views.push_back(depth_view_);
+    }
+    for (const auto& entry : sampled_views_) {
+      if (entry.second != VK_NULL_HANDLE) {
+        dead_views.push_back(entry.second);
+      }
+    }
+    view_purger_->PurgeImageViews(dead_views);
+  }
   const auto& vk = device_.functions();
   for (const auto& entry : sampled_views_) {
     vk.vkDestroyImageView(device_.device(), entry.second, nullptr);

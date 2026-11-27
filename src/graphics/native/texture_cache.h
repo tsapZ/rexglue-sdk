@@ -93,6 +93,7 @@ class NativeTextureCache {
   void RebuildCachedTexturePages();
   // Marks guest pages as holding cached resolve data.
   void MarkCachedPages(uint32_t start, uint32_t length);
+  void set_view_purger(const DrawBindingsViewPurger* purger) { view_purger_ = purger; }
   // Lock-free atomic read of a 256 KiB block's GPU-resolved-page mask.
   uint64_t ResolvedPagesWord(uint32_t block) const {
     return block < resolved_pages_.size()
@@ -208,6 +209,7 @@ class NativeTextureCache {
   std::vector<uint64_t> resolved_pages_;
   std::vector<uint64_t> scratch_resolved_pages_;
   std::vector<uint8_t> decode_row_scratch_;
+  const DrawBindingsViewPurger* view_purger_ = nullptr;
 };
 
 }  // namespace rex::graphics::native

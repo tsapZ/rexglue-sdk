@@ -92,6 +92,9 @@ void NativeTextureCache::InvalidateAll() {
 
 void NativeTextureCache::ClearSamplers() {
   for (const auto& entry : samplers_) {
+    if (view_purger_) {
+      view_purger_->PurgeSampler(entry.second.sampler);
+    }
     device_.functions().vkDestroySampler(device_.device(), entry.second.sampler, nullptr);
   }
   samplers_.clear();
@@ -411,6 +414,9 @@ VkSampler NativeTextureCache::GetSampler(const DrawSampler& key) {
     }
     auto victim_it = samplers_.find(*victim);
     custom_border_color_samplers_ -= victim_it->second.custom_border_color ? 1 : 0;
+    if (view_purger_) {
+      view_purger_->PurgeSampler(victim_it->second.sampler);
+    }
     device_.functions().vkDestroySampler(device_.device(), victim_it->second.sampler, nullptr);
     samplers_.erase(victim_it);
   }
@@ -735,6 +741,7 @@ std::shared_ptr<CachedTexture> NativeTextureCache::GetOrCreateCachedTexture(
   auto entry = std::make_shared<CachedTexture>();
   entry->device = &device_;
   entry->allocator = allocator_;
+  entry->view_purger = view_purger_;
   entry->level_count = image_info.mipLevels;
   entry->last_use_submission = clock_.next;
   if (!CreateDeviceImage(device_, allocator_, image_info, entry->image, entry->memory,

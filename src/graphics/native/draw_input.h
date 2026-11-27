@@ -2071,4 +2071,71 @@ constexpr VkExtent2D GetEdramTileHostExtent(xenos::MsaaSamples samples, bool is_
   return {width * scale_x, height * scale_y};
 }
 
+// Callback table allowing image/texture/sampler destructors to purge stale
+// handles from persistent descriptor set caches without circular dependencies.
+struct DrawBindingsViewPurger {
+  void* context = nullptr;
+  void (*purge_views)(void* context, std::span<const VkImageView> views) = nullptr;
+  void (*purge_sampler)(void* context, VkSampler sampler) = nullptr;
+  void PurgeImageViews(std::span<const VkImageView> views) const {
+    if (context && purge_views && !views.empty()) {
+      purge_views(context, views);
+    }
+  }
+  void PurgeSampler(VkSampler sampler) const {
+    if (context && purge_sampler && sampler != VK_NULL_HANDLE) {
+      purge_sampler(context, sampler);
+    }
+  }
+};
+
+struct TextureSetKeyView {
+  std::span<const VkImageView> views;
+  std::span<const VkSampler> samplers;
+};
+
+struct TextureSetKey {
+  std::vector<VkImageView> views;
+  std::vector<VkSampler> samplers;
+  bool operator==(const TextureSetKey& o) const = default;
+};
+
+struct TextureSetKeyHash {
+  using is_transparent = void;
+  static size_t HashParts(std::span<const VkImageView> views,
+                          std::span<const VkSampler> samplers) noexcept {
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (VkImageView v : views) {
+      h = (h ^ uint64_t(uintptr_t(v))) * 0xBF58476D1CE4E5B9ull;
+    }
+    for (VkSampler s : samplers) {
+      h = (h ^ uint64_t(uintptr_t(s))) * 0x94D049BB133111EBull;
+    }
+    return size_t(h ^ (h >> 32));
+  }
+  size_t operator()(const TextureSetKey& k) const noexcept {
+    return HashParts(k.views, k.samplers);
+  }
+  size_t operator()(const TextureSetKeyView& k) const noexcept {
+    return HashParts(k.views, k.samplers);
+  }
+};
+
+struct TextureSetKeyEqual {
+  using is_transparent = void;
+  static bool EqualParts(std::span<const VkImageView> a_views,
+                         std::span<const VkSampler> a_samplers,
+                         std::span<const VkImageView> b_views,
+                         std::span<const VkSampler> b_samplers) noexcept {
+    return std::ranges::equal(a_views, b_views) && std::ranges::equal(a_samplers, b_samplers);
+  }
+  bool operator()(const TextureSetKey& a, const TextureSetKey& b) const noexcept { return a == b; }
+  bool operator()(const TextureSetKey& a, const TextureSetKeyView& b) const noexcept {
+    return EqualParts(a.views, a.samplers, b.views, b.samplers);
+  }
+  bool operator()(const TextureSetKeyView& a, const TextureSetKey& b) const noexcept {
+    return EqualParts(a.views, a.samplers, b.views, b.samplers);
+  }
+};
+
 }  // namespace rex::graphics::native
