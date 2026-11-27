@@ -872,6 +872,38 @@ TEST_CASE("Native invalidation widening respects protected texture pages", "[gpu
       native::WidenInvalidationPageRange(empty_protected, native::kPhysicalMemorySize - 4096u, 4096u);
   CHECK(end_clamped.first == native::kPhysicalMemorySize - 4096u);
   CHECK(end_clamped.second == 4096u);
+
+  // Union mask across multiple bitmaps stops at the tightest protected boundary
+  // even when another bitmap (e.g., shader pages) is all zeros in that block.
+  std::vector<uint64_t> tex_pages(4, 0);
+  std::vector<uint64_t> idx_pages(4, 0);
+  std::vector<uint64_t> shader_pages(4, 0);
+  native::AtomicSetPageRangeBits(tex_pages, 10, 1);
+  native::AtomicSetPageRangeBits(idx_pages, 20, 1);
+  const auto union_widened = native::WidenInvalidationPageRangeWithMask(
+      [&](uint32_t b) { return tex_pages[b] | idx_pages[b] | shader_pages[b]; }, 4u, 16u * 4096u,
+      4096u);
+  CHECK(union_widened.first == 11u * 4096u);
+  CHECK(union_widened.second == 9u * 4096u);
+}
+
+TEST_CASE("Native atomic watched page run finder skips already-watched pages", "[gpu][native]") {
+  std::vector<uint64_t> watched(4, 0);
+  native::AtomicSetPageRangeBits(watched, 62, 4);  // spans word 0->1 boundary
+  native::AtomicClearPageRangeBits(watched, 63, 1);
+  uint32_t cursor = 60;
+  uint32_t run_first = 0;
+  uint32_t run_count = 0;
+  REQUIRE(native::AtomicFindNextUnsetPageRun(watched, cursor, 70, run_first, run_count));
+  CHECK(run_first == 60u);
+  CHECK(run_count == 2u);
+  REQUIRE(native::AtomicFindNextUnsetPageRun(watched, cursor, 70, run_first, run_count));
+  CHECK(run_first == 63u);
+  CHECK(run_count == 1u);
+  REQUIRE(native::AtomicFindNextUnsetPageRun(watched, cursor, 70, run_first, run_count));
+  CHECK(run_first == 66u);
+  CHECK(run_count == 4u);
+  CHECK_FALSE(native::AtomicFindNextUnsetPageRun(watched, cursor, 70, run_first, run_count));
 }
 
 TEST_CASE("Native draw resolution scale rect and crop helpers", "[gpu][native]") {

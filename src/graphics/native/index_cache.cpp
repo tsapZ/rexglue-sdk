@@ -29,6 +29,7 @@ bool NativeIndexCache::Initialize(bool watch_pages) {
   if (watch_pages) {
     const size_t words = (kSharedVertexPageCount + 63) / 64;
     cached_pages_.assign(words, 0);
+    scratch_pages_.assign(words, 0);
     recent_invalidated_pages_.assign(words, 0);
   }
   return true;
@@ -39,9 +40,8 @@ void NativeIndexCache::InvalidateAll() {
   for (auto& chunk : chunks_) {
     chunk.used = 0;
   }
-  if (!cached_pages_.empty()) {
-    std::lock_guard<std::mutex> lock(pages_mutex_);
-    std::fill(cached_pages_.begin(), cached_pages_.end(), 0);
+  for (auto& w : cached_pages_) {
+    std::atomic_ref<uint64_t>(w).store(0, std::memory_order_relaxed);
   }
   std::fill(recent_invalidated_pages_.begin(), recent_invalidated_pages_.end(), 0);
 }
@@ -51,22 +51,25 @@ void NativeIndexCache::ClearRecentInvalidations() {
 }
 
 std::pair<uint32_t, uint32_t> NativeIndexCache::WidenInvalidation(uint32_t start, uint32_t length) {
-  std::lock_guard<std::mutex> lock(pages_mutex_);
   if (cached_pages_.empty()) {
     return {start, 0};
   }
-  return WidenInvalidationPageRange(cached_pages_, start, length);
+  return WidenInvalidationPageRangeWithMask(
+      [this](uint32_t b) { return ProtectedPagesWord(b); }, uint32_t(cached_pages_.size()), start,
+      length);
 }
 
 void NativeIndexCache::RebuildCachedPages() {
   if (cached_pages_.empty()) {
     return;
   }
-  std::lock_guard<std::mutex> lock(pages_mutex_);
-  std::fill(cached_pages_.begin(), cached_pages_.end(), 0);
+  std::fill(scratch_pages_.begin(), scratch_pages_.end(), 0);
   for (const auto& [key, entry] : entries_) {
     const auto [first, count] = GetPhysicalPageRange(entry.guest_start, entry.guest_length);
-    SetPageRangeBits(cached_pages_, first, count);
+    SetPageRangeBits(scratch_pages_, first, count);
+  }
+  for (size_t i = 0; i < cached_pages_.size(); ++i) {
+    std::atomic_ref<uint64_t>(cached_pages_[i]).store(scratch_pages_[i], std::memory_order_relaxed);
   }
 }
 
@@ -75,7 +78,7 @@ void NativeIndexCache::Invalidate(uint32_t start, uint32_t length) {
   if (!recent_invalidated_pages_.empty()) {
     SetPageRangeBits(recent_invalidated_pages_, first_page, page_count);
   }
-  if (!cached_pages_.empty() && !HasAnyPageBitSet(cached_pages_, first_page, page_count)) {
+  if (!cached_pages_.empty() && !AtomicHasAnyPageBitSet(cached_pages_, first_page, page_count)) {
     return;
   }
   bool erased = false;
@@ -199,7 +202,11 @@ bool NativeIndexCache::GetOrCreate(const IndexCacheKey& key, std::span<const uin
   if (!AllocateInChunks(host_bytes, chunk_index, dst_buffer, dst_offset)) {
     return false;
   }
-  memory_.EnablePhysicalMemoryAccessCallbacks(key.guest_base, guest_length, true, false);
+  if (watch_range_) {
+    watch_range_(key.guest_base, guest_length);
+  } else {
+    memory_.EnablePhysicalMemoryAccessCallbacks(key.guest_base, guest_length, true, false);
+  }
   if (key.use_uint16) {
     DecodeDmaIndices16(guest_bytes, key.endianness, reinterpret_cast<uint16_t*>(staging),
                        key.index_count);
@@ -208,10 +215,7 @@ bool NativeIndexCache::GetOrCreate(const IndexCacheKey& key, std::span<const uin
                        reinterpret_cast<uint32_t*>(staging), key.index_count, key.primitive_restart,
                        key.reset_index);
   }
-  {
-    std::lock_guard<std::mutex> lock(pages_mutex_);
-    SetPageRangeBits(cached_pages_, first_page, page_count);
-  }
+  AtomicSetPageRangeBits(cached_pages_, first_page, page_count);
   entries_.emplace(key, Entry{chunk_index, dst_buffer, dst_offset, key.guest_base, guest_length,
                               clock_.next});
   binding_out = {true, dst_buffer, dst_offset,

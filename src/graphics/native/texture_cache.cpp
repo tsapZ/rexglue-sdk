@@ -65,20 +65,28 @@ NativeTextureCache::~NativeTextureCache() {
 
 bool NativeTextureCache::Initialize(bool watch_pages) {
   if (watch_pages) {
-    cached_texture_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
+    const size_t words = (kSharedVertexPageCount + 63) / 64;
+    cached_only_pages_.assign(words, 0);
+    resolved_pages_.assign(words, 0);
+    scratch_resolved_pages_.assign(words, 0);
   }
   return InitializeNullTextures();
 }
 
 void NativeTextureCache::InvalidateAll() {
   cached_textures_.clear();
+  for (auto& bucket : texture_buckets_) {
+    bucket.clear();
+  }
   resolved_images_.clear();
   resolved_cubes_.clear();
   resolved_crops_.clear();
   presented_resolve_address_.reset();
-  if (!cached_texture_pages_.empty()) {
-    std::lock_guard<std::mutex> lock(pages_mutex_);
-    std::fill(cached_texture_pages_.begin(), cached_texture_pages_.end(), 0);
+  for (auto& w : cached_only_pages_) {
+    std::atomic_ref<uint64_t>(w).store(0, std::memory_order_relaxed);
+  }
+  for (auto& w : resolved_pages_) {
+    std::atomic_ref<uint64_t>(w).store(0, std::memory_order_relaxed);
   }
 }
 
@@ -91,21 +99,22 @@ void NativeTextureCache::ClearSamplers() {
 }
 
 void NativeTextureCache::MarkCachedPages(uint32_t start, uint32_t length) {
-  if (cached_texture_pages_.empty()) {
+  if (resolved_pages_.empty()) {
     return;
   }
-  std::lock_guard<std::mutex> lock(pages_mutex_);
   const auto [first_page, page_count] = GetPhysicalPageRange(start, length);
-  SetPageRangeBits(cached_texture_pages_, first_page, page_count);
+  AtomicSetPageRangeBits(resolved_pages_, first_page, page_count);
 }
 
 std::pair<uint32_t, uint32_t> NativeTextureCache::WidenInvalidation(uint32_t start,
                                                                     uint32_t length) {
-  std::lock_guard<std::mutex> lock(pages_mutex_);
-  if (cached_texture_pages_.empty()) {
+  if (cached_only_pages_.empty() && resolved_pages_.empty()) {
     return {start, 0};
   }
-  return WidenInvalidationPageRange(cached_texture_pages_, start, length);
+  const uint32_t max_blocks =
+      uint32_t(std::max(cached_only_pages_.size(), resolved_pages_.size()));
+  return WidenInvalidationPageRangeWithMask(
+      [this](uint32_t b) { return ProtectedPagesWord(b); }, max_blocks, start, length);
 }
 
 bool NativeTextureCache::InitializeNullTextures() {
@@ -476,38 +485,189 @@ void NativeTextureCache::InvalidateWrittenRanges(std::span<const PhysicalRange> 
   InvalidateRanges(ranges, InvalidationTarget::kBoth);
 }
 
+void NativeTextureCache::AddTextureToBuckets(const GuestTextureKey& key,
+                                             const CachedTexture& texture) {
+  auto add_range = [&](uint32_t start, uint32_t length, int32_t skip_first, int32_t skip_last) {
+    if (!length || start >= kPhysicalMemorySize) {
+      return std::pair<int32_t, int32_t>{-1, -2};
+    }
+    const uint32_t clamped = std::min(length, kPhysicalMemorySize - start);
+    const uint32_t b_first = start >> kBucketShift;
+    const uint32_t b_last = (start + clamped - 1) >> kBucketShift;
+    for (uint32_t b = b_first; b <= b_last; ++b) {
+      if (int32_t(b) >= skip_first && int32_t(b) <= skip_last) {
+        continue;
+      }
+      texture_buckets_[b].push_back(&key);
+    }
+    return std::pair<int32_t, int32_t>{int32_t(b_first), int32_t(b_last)};
+  };
+  const auto [bf, bl] = add_range(texture.base_start, texture.base_length, -1, -2);
+  add_range(texture.mip_start, texture.mip_length, bf, bl);
+}
+
+void NativeTextureCache::RemoveTextureFromBuckets(const GuestTextureKey& key,
+                                                  const CachedTexture& texture,
+                                                  std::vector<uint32_t>* dirty_buckets) {
+  auto remove_range = [&](uint32_t start, uint32_t length) {
+    if (!length || start >= kPhysicalMemorySize) {
+      return;
+    }
+    const uint32_t clamped = std::min(length, kPhysicalMemorySize - start);
+    const uint32_t b_first = start >> kBucketShift;
+    const uint32_t b_last = (start + clamped - 1) >> kBucketShift;
+    for (uint32_t b = b_first; b <= b_last; ++b) {
+      auto& bucket = texture_buckets_[b];
+      for (size_t i = 0; i < bucket.size(); ++i) {
+        if (bucket[i] == &key) {
+          bucket[i] = bucket.back();
+          bucket.pop_back();
+          if (dirty_buckets) {
+            dirty_buckets->push_back(b);
+          }
+          break;
+        }
+      }
+    }
+  };
+  remove_range(texture.base_start, texture.base_length);
+  remove_range(texture.mip_start, texture.mip_length);
+}
+
+void NativeTextureCache::RecomputeTexturePageWord(uint32_t block) {
+  if (block >= cached_only_pages_.size()) {
+    return;
+  }
+  const uint32_t block_page_base = block << 6;
+  uint64_t mask = 0;
+  auto accum_range = [&](uint32_t start, uint32_t length) {
+    const auto [first_page, page_count] = GetPhysicalPageRange(start, length);
+    if (!page_count) {
+      return;
+    }
+    const uint32_t end_page = first_page + page_count;
+    const uint32_t lo = std::max(first_page, block_page_base);
+    const uint32_t hi = std::min(end_page, block_page_base + 64u);
+    if (lo >= hi) {
+      return;
+    }
+    const uint32_t bit = lo - block_page_base;
+    const uint32_t count = hi - lo;
+    mask |= (count == 64 ? ~uint64_t(0) : ((uint64_t(1) << count) - 1)) << bit;
+  };
+  for (const GuestTextureKey* key : texture_buckets_[block]) {
+    const auto it = cached_textures_.find(*key);
+    if (it == cached_textures_.end()) {
+      continue;
+    }
+    const CachedTexture& texture = *it->second.texture;
+    accum_range(texture.base_start, texture.base_length);
+    accum_range(texture.mip_start, texture.mip_length);
+  }
+  std::atomic_ref<uint64_t>(cached_only_pages_[block]).store(mask, std::memory_order_relaxed);
+}
+
+void NativeTextureCache::RecomputeResolvedPages() {
+  if (resolved_pages_.empty()) {
+    return;
+  }
+  std::fill(scratch_resolved_pages_.begin(), scratch_resolved_pages_.end(), 0);
+  for (const auto& [addr, entry] : resolved_images_) {
+    const auto [first, count] = GetPhysicalPageRange(entry.guest_start, entry.guest_length);
+    SetPageRangeBits(scratch_resolved_pages_, first, count);
+  }
+  for (size_t i = 0; i < resolved_pages_.size(); ++i) {
+    std::atomic_ref<uint64_t>(resolved_pages_[i])
+        .store(scratch_resolved_pages_[i], std::memory_order_relaxed);
+  }
+}
+
 void NativeTextureCache::InvalidateRanges(std::span<const PhysicalRange> ranges,
                                           InvalidationTarget target) {
   if (ranges.empty()) return;
-  if (!cached_texture_pages_.empty() &&
-      std::none_of(ranges.begin(), ranges.end(), [&](const PhysicalRange& range) {
-        const auto [first, count] = GetPhysicalPageRange(range.first, range.second);
-        return HasAnyPageBitSet(cached_texture_pages_, first, count);
-      })) {
-    return;
-  }
-  bool textures_erased = false;
   if (target != InvalidationTarget::kResolves) {
-    textures_erased = std::erase_if(cached_textures_, [&](const auto& entry) {
-      const CachedTexture& texture = *entry.second.texture;
-      return OverlapsPhysicalRanges(ranges, texture.base_start, texture.base_length) ||
-             OverlapsPhysicalRanges(ranges, texture.mip_start, texture.mip_length);
-    }) != 0;
+    const bool check_textures =
+        cached_only_pages_.empty() ||
+        std::any_of(ranges.begin(), ranges.end(), [&](const PhysicalRange& range) {
+          const auto [first, count] = GetPhysicalPageRange(range.first, range.second);
+          return AtomicHasAnyPageBitSet(cached_only_pages_, first, count);
+        });
+    if (check_textures) {
+      std::vector<const GuestTextureKey*> victims;
+      std::vector<uint32_t> dirty_buckets;
+      for (const auto& [r_start, r_len] : ranges) {
+        if (!r_len || r_start >= kPhysicalMemorySize) {
+          continue;
+        }
+        const uint32_t clamped = std::min(r_len, kPhysicalMemorySize - r_start);
+        const uint32_t b_first = r_start >> kBucketShift;
+        const uint32_t b_last = (r_start + clamped - 1) >> kBucketShift;
+        for (uint32_t b = b_first; b <= b_last; ++b) {
+          if (!cached_only_pages_.empty() &&
+              std::atomic_ref<const uint64_t>(cached_only_pages_[b])
+                      .load(std::memory_order_relaxed) == 0) {
+            continue;
+          }
+          for (const GuestTextureKey* key : texture_buckets_[b]) {
+            const auto it = cached_textures_.find(*key);
+            if (it == cached_textures_.end()) {
+              continue;
+            }
+            const CachedTexture& texture = *it->second.texture;
+            if (OverlapsPhysicalRanges(ranges, texture.base_start, texture.base_length) ||
+                OverlapsPhysicalRanges(ranges, texture.mip_start, texture.mip_length)) {
+              victims.push_back(key);
+            }
+          }
+        }
+      }
+      if (!victims.empty()) {
+        std::sort(victims.begin(), victims.end());
+        victims.erase(std::unique(victims.begin(), victims.end()), victims.end());
+        for (const GuestTextureKey* key : victims) {
+          const auto it = cached_textures_.find(*key);
+          if (it == cached_textures_.end()) {
+            continue;
+          }
+          RemoveTextureFromBuckets(*key, *it->second.texture, &dirty_buckets);
+          cached_textures_.erase(it);
+        }
+        if (!cached_only_pages_.empty()) {
+          std::sort(dirty_buckets.begin(), dirty_buckets.end());
+          dirty_buckets.erase(std::unique(dirty_buckets.begin(), dirty_buckets.end()),
+                              dirty_buckets.end());
+          for (uint32_t b : dirty_buckets) {
+            RecomputeTexturePageWord(b);
+          }
+        }
+      }
+    }
   }
-  bool resolves_erased = false;
   if (target != InvalidationTarget::kTextures) {
-    resolves_erased = std::erase_if(resolved_images_, [&](const auto& entry) {
-      if (!OverlapsPhysicalRanges(ranges, entry.second.guest_start, entry.second.guest_length)) {
-        return false;
+    const bool check_resolves =
+        resolved_pages_.empty() ||
+        std::any_of(ranges.begin(), ranges.end(), [&](const PhysicalRange& range) {
+          const auto [first, count] = GetPhysicalPageRange(range.first, range.second);
+          return AtomicHasAnyPageBitSet(resolved_pages_, first, count);
+        });
+    if (check_resolves) {
+      const bool resolves_erased =
+          std::erase_if(resolved_images_, [&](const auto& entry) {
+            if (!OverlapsPhysicalRanges(ranges, entry.second.guest_start,
+                                        entry.second.guest_length)) {
+              return false;
+            }
+            if (presented_resolve_address_ == entry.first) {
+              presented_resolve_address_.reset();
+            }
+            return true;
+          }) != 0;
+      if (resolves_erased) {
+        PruneResolvedDependents();
+        RecomputeResolvedPages();
       }
-      if (presented_resolve_address_ == entry.first) {
-        presented_resolve_address_.reset();
-      }
-      return true;
-    }) != 0;
-    if (resolves_erased) PruneResolvedDependents();
+    }
   }
-  if (textures_erased || resolves_erased) RebuildCachedTexturePages();
 }
 
 void NativeTextureCache::PruneResolvedDependents() {
@@ -534,28 +694,7 @@ void NativeTextureCache::PruneResolvedDependents() {
   }
 }
 
-void NativeTextureCache::RebuildCachedTexturePages() {
-  if (cached_texture_pages_.empty()) {
-    return;
-  }
-  std::lock_guard<std::mutex> lock(pages_mutex_);
-  std::fill(cached_texture_pages_.begin(), cached_texture_pages_.end(), 0);
-  for (const auto& [key, entry] : cached_textures_) {
-    const auto& texture = *entry.texture;
-    const auto [base_first, base_count] =
-        GetPhysicalPageRange(texture.base_start, texture.base_length);
-    SetPageRangeBits(cached_texture_pages_, base_first, base_count);
-    if (texture.mip_length) {
-      const auto [mip_first, mip_count] =
-          GetPhysicalPageRange(texture.mip_start, texture.mip_length);
-      SetPageRangeBits(cached_texture_pages_, mip_first, mip_count);
-    }
-  }
-  for (const auto& [addr, entry] : resolved_images_) {
-    const auto [first, count] = GetPhysicalPageRange(entry.guest_start, entry.guest_length);
-    SetPageRangeBits(cached_texture_pages_, first, count);
-  }
-}
+void NativeTextureCache::RebuildCachedTexturePages() { RecomputeResolvedPages(); }
 
 template <typename EntryMap, typename Key, typename OnCreated>
 std::shared_ptr<CachedTexture> NativeTextureCache::GetOrCreateCachedTexture(
@@ -571,7 +710,23 @@ std::shared_ptr<CachedTexture> NativeTextureCache::GetOrCreateCachedTexture(
     const auto victim = SelectRetiredEviction(
         cache, clock_.retired + 1, [](const Key&, const CachedTextureEntry&) { return true; });
     if (victim) {
-      cache.erase(*victim);
+      if constexpr (std::is_same_v<Key, GuestTextureKey>) {
+        if (auto vit = cache.find(*victim); vit != cache.end()) {
+          std::vector<uint32_t> dirty_buckets;
+          RemoveTextureFromBuckets(vit->first, *vit->second.texture, &dirty_buckets);
+          cache.erase(vit);
+          if (!cached_only_pages_.empty()) {
+            std::sort(dirty_buckets.begin(), dirty_buckets.end());
+            dirty_buckets.erase(std::unique(dirty_buckets.begin(), dirty_buckets.end()),
+                                dirty_buckets.end());
+            for (uint32_t b : dirty_buckets) {
+              RecomputeTexturePageWord(b);
+            }
+          }
+        }
+      } else {
+        cache.erase(*victim);
+      }
     }
   }
   if (cache.size() >= max_entries) {
@@ -588,7 +743,10 @@ std::shared_ptr<CachedTexture> NativeTextureCache::GetOrCreateCachedTexture(
     return {};
   }
   on_created(*entry);
-  cache.emplace(key, CachedTextureEntry{entry, clock_.next});
+  auto [inserted, _] = cache.emplace(key, CachedTextureEntry{entry, clock_.next});
+  if constexpr (std::is_same_v<Key, GuestTextureKey>) {
+    AddTextureToBuckets(inserted->first, *entry);
+  }
   return entry;
 }
 
@@ -906,7 +1064,6 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
       image.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
     bool failed = false;
-    const size_t size_before = cached_textures_.size();
     entry = GetOrCreateCachedTexture(
         cached_textures_, kMaxCachedTextures, key, image,
         [&](CachedTexture& created) {
@@ -914,32 +1071,37 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
           created.base_length = base_length;
           created.mip_start = mip_start;
           created.mip_length = mip_length;
-          if (!cached_texture_pages_.empty()) {
-            std::lock_guard<std::mutex> lock(pages_mutex_);
+          if (!cached_only_pages_.empty()) {
             if (base_length) {
               const auto [base_first, base_count] = GetPhysicalPageRange(address, base_length);
-              SetPageRangeBits(cached_texture_pages_, base_first, base_count);
+              AtomicSetPageRangeBits(cached_only_pages_, base_first, base_count);
             }
             if (mip_length) {
               const auto [mip_first, mip_count] = GetPhysicalPageRange(mip_start, mip_length);
-              SetPageRangeBits(cached_texture_pages_, mip_first, mip_count);
+              AtomicSetPageRangeBits(cached_only_pages_, mip_first, mip_count);
             }
           }
           // Watch the guest pages before reading them, so a write between the read and
           // the next frame invalidates this entry.
-          if (base_length) {
-            memory_.EnablePhysicalMemoryAccessCallbacks(address, base_length, true, false);
-          }
-          if (mip_length) {
-            memory_.EnablePhysicalMemoryAccessCallbacks(mip_start, mip_length, true, false);
+          if (watch_range_) {
+            if (base_length) {
+              watch_range_(address, base_length);
+            }
+            if (mip_length) {
+              watch_range_(mip_start, mip_length);
+            }
+          } else {
+            if (base_length) {
+              memory_.EnablePhysicalMemoryAccessCallbacks(address, base_length, true, false);
+            }
+            if (mip_length) {
+              memory_.EnablePhysicalMemoryAccessCallbacks(mip_start, mip_length, true, false);
+            }
           }
         },
         failed);
     if (failed) {
       return false;
-    }
-    if (cached_textures_.size() <= size_before && entry) {
-      RebuildCachedTexturePages();
     }
   }
 

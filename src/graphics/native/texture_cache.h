@@ -1,8 +1,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -51,17 +52,20 @@ class NativeTextureCache {
   };
   static constexpr size_t kMaxResolvedImages = 256;
 
+  using WatchRangeFn = std::function<void(uint32_t start, uint32_t length)>;
+
   NativeTextureCache(const ui::vulkan::VulkanDevice& device, VmaAllocator allocator,
                      memory::Memory& memory, const RegisterFile& regs,
                      const SubmissionClock& clock, uint32_t draw_resolution_scale_x,
-                     uint32_t draw_resolution_scale_y)
+                     uint32_t draw_resolution_scale_y, WatchRangeFn watch_range = {})
       : device_(device),
         allocator_(allocator),
         memory_(memory),
         regs_(regs),
         clock_(clock),
         draw_resolution_scale_x_(draw_resolution_scale_x),
-        draw_resolution_scale_y_(draw_resolution_scale_y) {}
+        draw_resolution_scale_y_(draw_resolution_scale_y),
+        watch_range_(std::move(watch_range)) {}
   ~NativeTextureCache();
   NativeTextureCache(const NativeTextureCache&) = delete;
   NativeTextureCache& operator=(const NativeTextureCache&) = delete;
@@ -85,8 +89,28 @@ class NativeTextureCache {
   void ClearSamplers();
   void PruneResolvedDependents();
   void RebuildCachedTexturePages();
-  // Marks guest pages as holding cached data.
+  // Marks guest pages as holding cached resolve data.
   void MarkCachedPages(uint32_t start, uint32_t length);
+  // Lock-free atomic read of a 256 KiB block's GPU-resolved-page mask.
+  uint64_t ResolvedPagesWord(uint32_t block) const {
+    return block < resolved_pages_.size()
+               ? std::atomic_ref<const uint64_t>(resolved_pages_[block])
+                     .load(std::memory_order_relaxed)
+               : 0;
+  }
+  // Lock-free atomic read of a 256 KiB block's protected-page mask (textures | resolves).
+  uint64_t ProtectedPagesWord(uint32_t block) const {
+    uint64_t word = 0;
+    if (block < cached_only_pages_.size()) {
+      word |= std::atomic_ref<const uint64_t>(cached_only_pages_[block])
+                  .load(std::memory_order_relaxed);
+    }
+    if (block < resolved_pages_.size()) {
+      word |=
+          std::atomic_ref<const uint64_t>(resolved_pages_[block]).load(std::memory_order_relaxed);
+    }
+    return word;
+  }
   // Called from guest threads: widens [start, start + length) to the cached
   // pages it touches, or returns a zero length when it touches none.
   std::pair<uint32_t, uint32_t> WidenInvalidation(uint32_t start, uint32_t length);
@@ -137,6 +161,15 @@ class NativeTextureCache {
                                                           const VkImageCreateInfo& image_info,
                                                           OnCreated&& on_created, bool& failed);
 
+  static constexpr uint32_t kBucketShift = 18;  // 256 KiB = 64 pages = 1 bitmap word
+  static constexpr size_t kBucketCount = kPhysicalMemorySize >> kBucketShift;
+
+  void AddTextureToBuckets(const GuestTextureKey& key, const CachedTexture& texture);
+  void RemoveTextureFromBuckets(const GuestTextureKey& key, const CachedTexture& texture,
+                                std::vector<uint32_t>* dirty_buckets = nullptr);
+  void RecomputeTexturePageWord(uint32_t block);
+  void RecomputeResolvedPages();
+
   const ui::vulkan::VulkanDevice& device_;
   VmaAllocator allocator_;
   memory::Memory& memory_;
@@ -144,6 +177,7 @@ class NativeTextureCache {
   const SubmissionClock& clock_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+  WatchRangeFn watch_range_;
   // 1x1 zero-cleared cube-compatible image shared by the 2D array and cube
   // fallback views bound for fetch constants that cannot produce texels.
   VkImage null_texture_image_ = VK_NULL_HANDLE;
@@ -166,9 +200,11 @@ class NativeTextureCache {
   std::unordered_map<GuestTextureKey, CachedTextureEntry, GuestTextureKeyHash> cached_textures_;
   std::unordered_map<ResolvedCubeKey, CachedTextureEntry, ResolvedCubeKeyHash> resolved_cubes_;
   std::unordered_map<ResolvedCropKey, CachedTextureEntry, ResolvedCropKeyHash> resolved_crops_;
-  // Read from guest threads by WidenInvalidation, so it only guards the bitset.
-  std::mutex pages_mutex_;
-  std::vector<uint64_t> cached_texture_pages_;
+  std::array<std::vector<const GuestTextureKey*>, kBucketCount> texture_buckets_;
+  // Fixed-size bitsets read atomically from guest threads by ProtectedPagesWord.
+  std::vector<uint64_t> cached_only_pages_;
+  std::vector<uint64_t> resolved_pages_;
+  std::vector<uint64_t> scratch_resolved_pages_;
 };
 
 }  // namespace rex::graphics::native

@@ -1,7 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
-#include <mutex>
+#include <functional>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -53,9 +54,16 @@ struct CachedIndexUpload {
 // guest memory write watches.
 class NativeIndexCache {
  public:
+  using WatchRangeFn = std::function<void(uint32_t start, uint32_t length)>;
+
   NativeIndexCache(const ui::vulkan::VulkanDevice& device, VmaAllocator allocator,
-                   memory::Memory& memory, const SubmissionClock& clock)
-      : device_(device), allocator_(allocator), memory_(memory), clock_(clock) {}
+                   memory::Memory& memory, const SubmissionClock& clock,
+                   WatchRangeFn watch_range = {})
+      : device_(device),
+        allocator_(allocator),
+        memory_(memory),
+        clock_(clock),
+        watch_range_(std::move(watch_range)) {}
   ~NativeIndexCache();
   NativeIndexCache(const NativeIndexCache&) = delete;
   NativeIndexCache& operator=(const NativeIndexCache&) = delete;
@@ -64,6 +72,12 @@ class NativeIndexCache {
   void Invalidate(uint32_t start, uint32_t length);
   void InvalidateAll();
   void ClearRecentInvalidations();
+  uint64_t ProtectedPagesWord(uint32_t block) const {
+    return block < cached_pages_.size()
+               ? std::atomic_ref<const uint64_t>(cached_pages_[block])
+                     .load(std::memory_order_relaxed)
+               : 0;
+  }
   std::pair<uint32_t, uint32_t> WidenInvalidation(uint32_t start, uint32_t length);
 
   // Looks up or decodes+caches a static index buffer. Returns true with `binding`
@@ -104,10 +118,11 @@ class NativeIndexCache {
   VmaAllocator allocator_;
   memory::Memory& memory_;
   const SubmissionClock& clock_;
+  WatchRangeFn watch_range_;
   std::vector<Chunk> chunks_;
   std::unordered_map<IndexCacheKey, Entry, IndexCacheKeyHash> entries_;
-  std::mutex pages_mutex_;
   std::vector<uint64_t> cached_pages_;
+  std::vector<uint64_t> scratch_pages_;
   std::vector<uint64_t> recent_invalidated_pages_;
 };
 

@@ -128,6 +128,7 @@ class NativeCommandProcessor : public CommandProcessor {
     }
   }
   void DrainMemoryInvalidations();
+  void WatchPhysicalRange(uint32_t address, uint32_t length);
   bool EnsureSharedVertexRange(uint32_t address, uint32_t size);
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);
@@ -220,6 +221,7 @@ class NativeCommandProcessor : public CommandProcessor {
   std::multimap<uint64_t, std::unique_ptr<SpirvShader>> shaders_;
   std::unordered_map<uint64_t, SpirvShader*> shader_addr_cache_;
   std::vector<uint64_t> shader_pages_;
+  std::vector<uint64_t> watched_pages_;
   std::unique_ptr<SpirvShaderTranslator> translator_;
   DrawPipelines pipelines_;
   DrawBindingCache draw_bindings_;

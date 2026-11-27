@@ -299,8 +299,9 @@ bool NativeCommandProcessor::SetupContext() {
       shared_vertex_.reset();
     }
   }
-  index_cache_ =
-      std::make_unique<NativeIndexCache>(*vulkan_device_, vma_allocator_, *memory_, clock_);
+  auto watch_cb = [this](uint32_t start, uint32_t length) { WatchPhysicalRange(start, length); };
+  index_cache_ = std::make_unique<NativeIndexCache>(*vulkan_device_, vma_allocator_, *memory_,
+                                                    clock_, watch_cb);
   if (!index_cache_->Initialize(shared_vertex_ != nullptr)) {
     ShutdownContext();
     return false;
@@ -334,7 +335,7 @@ bool NativeCommandProcessor::SetupContext() {
   texture_cache_ = std::make_unique<NativeTextureCache>(*vulkan_device_, vma_allocator_, *memory_,
                                                         *register_file_,
                                                         clock_, draw_resolution_scale_x_,
-                                                        draw_resolution_scale_y_);
+                                                        draw_resolution_scale_y_, watch_cb);
   target_cache_ = std::make_unique<NativeTargetCache>(
       *vulkan_device_, vma_allocator_, clock_, draw_resolution_scale_x_, draw_resolution_scale_y_,
       depth_unorm24_supported,
@@ -348,6 +349,7 @@ bool NativeCommandProcessor::SetupContext() {
         pending_.emplace_back(QueuedTileTransfer{source, destination, std::move(copies)});
       });
   shader_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
+  watched_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
   if (!texture_cache_->Initialize(shared_vertex_ != nullptr)) {
     ShutdownContext();
     return false;
@@ -635,8 +637,8 @@ Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type,
                    })) {
       if (cacheable_addr) {
         const auto [first_page, page_count] = GetPhysicalPageRange(guest_address, byte_count);
-        SetPageRangeBits(shader_pages_, first_page, page_count);
-        memory_->EnablePhysicalMemoryAccessCallbacks(guest_address, byte_count, true, false);
+        AtomicSetPageRangeBits(shader_pages_, first_page, page_count);
+        WatchPhysicalRange(guest_address, byte_count);
         shader_addr_cache_.emplace(addr_key, &shader);
       }
       return &shader;
@@ -646,8 +648,8 @@ Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type,
   auto* ptr = shaders_.emplace(hash, std::move(shader))->second.get();
   if (cacheable_addr) {
     const auto [first_page, page_count] = GetPhysicalPageRange(guest_address, byte_count);
-    SetPageRangeBits(shader_pages_, first_page, page_count);
-    memory_->EnablePhysicalMemoryAccessCallbacks(guest_address, byte_count, true, false);
+    AtomicSetPageRangeBits(shader_pages_, first_page, page_count);
+    WatchPhysicalRange(guest_address, byte_count);
     shader_addr_cache_.emplace(addr_key, ptr);
   }
   return ptr;
@@ -675,7 +677,7 @@ void NativeCommandProcessor::DrainMemoryInvalidations() {
     }
     if (!shader_pages_.empty()) {
       const auto [first_page, page_count] = GetPhysicalPageRange(start, length);
-      if (HasAnyPageBitSet(shader_pages_, first_page, page_count)) {
+      if (AtomicHasAnyPageBitSet(shader_pages_, first_page, page_count)) {
         for (auto it = shader_addr_cache_.begin(); it != shader_addr_cache_.end();) {
           const uint32_t s_addr = uint32_t(it->first >> 32);
           const uint32_t s_len = uint32_t(it->first) * uint32_t(sizeof(uint32_t));
@@ -685,7 +687,7 @@ void NativeCommandProcessor::DrainMemoryInvalidations() {
             ++it;
           }
         }
-        ClearPageRangeBits(shader_pages_, first_page, page_count);
+        AtomicClearPageRangeBits(shader_pages_, first_page, page_count);
       }
     }
     InvalidateSharedVertices(start, length);
@@ -704,11 +706,37 @@ void NativeCommandProcessor::InvalidateGpuMemory() {
     index_cache_->InvalidateAll();
   }
   shader_addr_cache_.clear();
-  std::fill(shader_pages_.begin(), shader_pages_.end(), 0);
+  for (auto& w : shader_pages_) {
+    std::atomic_ref<uint64_t>(w).store(0, std::memory_order_relaxed);
+  }
   if (shared_vertex_) {
     shared_vertex_->InvalidateAll();
   }
   InvalidateConstantState();
+}
+
+void NativeCommandProcessor::WatchPhysicalRange(uint32_t address, uint32_t length) {
+  const auto [first_page, page_count] = GetPhysicalPageRange(address, length);
+  if (!page_count) {
+    return;
+  }
+  if (watched_pages_.empty()) {
+    memory_->EnablePhysicalMemoryAccessCallbacks(address, length, true, false);
+    return;
+  }
+  uint32_t cursor = first_page;
+  const uint32_t end_page = first_page + page_count;
+  uint32_t run_first = 0;
+  uint32_t run_count = 0;
+  while (AtomicFindNextUnsetPageRun(watched_pages_, cursor, end_page, run_first, run_count)) {
+    // Set bits before arming PhysicalHeap so a concurrent invalidation clearing a
+    // bit between arm and return is never overwritten.
+    AtomicSetPageRangeBits(watched_pages_, run_first, run_count);
+    const uint32_t run_addr = run_first << kSharedVertexPageShift;
+    const uint32_t run_len =
+        std::min(run_count << kSharedVertexPageShift, kPhysicalMemorySize - run_addr);
+    memory_->EnablePhysicalMemoryAccessCallbacks(run_addr, run_len, true, false);
+  }
 }
 
 void NativeCommandProcessor::ClearCaches() {
@@ -761,7 +789,7 @@ bool NativeCommandProcessor::EnsureSharedVertexRange(uint32_t address, uint32_t 
         }
         // Watch the guest pages before reading them so any write after the copy
         // invalidates them before a later draw reads stale vertices.
-        memory_->EnablePhysicalMemoryAccessCallbacks(chunk_addr, chunk_size, true, false);
+        WatchPhysicalRange(chunk_addr, chunk_size);
         std::memcpy(dst, bytes.data(), chunk_size);
         pending_.emplace_back(QueuedBufferUpload{src_buffer, src_offset, chunk_addr, chunk_size,
                                                  !invalidated_since_last_draw_});
@@ -785,27 +813,21 @@ std::pair<uint32_t, uint32_t> NativeCommandProcessor::MemoryInvalidationCallback
     // Only the tiny pending list is touched here; this runs on a guest thread
     // while the global critical region is held.
     if (!exact_range) {
-      const auto [tex_start, tex_len] =
-          texture_cache_->WidenInvalidation(physical_address_start, length);
-      if (tex_len) {
-        physical_address_start = tex_start;
-        length = tex_len;
-      } else if (index_cache_) {
-        const auto [idx_start, idx_len] =
-            index_cache_->WidenInvalidation(physical_address_start, length);
-        if (idx_len) {
-          physical_address_start = idx_start;
-          length = idx_len;
-        }
+      // Only GPU-resolved pages cannot be re-uploaded from guest RAM, so
+      // widen up to 256 KiB stopping only at resolved_pages_ (matching Xenos
+      // SharedMemory) to avoid 4 KiB access-violation storms on dynamic pools.
+      const uint32_t max_blocks = uint32_t((kSharedVertexPageCount + 63) / 64);
+      const auto [w_start, w_len] = WidenInvalidationPageRangeWithMask(
+          [this](uint32_t b) { return texture_cache_ ? texture_cache_->ResolvedPagesWord(b) : 0; },
+          max_blocks, physical_address_start, length);
+      if (w_len) {
+        physical_address_start = w_start;
+        length = w_len;
       }
-      if (!shader_pages_.empty()) {
-        const auto [s_start, s_len] =
-            WidenInvalidationPageRange(shader_pages_, physical_address_start, length);
-        if (s_len) {
-          physical_address_start = s_start;
-          length = s_len;
-        }
-      }
+    }
+    if (!watched_pages_.empty()) {
+      const auto [w_first, w_count] = GetPhysicalPageRange(physical_address_start, length);
+      AtomicClearPageRangeBits(watched_pages_, w_first, w_count);
     }
     std::lock_guard<std::mutex> lock(invalidation_mutex_);
     pending_invalidations_.emplace_back(physical_address_start, length);
@@ -2101,8 +2123,7 @@ bool NativeCommandProcessor::IssueCopy() {
   } else {
     texture_cache_->MarkCachedPages(guest_start, guest_length);
   }
-  memory_->EnablePhysicalMemoryAccessCallbacks(copy.copy_dest_extent_start,
-                                               copy.copy_dest_extent_length, true, false);
+  WatchPhysicalRange(copy.copy_dest_extent_start, copy.copy_dest_extent_length);
   const size_t resolve_index = pending_.size();
   const uint32_t depth_sample = depth ? GetResolveSampleIndex(samples, selection) : 0;
   pending_.emplace_back(

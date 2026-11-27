@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <compare>
 #include <cstdint>
@@ -110,6 +111,98 @@ inline bool AreAllPageBitsSet(const std::vector<uint64_t>& words, uint32_t first
   return true;
 }
 
+inline void AtomicSetPageRangeBits(std::vector<uint64_t>& words, uint32_t first_page,
+                                     uint32_t page_count) {
+  if (!page_count || words.empty()) {
+    return;
+  }
+  const uint32_t end_page = std::min(first_page + page_count, uint32_t(words.size() * 64));
+  for (uint32_t page = first_page; page < end_page;) {
+    const uint32_t word = page >> 6;
+    const uint32_t bit = page & 63;
+    const uint32_t count = std::min(64 - bit, end_page - page);
+    const uint64_t mask = (count == 64 ? ~uint64_t(0) : ((uint64_t(1) << count) - 1)) << bit;
+    std::atomic_ref<uint64_t>(words[word]).fetch_or(mask, std::memory_order_relaxed);
+    page += count;
+  }
+}
+
+inline void AtomicClearPageRangeBits(std::vector<uint64_t>& words, uint32_t first_page,
+                                       uint32_t page_count) {
+  if (!page_count || words.empty()) {
+    return;
+  }
+  const uint32_t end_page = std::min(first_page + page_count, uint32_t(words.size() * 64));
+  for (uint32_t page = first_page; page < end_page;) {
+    const uint32_t word = page >> 6;
+    const uint32_t bit = page & 63;
+    const uint32_t count = std::min(64 - bit, end_page - page);
+    const uint64_t mask = (count == 64 ? ~uint64_t(0) : ((uint64_t(1) << count) - 1)) << bit;
+    std::atomic_ref<uint64_t>(words[word]).fetch_and(~mask, std::memory_order_release);
+    page += count;
+  }
+}
+
+inline bool AtomicHasAnyPageBitSet(const std::vector<uint64_t>& words, uint32_t first_page,
+                                   uint32_t page_count) {
+  if (!page_count || words.empty()) {
+    return false;
+  }
+  const uint32_t end_page = std::min(first_page + page_count, uint32_t(words.size() * 64));
+  for (uint32_t page = first_page; page < end_page;) {
+    const uint32_t word = page >> 6;
+    const uint32_t bit = page & 63;
+    const uint32_t count = std::min(64 - bit, end_page - page);
+    const uint64_t mask = (count == 64 ? ~uint64_t(0) : ((uint64_t(1) << count) - 1)) << bit;
+    if ((std::atomic_ref<const uint64_t>(words[word]).load(std::memory_order_relaxed) & mask) !=
+        0) {
+      return true;
+    }
+    page += count;
+  }
+  return false;
+}
+
+inline bool AtomicFindNextUnsetPageRun(const std::vector<uint64_t>& words, uint32_t& cursor,
+                                       uint32_t end_page, uint32_t& run_first_page,
+                                       uint32_t& run_page_count) {
+  const uint32_t limit = std::min(end_page, uint32_t(words.size() * 64));
+  while (cursor < limit) {
+    const uint32_t word = cursor >> 6;
+    const uint32_t bit = cursor & 63;
+    const uint64_t inv =
+        ~std::atomic_ref<const uint64_t>(words[word]).load(std::memory_order_acquire) &
+        (~uint64_t(0) << bit);
+    if (!inv) {
+      cursor = (word + 1) << 6;
+      continue;
+    }
+    const uint32_t first = (word << 6) + uint32_t(std::countr_zero(inv));
+    if (first >= limit) {
+      cursor = limit;
+      return false;
+    }
+    run_first_page = first;
+    uint32_t end = first;
+    while (end < limit) {
+      const uint32_t w = end >> 6;
+      const uint32_t b = end & 63;
+      const uint64_t valid_mask =
+          std::atomic_ref<const uint64_t>(words[w]).load(std::memory_order_acquire) >> b;
+      if (!valid_mask) {
+        end = std::min(limit, (w + 1) << 6);
+      } else {
+        end = std::min(limit, end + uint32_t(std::countr_zero(valid_mask)));
+        break;
+      }
+    }
+    run_page_count = end - first;
+    cursor = end;
+    return true;
+  }
+  return false;
+}
+
 // Inline 2D Xenos texture tiling offset (matches texture_util::GetTiledOffset2D).
 struct Tiled2DRowState {
   int32_t y_macro;
@@ -214,8 +307,9 @@ inline bool FindNextInvalidPageRun(const std::vector<uint64_t>& valid_words, uin
   return false;
 }
 
-inline std::pair<uint32_t, uint32_t> WidenInvalidationPageRange(
-    const std::vector<uint64_t>& protected_pages, uint32_t address, uint32_t length) {
+template <typename BlockMaskFn>
+inline std::pair<uint32_t, uint32_t> WidenInvalidationPageRangeWithMask(
+    BlockMaskFn&& block_mask, uint32_t max_blocks, uint32_t address, uint32_t length) {
   if (!length || address >= kPhysicalMemorySize) {
     return {0, 0};
   }
@@ -227,15 +321,14 @@ inline std::pair<uint32_t, uint32_t> WidenInvalidationPageRange(
   uint32_t page_last = initial_first + initial_count - 1;
   const uint32_t block_first = page_first >> 6;
   const uint32_t block_last = page_last >> 6;
-  const uint32_t max_blocks = uint32_t(protected_pages.size());
   if (block_first < max_blocks && (page_first & 63) != 0) {
     const uint64_t before =
-        protected_pages[block_first] & ((uint64_t(1) << (page_first & 63)) - 1);
+        block_mask(block_first) & ((uint64_t(1) << (page_first & 63)) - 1);
     page_first = (page_first & ~uint32_t(63)) + (64u - uint32_t(std::countl_zero(before)));
   }
   if (block_last < max_blocks && (page_last & 63) != 63) {
     const uint64_t after =
-        protected_pages[block_last] & ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
+        block_mask(block_last) & ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
     page_last =
         (page_last & ~uint32_t(63)) + (std::max(uint32_t(std::countr_zero(after)), 1u) - 1u);
   }
@@ -243,6 +336,13 @@ inline std::pair<uint32_t, uint32_t> WidenInvalidationPageRange(
   const uint32_t widened_length = std::min((page_last - page_first + 1) << kSharedVertexPageShift,
                                            kPhysicalMemorySize - widened_start);
   return {widened_start, widened_length};
+}
+
+inline std::pair<uint32_t, uint32_t> WidenInvalidationPageRange(
+    const std::vector<uint64_t>& protected_pages, uint32_t address, uint32_t length) {
+  return WidenInvalidationPageRangeWithMask(
+      [&protected_pages](uint32_t block) { return protected_pages[block]; },
+      uint32_t(protected_pages.size()), address, length);
 }
 
 // Host sampler state derived from a guest sampler binding. Also the device-lifetime
