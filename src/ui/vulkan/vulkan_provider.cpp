@@ -84,6 +84,17 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
 
   if (!provider->vulkan_device_) {
     std::vector<VkPhysicalDevice> physical_devices_ordered = physical_devices;
+    // A discrete card before the processor's own graphics, in the order the loader gave otherwise: on a
+    // laptop the integrated one can come first, and D3D12 took exactly that one (Core of Light #164: an Intel
+    // UHD 630 next to a GTX 1060). The feature score below sorts stably, so this order stays among equals.
+    std::stable_sort(physical_devices_ordered.begin(), physical_devices_ordered.end(),
+                     [&ifn](VkPhysicalDevice a, VkPhysicalDevice b) {
+                       VkPhysicalDeviceProperties pa, pb;
+                       ifn.vkGetPhysicalDeviceProperties(a, &pa);
+                       ifn.vkGetPhysicalDeviceProperties(b, &pb);
+                       return pa.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU &&
+                              pb.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+                     });
     bool prefer_geometry_shader = REXCVAR_GET(vulkan_prefer_geometry_shader);
     bool prefer_fragment_stores = REXCVAR_GET(vulkan_prefer_fragment_stores_and_atomics);
     bool prefer_vertex_stores = REXCVAR_GET(vulkan_prefer_vertex_pipeline_stores_and_atomics);
@@ -96,8 +107,8 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
         uint32_t score;
       };
       std::vector<PhysicalDeviceScore> scored_devices;
-      scored_devices.reserve(physical_devices.size());
-      for (const VkPhysicalDevice physical_device : physical_devices) {
+      scored_devices.reserve(physical_devices_ordered.size());
+      for (const VkPhysicalDevice physical_device : physical_devices_ordered) {
         VkPhysicalDeviceFeatures supported_features = {};
         ifn.vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
         uint32_t score = 0;

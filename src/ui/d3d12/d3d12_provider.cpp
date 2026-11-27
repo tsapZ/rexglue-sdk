@@ -20,6 +20,7 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 
+#include <dxgi1_6.h>
 #include <malloc.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
@@ -267,10 +268,22 @@ bool D3D12Provider::Initialize() {
     return false;
   }
 
-  // Choose the adapter.
+  // Choose the adapter. For "any physical adapter" (-1) in Windows' high-performance order when the factory
+  // has it: EnumAdapters1 lists the adapter the screen hangs on first, which on a laptop with switchable
+  // graphics is the processor's own. An Intel UHD 630 next to a GTX 1060 drew Spyro's Adventure as coloured
+  // blocks (Core of Light #164). An index (d3d12_adapter >= 0) keeps meaning EnumAdapters1's order.
+  IDXGIFactory6* dxgi_factory6 = nullptr;
+  if (REXCVAR_GET(d3d12_adapter) == -1) {
+    dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory6));
+  }
+  auto enum_adapter = [&](uint32_t index, IDXGIAdapter1** adapter_out) {
+    return dxgi_factory6 ? dxgi_factory6->EnumAdapterByGpuPreference(
+                               index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(adapter_out))
+                         : dxgi_factory->EnumAdapters1(index, adapter_out);
+  };
   uint32_t adapter_index = 0;
   IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+  while (enum_adapter(adapter_index, &adapter) == S_OK) {
     DXGI_ADAPTER_DESC1 adapter_desc;
     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
       if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
@@ -293,6 +306,9 @@ bool D3D12Provider::Initialize() {
     adapter->Release();
     adapter = nullptr;
     ++adapter_index;
+  }
+  if (dxgi_factory6) {
+    dxgi_factory6->Release();
   }
   if (adapter == nullptr) {
     REXLOG_ERROR(
