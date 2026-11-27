@@ -1579,3 +1579,52 @@ TEST_CASE("Native draw_resolution_scale_threshold classifies pitches", "[gpu][na
   CHECK_FALSE(native::IsDrawScaleNativeForPitch(1280, MsaaSamples::k1X, 640, 2, 2));
   CHECK_FALSE(native::IsDrawScaleNativeForPitch(641, MsaaSamples::k1X, 640, 2, 2));
 }
+
+TEST_CASE("Native chunked tiled texture decode matches byte-by-byte reference", "[gpu][native]") {
+  auto run_case = [&](auto tag_bs, auto tag_sw, uint32_t pitch, uint32_t sx, uint32_t sy,
+                      uint32_t w, uint32_t h) {
+    constexpr uint32_t bs = decltype(tag_bs)::value;
+    constexpr size_t sw = decltype(tag_sw)::value;
+    constexpr uint32_t bpb_log2 = uint32_t(std::countr_zero(bs));
+    const uint32_t pitch_aligned = (pitch + 31u) & ~31u;
+    const size_t upper =
+        size_t(texture_util::GetTiledAddressUpperBound2D(sx + w, sy + h, pitch_aligned, bpb_log2));
+    std::vector<uint8_t> src(upper + 64);
+    for (size_t i = 0; i < src.size(); ++i) {
+      src[i] = uint8_t((i * 131 + 17) & 0xFF);
+    }
+    const size_t dst_bytes = size_t(w) * h * bs;
+    std::vector<uint8_t> got(dst_bytes, 0);
+    std::vector<uint8_t> scratch(size_t(w) * bs, 0);
+    native::DecodeTiled2DCopyLevel<bs, sw>(src.data(), src.size(), got.data(), 1, w, h, sx, sy,
+                                           pitch_aligned, bpb_log2, 0, dst_bytes, scratch.data());
+    std::vector<uint8_t> ref(dst_bytes, 0);
+    for (uint32_t y = 0; y < h; ++y) {
+      for (uint32_t x = 0; x < w; ++x) {
+        const size_t off = size_t(texture_util::GetTiledOffset2D(
+            int32_t(x + sx), int32_t(y + sy), pitch_aligned, bpb_log2));
+        native::CopySwapBlock<bs, sw>(src.data(), off, ref.data() + (size_t(y) * w + x) * bs);
+      }
+    }
+    CHECK(got == ref);
+  };
+  for (uint32_t pitch : {32u, 64u, 96u}) {
+    for (uint32_t sx : {0u, 1u, 4u, 7u}) {
+      for (uint32_t w : {1u, 3u, 7u, 13u, 19u, 37u}) {
+        run_case(std::integral_constant<uint32_t, 1>{}, std::integral_constant<size_t, 0>{}, pitch, sx, 3, w, 5);
+        run_case(std::integral_constant<uint32_t, 1>{}, std::integral_constant<size_t, 3>{}, pitch, sx, 3, w, 5);
+        run_case(std::integral_constant<uint32_t, 2>{}, std::integral_constant<size_t, 1>{}, pitch, sx, 5, w, 5);
+        run_case(std::integral_constant<uint32_t, 2>{}, std::integral_constant<size_t, 2>{}, pitch, sx, 5, w, 5);
+        run_case(std::integral_constant<uint32_t, 4>{}, std::integral_constant<size_t, 0>{}, pitch, sx, 4, w, 5);
+        run_case(std::integral_constant<uint32_t, 4>{}, std::integral_constant<size_t, 1>{}, pitch, sx, 4, w, 5);
+        run_case(std::integral_constant<uint32_t, 4>{}, std::integral_constant<size_t, 2>{}, pitch, sx, 4, w, 5);
+        run_case(std::integral_constant<uint32_t, 4>{}, std::integral_constant<size_t, 3>{}, pitch, sx, 4, w, 5);
+        run_case(std::integral_constant<uint32_t, 8>{}, std::integral_constant<size_t, 3>{}, pitch, sx, 1, w, 5);
+        run_case(std::integral_constant<uint32_t, 16>{}, std::integral_constant<size_t, 3>{}, pitch, sx, 2, w, 5);
+      }
+    }
+  }
+  CHECK(0.0f * (1.0f / 16777215.0f) == 0.0f);
+  CHECK(float(0xFFFFFFu) * (1.0f / 16777215.0f) == 1.0f);
+  CHECK(float(0x7FFFFFu) * (1.0f / 16777215.0f) == Catch::Approx(0x7FFFFFu / 16777215.0f));
+}

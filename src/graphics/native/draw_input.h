@@ -15,6 +15,7 @@
 #include <xxhash.h>
 
 #include <rex/graphics/edram_layout.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -213,9 +214,19 @@ struct Tiled2DRowState {
 };
 
 constexpr Tiled2DRowState MakeTiled2DRowState(int32_t gy, uint32_t pitch_aligned,
-                                              uint32_t bpb_log2) {
+                                              uint32_t bpb_log2 = 0) {
+  (void)bpb_log2;
   return {(gy >> 5) * int32_t(pitch_aligned >> 5), (gy & 0xE) << 2, (gy & 1) << 4,
           (gy & 16) << 7, (gy & 8) >> 2};
+}
+
+template <uint32_t BpbLog2>
+constexpr int32_t GetTiledOffset2DFromRowT(int32_t gx, const Tiled2DRowState& row) {
+  const int32_t macro = ((gx >> 5) + row.y_macro) << (BpbLog2 + 7);
+  const int32_t micro = ((gx & 7) + row.y_micro) << BpbLog2;
+  const int32_t offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + row.y_bit0;
+  return ((offset & ~0x1FF) << 3) + row.y_bit4 + ((offset & 0x1C0) << 2) +
+         (((row.y_bit3 + (gx >> 3)) & 3) << 6) + (offset & 0x3F);
 }
 
 constexpr int32_t GetTiledOffset2DFromRow(int32_t gx, const Tiled2DRowState& row,
@@ -232,6 +243,26 @@ constexpr int32_t GetTiledOffset2DInline(int32_t gx, int32_t gy, uint32_t pitch,
   const uint32_t pitch_aligned =
       (pitch + (xenos::kTextureTileWidthHeight - 1)) & ~(xenos::kTextureTileWidthHeight - 1);
   return GetTiledOffset2DFromRow(gx, MakeTiled2DRowState(gy, pitch_aligned, bpb_log2), bpb_log2);
+}
+
+template <size_t Swap>
+inline void CopySwapDwords(const uint8_t* __restrict src, uint8_t* __restrict dst, size_t dwords) {
+  if constexpr (Swap == 0) {
+    std::memcpy(dst, src, dwords * 4);
+  } else {
+    for (size_t i = 0; i < dwords; ++i) {
+      uint32_t v;
+      std::memcpy(&v, src + i * 4, 4);
+      if constexpr (Swap == 1) {
+        v = ((v & 0x00FF00FFu) << 8) | ((v & 0xFF00FF00u) >> 8);
+      } else if constexpr (Swap == 2) {
+        v = std::rotl(v, 16);
+      } else {
+        v = rex::byte_swap(v);
+      }
+      std::memcpy(dst + i * 4, &v, 4);
+    }
+  }
 }
 
 template <uint32_t BlockSize, size_t Swap>
@@ -266,6 +297,176 @@ inline void CopySwapBlock(const uint8_t* __restrict src, size_t offset,
         v = ((v >> 24) & 0xFFu) | ((v >> 8) & 0xFF00u) | ((v & 0xFF00u) << 8) | (v << 24);
       }
       std::memcpy(dst + w, &v, 4);
+    }
+  }
+}
+
+template <uint32_t BlockSize, size_t Swap>
+inline void DecodeTiled2DCopyLevel(const uint8_t* __restrict source, size_t source_size,
+                                   uint8_t* __restrict dst, uint32_t slices, uint32_t blocks_x,
+                                   uint32_t blocks_y, uint32_t start_x, uint32_t start_y,
+                                   uint32_t pitch_aligned, uint32_t bpb_log2,
+                                   size_t slice_stride_bytes, size_t dst_slice_bytes,
+                                   uint8_t* row_scratch = nullptr) {
+  (void)bpb_log2;
+  constexpr uint32_t kBpbLog2 = uint32_t(std::countr_zero(BlockSize));
+  const size_t row_bytes = size_t(blocks_x) * BlockSize;
+  const size_t max_slice_end =
+      (blocks_x && blocks_y)
+          ? size_t(texture_util::GetTiledAddressUpperBound2D(
+                start_x + blocks_x, start_y + blocks_y, pitch_aligned, kBpbLog2))
+          : 0;
+  const bool in_bounds =
+      slices > 0 && blocks_x > 0 && blocks_y > 0 && max_slice_end <= source_size &&
+      size_t(slices - 1) * slice_stride_bytes <= source_size - max_slice_end;
+
+  for (uint32_t slice = 0; slice < slices; ++slice) {
+    const size_t slice_base = size_t(slice) * slice_stride_bytes;
+    uint8_t* slice_dst = dst + size_t(slice) * dst_slice_bytes;
+    for (uint32_t y = 0; y < blocks_y; ++y) {
+      const auto row = MakeTiled2DRowState(int32_t(y + start_y), pitch_aligned, kBpbLog2);
+      uint8_t* row_dst = slice_dst + size_t(y) * row_bytes;
+      uint8_t* out = row_scratch ? row_scratch : row_dst;
+      if (in_bounds) {
+        uint32_t x = 0;
+        if constexpr (BlockSize == 4) {
+          while (x < blocks_x && ((x + start_x) & 3) != 0) {
+            const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<2>(int32_t(x + start_x), row));
+            CopySwapBlock<4, Swap>(source, off, out + size_t(x) * 4);
+            ++x;
+          }
+          if (((x + start_x) & 7) == 4 && x + 4 <= blocks_x) {
+            const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<2>(int32_t(x + start_x), row));
+            CopySwapDwords<Swap>(source + off, out + size_t(x) * 4, 4);
+            x += 4;
+          }
+          while (x + 8 <= blocks_x) {
+            const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<2>(int32_t(x + start_x), row));
+            CopySwapDwords<Swap>(source + off, out + size_t(x) * 4, 4);
+            CopySwapDwords<Swap>(source + off + 32, out + size_t(x + 4) * 4, 4);
+            x += 8;
+          }
+          if (x + 4 <= blocks_x) {
+            const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<2>(int32_t(x + start_x), row));
+            CopySwapDwords<Swap>(source + off, out + size_t(x) * 4, 4);
+            x += 4;
+          }
+        } else if constexpr (BlockSize == 2) {
+          while (x < blocks_x && ((x + start_x) & 7) != 0) {
+            const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<1>(int32_t(x + start_x), row));
+            CopySwapBlock<2, Swap>(source, off, out + size_t(x) * 2);
+            ++x;
+          }
+          while (x + 8 <= blocks_x) {
+            const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<1>(int32_t(x + start_x), row));
+            CopySwapDwords<Swap>(source + off, out + size_t(x) * 2, 4);
+            x += 8;
+          }
+        } else if constexpr (BlockSize == 8) {
+          if (x < blocks_x && ((x + start_x) & 1) != 0) {
+            const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<3>(int32_t(x + start_x), row));
+            CopySwapBlock<8, Swap>(source, off, out);
+            ++x;
+          }
+          if (((x + start_x) & 3) == 2 && x + 2 <= blocks_x) {
+            const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<3>(int32_t(x + start_x), row));
+            CopySwapDwords<Swap>(source + off, out + size_t(x) * 8, 4);
+            x += 2;
+          }
+          while (x + 4 <= blocks_x) {
+            const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<3>(int32_t(x + start_x), row));
+            CopySwapDwords<Swap>(source + off, out + size_t(x) * 8, 4);
+            CopySwapDwords<Swap>(source + off + 32, out + size_t(x + 2) * 8, 4);
+            x += 4;
+          }
+          if (x + 2 <= blocks_x) {
+            const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<3>(int32_t(x + start_x), row));
+            CopySwapDwords<Swap>(source + off, out + size_t(x) * 8, 4);
+            x += 2;
+          }
+        } else if constexpr (BlockSize == 1) {
+          while (x < blocks_x && ((x + start_x) & 7) != 0) {
+            const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<0>(int32_t(x + start_x), row));
+            CopySwapBlock<1, Swap>(source, off, out + x);
+            ++x;
+          }
+          while (x + 8 <= blocks_x) {
+            const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<0>(int32_t(x + start_x), row));
+            CopySwapDwords<Swap>(source + off, out + x, 2);
+            x += 8;
+          }
+        } else if constexpr (BlockSize == 16) {
+          if (x < blocks_x && ((x + start_x) & 1) != 0) {
+            const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<4>(int32_t(x + start_x), row));
+            CopySwapDwords<Swap>(source + off, out, 4);
+            ++x;
+          }
+          while (x + 2 <= blocks_x) {
+            const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<4>(int32_t(x + start_x), row));
+            CopySwapDwords<Swap>(source + off, out + size_t(x) * 16, 4);
+            CopySwapDwords<Swap>(source + off + 32, out + size_t(x + 1) * 16, 4);
+            x += 2;
+          }
+        }
+        while (x < blocks_x) {
+          const size_t off = slice_base + size_t(GetTiledOffset2DFromRowT<kBpbLog2>(int32_t(x + start_x), row));
+          CopySwapBlock<BlockSize, Swap>(source, off, out + size_t(x) * BlockSize);
+          ++x;
+        }
+      } else {
+        for (uint32_t x = 0; x < blocks_x; ++x) {
+          const size_t offset =
+              slice_base +
+              size_t(GetTiledOffset2DFromRowT<kBpbLog2>(int32_t(x + start_x), row));
+          if (offset <= source_size && BlockSize <= source_size - offset) {
+            CopySwapBlock<BlockSize, Swap>(source, offset, out + size_t(x) * BlockSize);
+          }
+        }
+      }
+      if (row_scratch) {
+        std::memcpy(row_dst, row_scratch, row_bytes);
+      }
+    }
+  }
+}
+
+template <uint32_t BlockSize, size_t Swap>
+inline void DecodeLinear2DCopyLevel(const uint8_t* __restrict source, uint8_t* __restrict dst,
+                                    uint32_t slices, uint32_t blocks_x, uint32_t blocks_y,
+                                    uint32_t start_x, uint32_t start_y, uint32_t row_pitch_bytes,
+                                    size_t slice_stride_bytes, size_t dst_slice_bytes,
+                                    uint8_t* row_scratch = nullptr) {
+  const size_t row_copy_bytes = size_t(blocks_x) * BlockSize;
+  for (uint32_t slice = 0; slice < slices; ++slice) {
+    const size_t slice_base = size_t(slice) * slice_stride_bytes;
+    uint8_t* slice_dst = dst + size_t(slice) * dst_slice_bytes;
+    for (uint32_t y = 0; y < blocks_y; ++y) {
+      const size_t row_src_offset =
+          slice_base + size_t(y + start_y) * row_pitch_bytes + size_t(start_x) * BlockSize;
+      uint8_t* row_dst = slice_dst + size_t(y) * row_copy_bytes;
+      if constexpr (Swap == 0) {
+        std::memcpy(row_dst, source + row_src_offset, row_copy_bytes);
+      } else {
+        uint8_t* out = row_scratch ? row_scratch : row_dst;
+        if constexpr (BlockSize >= 4) {
+          CopySwapDwords<Swap>(source + row_src_offset, out, row_copy_bytes / 4);
+        } else if ((row_src_offset & 3) == 0) {
+          const size_t dwords = row_copy_bytes / 4;
+          CopySwapDwords<Swap>(source + row_src_offset, out, dwords);
+          const size_t tail_byte = dwords * 4;
+          for (size_t b = tail_byte; b < row_copy_bytes; b += BlockSize) {
+            CopySwapBlock<BlockSize, Swap>(source, row_src_offset + b, out + b);
+          }
+        } else {
+          for (uint32_t x = 0; x < blocks_x; ++x) {
+            CopySwapBlock<BlockSize, Swap>(source, row_src_offset + size_t(x) * BlockSize,
+                                           out + size_t(x) * BlockSize);
+          }
+        }
+        if (row_scratch) {
+          std::memcpy(row_dst, row_scratch, row_copy_bytes);
+        }
+      }
     }
   }
 }
@@ -959,13 +1160,14 @@ struct ResolvedCropKey {
   uint32_t width = 0;
   uint32_t height = 0;
   VkFormat format = VK_FORMAT_UNDEFINED;
+  uint32_t pack_flags = 0;
   auto operator<=>(const ResolvedCropKey&) const = default;
 };
 
 struct ResolvedCropKeyHash {
   size_t operator()(const ResolvedCropKey& key) const noexcept {
-    const std::array<uint32_t, 4> fields{key.address, key.width, key.height,
-                                         uint32_t(key.format)};
+    const std::array<uint32_t, 5> fields{key.address, key.width, key.height,
+                                         uint32_t(key.format), key.pack_flags};
     return size_t(XXH3_64bits(fields.data(), sizeof(fields)));
   }
 };

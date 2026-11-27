@@ -49,6 +49,8 @@ class NativeTextureCache {
     xenos::Endian128 endian = xenos::Endian128::kNone;
     bool rgba8_readback_valid = false;
     bool resolution_scaled = true;
+    bool is_depth = false;
+    xenos::DepthRenderTargetFormat depth_format = xenos::DepthRenderTargetFormat::kD24S8;
   };
   static constexpr size_t kMaxResolvedImages = 256;
 
@@ -205,6 +207,7 @@ class NativeTextureCache {
   std::vector<uint64_t> cached_only_pages_;
   std::vector<uint64_t> resolved_pages_;
   std::vector<uint64_t> scratch_resolved_pages_;
+  std::vector<uint8_t> decode_row_scratch_;
 };
 
 }  // namespace rex::graphics::native

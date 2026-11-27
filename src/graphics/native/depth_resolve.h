@@ -18,6 +18,9 @@ class DepthResolve {
   void Record(VkCommandBuffer commands, size_t descriptor, VkImageView source,
               VkImageView destination, VkRect2D rectangle, VkOffset2D destination_offset,
               bool multisample, uint32_t sample, float scale);
+  void RecordPackRgba8(VkCommandBuffer commands, size_t descriptor, VkImageView source,
+                       VkImageView destination, VkExtent2D extent, bool float_depth,
+                       uint32_t endian_swap);
 
  private:
   const ui::vulkan::VulkanDevice& device_;
@@ -25,6 +28,8 @@ class DepthResolve {
   std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool> descriptors_;
   VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
   std::array<VkPipeline, 2> pipelines_{};
+  VkPipelineLayout pack_rgba8_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline pack_rgba8_pipeline_ = VK_NULL_HANDLE;
   VkSampler sampler_ = VK_NULL_HANDLE;
 };
 

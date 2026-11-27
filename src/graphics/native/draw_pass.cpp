@@ -7,6 +7,7 @@
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
+#include "depth_resolve.h"
 #include "edram_depth_clear_spirv.h"
 
 namespace rex::graphics::native {
@@ -51,7 +52,24 @@ CachedTexture::~CachedTexture() {
   for (const auto& entry : views) {
     vk.vkDestroyImageView(handle, entry.second, nullptr);
   }
+  vk.vkDestroyImageView(handle, storage_view, nullptr);
   DestroyDeviceImage(*device, allocator, image, memory, allocation);
+}
+
+VkImageView CachedTexture::GetOrCreateStorageView(VkFormat format) {
+  if (storage_view != VK_NULL_HANDLE) {
+    return storage_view;
+  }
+  VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  info.image = image;
+  info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  info.format = format;
+  info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  if (device->functions().vkCreateImageView(device->device(), &info, nullptr, &storage_view) !=
+      VK_SUCCESS) {
+    return VK_NULL_HANDLE;
+  }
+  return storage_view;
 }
 
 VkImageView CachedTexture::GetOrCreateView(VkImageViewType view_type, VkFormat format,
@@ -366,6 +384,7 @@ DrawPass& DrawPass::operator=(DrawPass&& other) noexcept {
   Release();
   device_ = other.device_;
   allocator_ = other.allocator_;
+  depth_resolve_ = std::exchange(other.depth_resolve_, nullptr);
   bindings_ = std::exchange(other.bindings_, nullptr);
   set_indices_ = std::exchange(other.set_indices_, {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
   sets_ = other.sets_;
@@ -407,7 +426,11 @@ void DrawPass::Release() {
       set_indices_[i] = SIZE_MAX;
     }
   }
-  for (const auto& texture : textures_) {
+  for (auto& texture : textures_) {
+    if (texture.depth_pack_descriptor != SIZE_MAX && depth_resolve_) {
+      depth_resolve_->Free(texture.depth_pack_descriptor);
+      texture.depth_pack_descriptor = SIZE_MAX;
+    }
     // Fallback views, cached views, resolved-image views, samplers and cached
     // images are owned by the command processor, not this pass.
     if (texture.fallback_view == VK_NULL_HANDLE && !texture.cached && !texture.resolved) {
@@ -432,9 +455,11 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
                           ui::vulkan::VulkanUploadBufferPool& uploads, uint64_t submission,
                           uint32_t frame_slot, VkBuffer shared_vertex_buffer,
                           std::timed_mutex* pipeline_cache_mutex,
-                          const PreuploadedConstants* preuploaded_constants) {
+                          const PreuploadedConstants* preuploaded_constants,
+                          DepthResolve* depth_resolve) {
   const auto& vk = device_->functions();
   const VkDevice device = device_->device();
+  depth_resolve_ = depth_resolve;
 
   textures_.resize(input.textures.size());
   blend_constants_ = input.blend_constants;
@@ -679,6 +704,9 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
     auto& texture = textures_[i];
     texture.resolved = input_texture.resolved_image;
     texture.crop_source = input_texture.crop_source;
+    texture.depth_pack_source = input_texture.depth_pack_source;
+    texture.depth_pack_float = input_texture.depth_pack_float;
+    texture.depth_pack_swap = input_texture.depth_pack_swap;
     texture.resolved_cube_faces = input_texture.resolved_cube_faces;
     texture.cached = input_texture.cached_texture;
     texture.upload_cached = input_texture.upload_cached;
@@ -699,6 +727,17 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
     if (texture.cached) {
       has_texture_work_ |= texture.upload_cached;
       texture.view = input_texture.cached_view;
+      if (texture.upload_cached && texture.depth_pack_source) {
+        if (!depth_resolve_) {
+          return false;
+        }
+        texture.cached_storage_view = texture.cached->GetOrCreateStorageView(input_texture.format);
+        texture.depth_pack_descriptor = depth_resolve_->Allocate();
+        if (texture.cached_storage_view == VK_NULL_HANDLE ||
+            texture.depth_pack_descriptor == SIZE_MAX) {
+          return false;
+        }
+      }
       continue;
     }
     // Resolved images cache their sampler views by component mapping, so a
@@ -927,6 +966,33 @@ void DrawPass::RecordTextureUpload(VkCommandBuffer commands) {
       resolved_faces |= face != nullptr;
     }
     const VkImage image = texture.cached ? texture.cached->image : texture.image;
+    if (texture.depth_pack_source) {
+      texture.depth_pack_source->Transition(commands, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                            VK_ACCESS_SHADER_READ_BIT);
+      VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+      barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.image = image;
+      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, texture.array_layers};
+      barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+      barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+      vk.vkCmdPipelineBarrier(commands, kTextureStages | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                              &barrier);
+      depth_resolve_->RecordPackRgba8(commands, texture.depth_pack_descriptor,
+                                      texture.depth_pack_source->depth_view(),
+                                      texture.cached_storage_view, texture.extent,
+                                      texture.depth_pack_float, texture.depth_pack_swap);
+      barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+      barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+      barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      vk.vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, kTextureStages, 0, 0,
+                              nullptr, 0, nullptr, 1, &barrier);
+      continue;
+    }
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;

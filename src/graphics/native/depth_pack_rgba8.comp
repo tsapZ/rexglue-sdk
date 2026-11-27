@@ -1,0 +1,53 @@
+#version 450
+
+// Packs a resolved R32_SFLOAT depth image into big-endian D24S8/D24FS8
+// RGBA8 bytes (with 0 stencil) so shaders sampling depth as k_8_8_8_8 read
+// GPU-resolved depth without CPU untiling.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D source_depth;
+layout(rgba8, set = 0, binding = 1) uniform writeonly image2D destination;
+layout(push_constant) uniform PackInfo {
+  ivec2 extent;
+  uint float_depth;
+  uint endian_swap;
+} pack;
+
+uint float32_to_20e4(float f32) {
+  if (!(f32 > 0.0)) {
+    return 0u;
+  }
+  uint u = floatBitsToUint(f32);
+  if (u >= 0x3FFFFFF8u) {
+    return 0xFFFFFFu;
+  }
+  if (u < 0x38800000u) {
+    uint shift = min(113u - (u >> 23u), 24u);
+    u = (0x800000u | (u & 0x7FFFFFu)) >> shift;
+  } else {
+    u += 0xC8000000u;
+  }
+  u += 3u + ((u >> 3u) & 1u);
+  return (u >> 3u) & 0xFFFFFFu;
+}
+
+void main() {
+  ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(pixel, pack.extent))) {
+    return;
+  }
+  float d = texelFetch(source_depth, pixel, 0).r;
+  uint depth24 = pack.float_depth != 0u
+                     ? float32_to_20e4(d)
+                     : uint(roundEven(clamp(d, 0.0, 1.0) * 16777215.0));
+  // shortcut: packs 0 stencil until stencil resolve capture is needed.
+  uint word = depth24 << 8u;
+  if (pack.endian_swap == 0u) {
+    word = ((word >> 24u) & 0xFFu) | ((word >> 8u) & 0xFF00u) |
+           ((word & 0xFF00u) << 8u) | (word << 24u);
+  } else if (pack.endian_swap == 1u) {
+    word = ((word >> 16u) & 0xFFFFu) | (word << 16u);
+  } else if (pack.endian_swap == 2u) {
+    word = ((word & 0x00FF00FFu) << 8u) | ((word & 0xFF00FF00u) >> 8u);
+  }
+  imageStore(destination, pixel, unpackUnorm4x8(word));
+}

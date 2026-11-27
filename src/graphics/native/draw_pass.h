@@ -19,6 +19,8 @@
 
 namespace rex::graphics::native {
 
+class DepthResolve;
+
 // Decoded guest texture uploaded to a device-local image that survives across
 // draws and frames. Owned through shared_ptr so draws keep it alive while their
 // GPU work is still queued after the cache evicts or invalidates the entry.
@@ -48,6 +50,7 @@ struct CachedTexture {
   // Keyed by format (UNORM and SNORM views share MUTABLE_FORMAT images) and
   // PackTextureComponentMapping.
   std::map<uint64_t, VkImageView> views;
+  VkImageView storage_view = VK_NULL_HANDLE;
   CachedTexture() = default;
   ~CachedTexture();
   CachedTexture(const CachedTexture&) = delete;
@@ -55,6 +58,7 @@ struct CachedTexture {
 
   VkImageView GetOrCreateView(VkImageViewType view_type, VkFormat format,
                               VkComponentMapping swizzle, uint32_t array_layers);
+  VkImageView GetOrCreateStorageView(VkFormat format);
 };
 
 struct DrawTexture {
@@ -82,6 +86,9 @@ struct DrawTexture {
   // Cached resolve of the same format but up to 8x8 larger than this texture;
   // its top-left corner is copied into a host image during the upload.
   std::shared_ptr<ColorImage> crop_source;
+  std::shared_ptr<ColorImage> depth_pack_source;
+  bool depth_pack_float = false;
+  uint32_t depth_pack_swap = 0;
   uint64_t resolved_crop_version = 0;
   // Resolved host image of each cube face, in face order, when the whole cube
   // was rendered on the GPU instead of being stored in guest memory. Each face
@@ -318,7 +325,8 @@ class DrawPass {
                   ui::vulkan::VulkanUploadBufferPool& uploads, uint64_t submission,
                   uint32_t frame_slot = 0, VkBuffer shared_vertex_buffer = VK_NULL_HANDLE,
                   std::timed_mutex* pipeline_cache_mutex = nullptr,
-                  const PreuploadedConstants* preuploaded_constants = nullptr);
+                  const PreuploadedConstants* preuploaded_constants = nullptr,
+                  DepthResolve* depth_resolve = nullptr);
   // Records only the binds and dynamic state that differ from `state`.
   void Record(VkCommandBuffer commands, VkExtent2D extent, DrawRenderState& state);
   void RecordTextureUpload(VkCommandBuffer commands);
@@ -331,6 +339,7 @@ class DrawPass {
 
   const ui::vulkan::VulkanDevice* device_;
   VmaAllocator allocator_;
+  DepthResolve* depth_resolve_ = nullptr;
   DrawBindings* bindings_ = nullptr;
   // Sets this pass allocated and frees; shared and cached sets stay SIZE_MAX.
   std::array<size_t, 4> set_indices_{SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
@@ -343,6 +352,7 @@ class DrawPass {
   struct Texture {
     std::shared_ptr<ColorImage> resolved;
     std::shared_ptr<ColorImage> crop_source;
+    std::shared_ptr<ColorImage> depth_pack_source;
     std::array<std::shared_ptr<ColorImage>, kTextureCubeArrayLayers> resolved_cube_faces;
     std::shared_ptr<CachedTexture> cached;
     VkImage image = VK_NULL_HANDLE;
@@ -350,10 +360,14 @@ class DrawPass {
     VmaAllocation allocation = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkImageView fallback_view = VK_NULL_HANDLE;
+    VkImageView cached_storage_view = VK_NULL_HANDLE;
     VkBuffer direct_upload_buffer = VK_NULL_HANDLE;
     VkExtent2D extent{};
     uint32_t array_layers = 1;
     uint32_t level_count = 1;
+    size_t depth_pack_descriptor = SIZE_MAX;
+    bool depth_pack_float = false;
+    uint32_t depth_pack_swap = 0;
     bool upload_cached = false;
     std::vector<VkBufferImageCopy> uploads;
   };

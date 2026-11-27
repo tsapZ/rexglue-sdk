@@ -1801,7 +1801,7 @@ size_t NativeCommandProcessor::AddPendingPass(const DrawInput& input,
   if (!pass.Initialize(input, index_binding, inline_indices, vertex, pixel, shared_count,
                        pipeline_cache_, pipelines_, draw_bindings_, *draw_uploads_, clock_.next,
                        DrawBindings::kPendingTextureSetSlot, shared_vertex_buffer,
-                       &pipeline_cache_mutex_, preuploaded_constants)) {
+                       &pipeline_cache_mutex_, preuploaded_constants, depth_resolve_.get())) {
     pending_passes_.pop_back();
     return SIZE_MAX;
   }
@@ -2115,7 +2115,9 @@ bool NativeCommandProcessor::IssueCopy() {
                               copy_dest_pitch,
                               copy.copy_dest_info.copy_dest_endian,
                               rgba8_readback_eligible,
-                              copy_scaled};
+                              copy_scaled,
+                              depth,
+                              depth_format};
   resolved_images().insert_or_assign(dest_resolve_address, std::move(resolve_entry));
   if (erased_other_resolved) {
     texture_cache_->PruneResolvedDependents();
