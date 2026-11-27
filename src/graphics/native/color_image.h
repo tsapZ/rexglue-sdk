@@ -34,14 +34,19 @@ class ColorImage {
   bool Initialize(VkExtent2D extent, VkFormat format = kFormat,
                   VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT,
                   VkImageAspectFlags aspects = VK_IMAGE_ASPECT_COLOR_BIT,
-                  uint32_t array_layers = 1);
+                  uint32_t array_layers = 1, bool allow_storage = true);
   void Transition(VkCommandBuffer commands, VkImageLayout layout, VkPipelineStageFlags stage,
                   VkAccessFlags access);
+  // Populates `barrier` and updates tracked layout/stage/access for batched barriers.
+  // Returns false when no transition is needed.
+  bool PrepareTransition(VkImageLayout layout, VkPipelineStageFlags stage, VkAccessFlags access,
+                         VkImageMemoryBarrier& barrier, VkPipelineStageFlags& src_stage_out);
   void Clear(VkCommandBuffer commands, const VkClearColorValue& color);
 
   VkImageAspectFlags aspects() const { return aspects_; }
   VkSampleCountFlagBits samples() const { return samples_; }
   VkFormat format() const { return format_; }
+  bool storage_enabled() const { return storage_enabled_; }
   VkImage image() const { return image_; }
   VkImageView view() const { return view_; }
   VkImageView depth_view() const { return depth_view_; }
@@ -85,6 +90,7 @@ class ColorImage {
   VkPipelineStageFlags stage_ = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
   VkAccessFlags access_ = 0;
   bool unpublished_resolve_ = false;
+  bool storage_enabled_ = false;
   const DrawBindingsViewPurger* view_purger_ = nullptr;
   uint64_t last_keepalive_submission_ = 0;
 };

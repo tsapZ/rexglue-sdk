@@ -1743,6 +1743,7 @@ struct DrawRenderState {
 
   VkPipeline pipeline = VK_NULL_HANDLE;
   VkPipelineLayout layout = VK_NULL_HANDLE;
+  std::array<VkDescriptorSetLayout, kSetCount> set_layouts{};
   std::array<VkDescriptorSet, kSetCount> sets{};
   std::array<uint32_t, kDynamicOffsetCount> dynamic_offsets{};
   bool viewport_valid = false;
@@ -1784,24 +1785,49 @@ struct DrawRenderState {
   // First descriptor set to rebind (kSetCount when none). A different pipeline
   // layout may disturb every bound set, so it rebinds all of them; the dynamic
   // set also rebinds when its offsets change.
-  uint32_t FirstChangedSet(VkPipelineLayout wanted_layout,
-                           const std::array<VkDescriptorSet, kSetCount>& wanted_sets,
-                           const std::array<uint32_t, kDynamicOffsetCount>& wanted_offsets) {
+  struct ChangedSetRange {
     uint32_t first = kSetCount;
+    uint32_t last = 0;
+    bool empty() const { return first > last; }
+  };
+  // Returns the inclusive [first, last] range of descriptor sets to rebind.
+  // When `layout != wanted_layout`, sets in [0, d) whose descriptor set layouts
+  // match (with identical push constant ranges) remain Vulkan-compatible.
+  ChangedSetRange GetChangedSets(
+      VkPipelineLayout wanted_layout,
+      const std::array<VkDescriptorSetLayout, kSetCount>& wanted_set_layouts,
+      const std::array<VkDescriptorSet, kSetCount>& wanted_sets,
+      const std::array<uint32_t, kDynamicOffsetCount>& wanted_offsets) {
+    uint32_t invalidate_from = kSetCount;
     if (layout != wanted_layout) {
-      first = 0;
-    } else {
-      for (uint32_t i = 0; i < kSetCount; ++i) {
-        if (sets[i] != wanted_sets[i] || (i == kDynamicSet && dynamic_offsets != wanted_offsets)) {
-          first = i;
-          break;
+      invalidate_from = 0;
+      while (invalidate_from < kSetCount && set_layouts[invalidate_from] != VK_NULL_HANDLE &&
+             set_layouts[invalidate_from] == wanted_set_layouts[invalidate_from]) {
+        ++invalidate_from;
+      }
+    }
+    ChangedSetRange range{};
+    for (uint32_t i = 0; i < kSetCount; ++i) {
+      const bool changed = i >= invalidate_from || sets[i] != wanted_sets[i] ||
+                           (i == kDynamicSet && dynamic_offsets != wanted_offsets);
+      if (changed) {
+        if (range.empty()) {
+          range.first = i;
         }
+        range.last = i;
       }
     }
     layout = wanted_layout;
+    set_layouts = wanted_set_layouts;
     sets = wanted_sets;
     dynamic_offsets = wanted_offsets;
-    return first;
+    return range;
+  }
+  uint32_t FirstChangedSet(VkPipelineLayout wanted_layout,
+                           const std::array<VkDescriptorSet, kSetCount>& wanted_sets,
+                           const std::array<uint32_t, kDynamicOffsetCount>& wanted_offsets) {
+    const auto range = GetChangedSets(wanted_layout, {}, wanted_sets, wanted_offsets);
+    return range.empty() ? kSetCount : range.first;
   }
   // Faces (bit 1 front, bit 2 back) whose value must be set to `wanted`.
   static uint32_t UpdateStencil(std::array<uint32_t, 2>& current, uint32_t& valid,
@@ -2182,6 +2208,38 @@ inline void CopyFloatConstantBitmap(uint8_t* __restrict dst, const uint32_t* __r
       bits &= ~(((uint64_t(1) << run) - 1) << start);
     }
   }
+}
+
+// Checks whether deferred clears on a render-pass run's attachments can fold into
+// LOAD_OP_CLEAR: all deferred clears must start at (0, 0), share an identical
+// clear extent within `attachment_extent`, cover `covered`, and match
+// `attachment_extent` if any sibling attachment is uninitialized.
+constexpr bool CanFoldDeferredClears(std::span<const VkRect2D> clear_areas, VkExtent2D covered,
+                                     VkExtent2D attachment_extent,
+                                     bool has_uninitialized_sibling) {
+  if (clear_areas.empty()) {
+    return false;
+  }
+  const VkRect2D first = clear_areas[0];
+  if (first.offset.x != 0 || first.offset.y != 0 ||
+      covered.width > first.extent.width || covered.height > first.extent.height ||
+      first.extent.width > attachment_extent.width ||
+      first.extent.height > attachment_extent.height) {
+    return false;
+  }
+  if (has_uninitialized_sibling &&
+      (first.extent.width != attachment_extent.width ||
+       first.extent.height != attachment_extent.height)) {
+    return false;
+  }
+  for (size_t i = 1; i < clear_areas.size(); ++i) {
+    if (clear_areas[i].offset.x != 0 || clear_areas[i].offset.y != 0 ||
+        clear_areas[i].extent.width != first.extent.width ||
+        clear_areas[i].extent.height != first.extent.height) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace rex::graphics::native

@@ -205,7 +205,7 @@ std::shared_ptr<ColorImage> NativeTargetCache::FindTarget(uint32_t tile, uint32_
   auto image = std::make_shared<ColorImage>(device_, allocator_);
   image->set_view_purger(view_purger_);
   if (!image->Initialize({pitch * sx, height * sy}, format,
-                         VkSampleCountFlagBits(1u << uint32_t(samples)), aspects)) {
+                         VkSampleCountFlagBits(1u << uint32_t(samples)), aspects, 1, false)) {
     return {};
   }
   // ponytail: only same-format, same-sample, same-pitch aliases transfer their

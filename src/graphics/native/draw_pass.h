@@ -255,7 +255,9 @@ struct DrawBindings {
   ~DrawBindings();
   bool Initialize(uint32_t shared_count, uint32_t vertex_image_count,
                   uint32_t vertex_sampler_count, uint32_t pixel_image_count,
-                  uint32_t pixel_sampler_count);
+                  uint32_t pixel_sampler_count,
+                  VkDescriptorSetLayout shared_set0_layout = VK_NULL_HANDLE,
+                  VkDescriptorSetLayout shared_set1_layout = VK_NULL_HANDLE);
   VkDescriptorSet GetOrCreateSharedVertexSet(VkBuffer buffer, uint32_t shared_count);
   // Dynamic constant buffer set of an upload pool page. Pool pages live until
   // the pool is destroyed, so the set is kept as long as these bindings.
@@ -292,6 +294,7 @@ struct DrawBindings {
 
   const ui::vulkan::VulkanDevice& device;
   std::array<VkDescriptorSetLayout, 4> layouts{};
+  std::array<bool, 2> owns_prefix_layouts{true, true};
   std::array<std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool>, 4> pools;
   std::array<bool, 4> empty_layouts{};
   std::array<size_t, 4> empty_set_indices{SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
@@ -328,6 +331,15 @@ struct DrawBindingCache {
   std::array<uint32_t, 5> last_key{};
   DrawBindings* last_bindings = nullptr;
   bool has_last = false;
+  VkDescriptorSetLayout shared_set0_layout = VK_NULL_HANDLE;
+  uint32_t shared_set0_count = 0;
+  VkDescriptorSetLayout shared_set1_layout = VK_NULL_HANDLE;
+  const ui::vulkan::VulkanDevice* layout_device = nullptr;
+
+  DrawBindingCache() = default;
+  DrawBindingCache(const DrawBindingCache&) = delete;
+  DrawBindingCache& operator=(const DrawBindingCache&) = delete;
+  ~DrawBindingCache() { clear(); }
 
   DrawBindings* FindOrNull(const std::array<uint32_t, 5>& key) {
     if (has_last && last_key == key) {
@@ -352,6 +364,20 @@ struct DrawBindingCache {
     map.clear();
     last_bindings = nullptr;
     has_last = false;
+    if (layout_device) {
+      const auto& vk = layout_device->functions();
+      const VkDevice handle = layout_device->device();
+      if (shared_set0_layout != VK_NULL_HANDLE) {
+        vk.vkDestroyDescriptorSetLayout(handle, shared_set0_layout, nullptr);
+        shared_set0_layout = VK_NULL_HANDLE;
+      }
+      if (shared_set1_layout != VK_NULL_HANDLE) {
+        vk.vkDestroyDescriptorSetLayout(handle, shared_set1_layout, nullptr);
+        shared_set1_layout = VK_NULL_HANDLE;
+      }
+      shared_set0_count = 0;
+      layout_device = nullptr;
+    }
   }
   auto begin() { return map.begin(); }
   auto end() { return map.end(); }

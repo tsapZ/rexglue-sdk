@@ -267,7 +267,6 @@ class NativeCommandProcessor : public CommandProcessor {
   std::mutex invalidation_mutex_;
   std::vector<PhysicalRange> pending_invalidations_;
   std::atomic<bool> has_pending_invalidations_{false};
-  bool invalidated_since_last_draw_ = false;
   void* memory_invalidation_handle_ = nullptr;
   void KeepAliveTexture(const std::shared_ptr<CachedTexture>& texture) {
     if (texture && texture->last_keepalive_submission != clock_.next) {
@@ -282,6 +281,36 @@ class NativeCommandProcessor : public CommandProcessor {
     }
   }
   void ReleaseTextureOps(std::vector<DrawTextureOp>& ops);
+
+  void DeferClear(ColorImage* target, VkRect2D area, VkClearValue value, bool is_depth);
+  void FlushDeferredClear(ColorImage* target);
+  void FlushAllDeferredClears();
+  void ExecuteDepthClear(ColorImage* target, VkRect2D area, VkClearDepthStencilValue value);
+  void ExecuteColorClear(ColorImage* target, VkRect2D area, const VkClearColorValue& value);
+  void ResetCurrentRunVertexReads() {
+    current_run_vertex_reads_.clear();
+    last_run_colors_.fill(nullptr);
+    last_run_depth_ = nullptr;
+  }
+  bool OverlapsCurrentRunVertexReads(uint32_t address, uint32_t size) const {
+    for (const auto& r : current_run_vertex_reads_) {
+      if (RangesOverlap(address, size, r.first, r.second)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  struct DeferredClear {
+    ColorImage* target = nullptr;
+    VkRect2D area{};
+    VkClearValue value{};
+    bool is_depth = false;
+  };
+  std::unordered_map<ColorImage*, DeferredClear> deferred_clears_;
+  std::vector<PhysicalRange> current_run_vertex_reads_;
+  std::array<ColorImage*, xenos::kMaxColorRenderTargets> last_run_colors_{};
+  ColorImage* last_run_depth_ = nullptr;
 
   std::vector<FrameCommand> pending_;
   std::vector<DrawPass> pending_passes_;

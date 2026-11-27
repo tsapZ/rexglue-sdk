@@ -93,7 +93,8 @@ VkImageView ColorImage::GetSampledView(VkComponentMapping swizzle) {
 }
 
 bool ColorImage::Initialize(VkExtent2D extent, VkFormat format, VkSampleCountFlagBits samples,
-                            VkImageAspectFlags aspects, uint32_t array_layers) {
+                            VkImageAspectFlags aspects, uint32_t array_layers,
+                            bool allow_storage) {
   const auto& properties = device_.properties();
   if (!extent.width || !extent.height || extent.width > properties.maxImageDimension2D ||
       extent.height > properties.maxImageDimension2D || !array_layers ||
@@ -110,14 +111,17 @@ bool ColorImage::Initialize(VkExtent2D extent, VkFormat format, VkSampleCountFla
   info.samples = samples;
   info.tiling = VK_IMAGE_TILING_OPTIMAL;
   // Compute resolves write single-sample color images as storage images.
+  // Disabling STORAGE_BIT on render targets and non-storage resolves preserves DCC compression.
   bool storage_supported = false;
-  if ((aspects & VK_IMAGE_ASPECT_COLOR_BIT) && samples == VK_SAMPLE_COUNT_1_BIT) {
+  if (allow_storage && (aspects & VK_IMAGE_ASPECT_COLOR_BIT) &&
+      samples == VK_SAMPLE_COUNT_1_BIT) {
     VkFormatProperties format_properties{};
     device_.vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
         device_.physical_device(), format, &format_properties);
     storage_supported =
         (format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
   }
+  storage_enabled_ = storage_supported;
   info.usage = GetColorImageUsage(aspects, storage_supported);
   if (!CreateDeviceImage(device_, allocator_, info, image_, memory_, allocation_)) {
     return false;
@@ -155,13 +159,17 @@ bool ColorImage::Initialize(VkExtent2D extent, VkFormat format, VkSampleCountFla
   return true;
 }
 
-void ColorImage::Transition(VkCommandBuffer commands, VkImageLayout layout,
-                            VkPipelineStageFlags stage, VkAccessFlags access) {
-  if (layout_ == layout && access_ == VK_ACCESS_SHADER_READ_BIT &&
-      access == VK_ACCESS_SHADER_READ_BIT && (stage_ & stage) == stage) {
-    return;
+bool ColorImage::PrepareTransition(VkImageLayout layout, VkPipelineStageFlags stage,
+                                   VkAccessFlags access, VkImageMemoryBarrier& barrier,
+                                   VkPipelineStageFlags& src_stage_out) {
+  if (layout_ == layout &&
+      ((access_ == VK_ACCESS_SHADER_READ_BIT && access == VK_ACCESS_SHADER_READ_BIT) ||
+       (layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL &&
+        access_ == VK_ACCESS_TRANSFER_READ_BIT && access == VK_ACCESS_TRANSFER_READ_BIT)) &&
+      (stage_ & stage) == stage) {
+    return false;
   }
-  VkImageMemoryBarrier barrier{};
+  barrier = {};
   barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
   barrier.srcAccessMask = access_;
   barrier.dstAccessMask = access;
@@ -170,11 +178,22 @@ void ColorImage::Transition(VkCommandBuffer commands, VkImageLayout layout,
   barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.image = image_;
   barrier.subresourceRange = {aspects_, 0, 1, 0, array_layers_};
-  device_.functions().vkCmdPipelineBarrier(commands, stage_, stage, 0, 0, nullptr, 0, nullptr, 1,
-                                           &barrier);
+  src_stage_out = stage_;
   access_ = access;
   layout_ = layout;
   stage_ = stage;
+  return true;
+}
+
+void ColorImage::Transition(VkCommandBuffer commands, VkImageLayout layout,
+                            VkPipelineStageFlags stage, VkAccessFlags access) {
+  VkImageMemoryBarrier barrier{};
+  VkPipelineStageFlags src_stage = 0;
+  if (!PrepareTransition(layout, stage, access, barrier, src_stage)) {
+    return;
+  }
+  device_.functions().vkCmdPipelineBarrier(commands, src_stage, stage, 0, 0, nullptr, 0, nullptr, 1,
+                                           &barrier);
 }
 
 void ColorImage::Clear(VkCommandBuffer commands, const VkClearColorValue& color) {

@@ -1716,3 +1716,81 @@ TEST_CASE("Native packed pipeline key and float-run constant copy", "[gpu][nativ
   CHECK(pos == 72 * 4);
   CHECK(out == ref);
 }
+
+TEST_CASE("Native Phase 5 clear folding, targeted set range, and storage usage", "[gpu][native]") {
+  // 1. Clear-folding geometry checks (including under-/over-clear guards).
+  const std::array<VkRect2D, 2> matching{
+      VkRect2D{{0, 0}, {1264, 704}},
+      VkRect2D{{0, 0}, {1264, 704}},
+  };
+  CHECK(native::CanFoldDeferredClears(matching, {1264, 704}, {1264, 704}, false));
+  CHECK(native::CanFoldDeferredClears(matching, {640, 480}, {1264, 704}, false));
+  CHECK(native::CanFoldDeferredClears(matching, {640, 480}, {1264, 704}, true));
+  CHECK_FALSE(native::CanFoldDeferredClears(matching, {1280, 704}, {1280, 704}, false));
+  // Under-clear: clear extent larger than attachment extent.
+  CHECK_FALSE(native::CanFoldDeferredClears(matching, {640, 480}, {1024, 704}, false));
+  // Over-clear: partial clear with an uninitialized sibling attachment.
+  const std::array<VkRect2D, 1> partial{VkRect2D{{0, 0}, {640, 480}}};
+  CHECK(native::CanFoldDeferredClears(partial, {640, 480}, {1264, 704}, false));
+  CHECK_FALSE(native::CanFoldDeferredClears(partial, {640, 480}, {1264, 704}, true));
+
+  const std::array<VkRect2D, 2> mismatched{
+      VkRect2D{{0, 0}, {1264, 704}},
+      VkRect2D{{0, 0}, {1280, 720}},
+  };
+  CHECK_FALSE(native::CanFoldDeferredClears(mismatched, {640, 480}, {1280, 720}, false));
+
+  const std::array<VkRect2D, 1> non_zero_offset{VkRect2D{{8, 0}, {1264, 704}}};
+  CHECK_FALSE(native::CanFoldDeferredClears(non_zero_offset, {640, 480}, {1280, 720}, false));
+
+  // 2. Targeted ChangedSetRange with exact VkDescriptorSetLayout compatibility.
+  native::DrawRenderState state;
+  const VkPipelineLayout layout_a = VkPipelineLayout(0x100);
+  const VkPipelineLayout layout_b = VkPipelineLayout(0x200);
+  const VkPipelineLayout layout_c = VkPipelineLayout(0x300);
+  const VkDescriptorSetLayout dsl0_shared = VkDescriptorSetLayout(0x10);
+  const VkDescriptorSetLayout dsl0_alt = VkDescriptorSetLayout(0x11);
+  const VkDescriptorSetLayout dsl1_shared = VkDescriptorSetLayout(0x20);
+  const std::array<VkDescriptorSetLayout, 4> layouts_a{
+      dsl0_shared, dsl1_shared, VkDescriptorSetLayout(0x30), VkDescriptorSetLayout(0x40)};
+  const std::array<VkDescriptorSetLayout, 4> layouts_b{
+      dsl0_shared, dsl1_shared, VkDescriptorSetLayout(0x31), VkDescriptorSetLayout(0x41)};
+  const std::array<VkDescriptorSetLayout, 4> layouts_c{
+      dsl0_alt, dsl1_shared, VkDescriptorSetLayout(0x32), VkDescriptorSetLayout(0x42)};
+  const std::array<VkDescriptorSet, 4> sets_a{
+      VkDescriptorSet(0x1), VkDescriptorSet(0x2), VkDescriptorSet(0x3), VkDescriptorSet(0x4)};
+  const std::array<uint32_t, 5> offsets_a{0, 16, 32, 48, 64};
+  auto r0 = state.GetChangedSets(layout_a, layouts_a, sets_a, offsets_a);
+  CHECK(r0.first == 0);
+  CHECK(r0.last == 3);
+
+  // Same layout, only set 3 changes.
+  auto sets_b = sets_a;
+  sets_b[3] = VkDescriptorSet(0x5);
+  auto r1 = state.GetChangedSets(layout_a, layouts_a, sets_b, offsets_a);
+  CHECK(r1.first == 3);
+  CHECK(r1.last == 3);
+
+  // Different layout with matching Set 0/1 layouts: only sets [2, 3] rebind when 0/1 match.
+  auto r2 = state.GetChangedSets(layout_b, layouts_b, sets_b, offsets_a);
+  CHECK(r2.first == 2);
+  CHECK(r2.last == 3);
+
+  // Same layout + dynamic offset change: [1, 1] rebinds.
+  auto offsets_b = offsets_a;
+  offsets_b[2] = 128;
+  auto r3 = state.GetChangedSets(layout_b, layouts_b, sets_b, offsets_b);
+  CHECK(r3.first == 1);
+  CHECK(r3.last == 1);
+
+  // Different layout where Set 0 layout differs: must rebind [0, 3] even if sets[0..1] match.
+  auto r4 = state.GetChangedSets(layout_c, layouts_c, sets_b, offsets_b);
+  CHECK(r4.first == 0);
+  CHECK(r4.last == 3);
+
+  // 3. GetColorImageUsage omits STORAGE_BIT when allow_storage is false.
+  CHECK((native::GetColorImageUsage(VK_IMAGE_ASPECT_COLOR_BIT, false) &
+         VK_IMAGE_USAGE_STORAGE_BIT) == 0);
+  CHECK((native::GetColorImageUsage(VK_IMAGE_ASPECT_COLOR_BIT, true) &
+         VK_IMAGE_USAGE_STORAGE_BIT) != 0);
+}

@@ -133,7 +133,9 @@ DrawBindings::~DrawBindings() {
   }
   for (size_t i = 0; i < layouts.size(); ++i) {
     pools[i].reset();
-    vk.vkDestroyDescriptorSetLayout(device.device(), layouts[i], nullptr);
+    if (i >= 2 || owns_prefix_layouts[i]) {
+      vk.vkDestroyDescriptorSetLayout(device.device(), layouts[i], nullptr);
+    }
   }
   vk.vkDestroyPipelineLayout(device.device(), pipeline_layout, nullptr);
 }
@@ -415,7 +417,9 @@ VkDescriptorSet DrawBindings::GetEmptySet(size_t index) {
 
 bool DrawBindings::Initialize(uint32_t shared_count, uint32_t vertex_image_count,
                               uint32_t vertex_sampler_count, uint32_t pixel_image_count,
-                              uint32_t pixel_sampler_count) {
+                              uint32_t pixel_sampler_count,
+                              VkDescriptorSetLayout shared_set0_layout,
+                              VkDescriptorSetLayout shared_set1_layout) {
   // Each fetch constant may have an unsigned and a signed binding per dimension.
   constexpr uint32_t kMaxImages = xenos::kTextureFetchConstantCount * 4;
   if (vertex_image_count > kMaxImages || pixel_image_count > kMaxImages ||
@@ -452,13 +456,21 @@ bool DrawBindings::Initialize(uint32_t shared_count, uint32_t vertex_image_count
   const std::array<std::span<const VkDescriptorSetLayoutBinding>, 4> bindings{
       std::span(&shared, 1), constants, vertex_textures, pixel_textures};
   for (size_t i = 0; i < layouts.size(); ++i) {
-    VkDescriptorSetLayoutCreateInfo info{};
-    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    info.bindingCount = uint32_t(bindings[i].size());
-    info.pBindings = bindings[i].data();
     empty_layouts[i] = bindings[i].empty();
-    if (vk.vkCreateDescriptorSetLayout(handle, &info, nullptr, &layouts[i]) != VK_SUCCESS) {
-      return false;
+    if (i == 0 && shared_set0_layout != VK_NULL_HANDLE) {
+      layouts[0] = shared_set0_layout;
+      owns_prefix_layouts[0] = false;
+    } else if (i == 1 && shared_set1_layout != VK_NULL_HANDLE) {
+      layouts[1] = shared_set1_layout;
+      owns_prefix_layouts[1] = false;
+    } else {
+      VkDescriptorSetLayoutCreateInfo info{};
+      info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+      info.bindingCount = uint32_t(bindings[i].size());
+      info.pBindings = bindings[i].data();
+      if (vk.vkCreateDescriptorSetLayout(handle, &info, nullptr, &layouts[i]) != VK_SUCCESS) {
+        return false;
+      }
     }
     std::vector<VkDescriptorPoolSize> sizes;
     for (const auto& binding : bindings[i]) {
@@ -608,9 +620,23 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
   bindings_ = binding_cache.FindOrNull(binding_key);
   if (!bindings_) {
     auto layout = std::make_unique<DrawBindings>(*device_);
+    const VkDescriptorSetLayout set0_shared =
+        binding_cache.shared_set0_count == binding_key[0] ? binding_cache.shared_set0_layout
+                                                          : VkDescriptorSetLayout(VK_NULL_HANDLE);
     if (!layout->Initialize(binding_key[0], binding_key[1], binding_key[2], binding_key[3],
-                            binding_key[4])) {
+                            binding_key[4], set0_shared, binding_cache.shared_set1_layout)) {
       return false;
+    }
+    if (binding_cache.shared_set0_layout == VK_NULL_HANDLE) {
+      binding_cache.layout_device = device_;
+      binding_cache.shared_set0_layout = layout->layouts[0];
+      binding_cache.shared_set0_count = binding_key[0];
+      layout->owns_prefix_layouts[0] = false;
+    }
+    if (binding_cache.shared_set1_layout == VK_NULL_HANDLE) {
+      binding_cache.layout_device = device_;
+      binding_cache.shared_set1_layout = layout->layouts[1];
+      layout->owns_prefix_layouts[1] = false;
     }
     bindings_ = binding_cache.Insert(binding_key, std::move(layout));
   }
@@ -1210,14 +1236,17 @@ void DrawPass::Record(VkCommandBuffer commands, VkExtent2D extent, DrawRenderSta
   if (state.SetPipeline(pipeline_)) {
     vk.vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
   }
-  const uint32_t first_set =
-      state.FirstChangedSet(bindings_->pipeline_layout, sets_, dynamic_offsets_);
-  if (first_set < sets_.size()) {
-    // The dynamic offsets belong to the constant set, so only pass them with it.
-    const bool with_constants = first_set <= DrawRenderState::kDynamicSet;
+  const auto changed = state.GetChangedSets(bindings_->pipeline_layout, bindings_->layouts, sets_,
+                                            dynamic_offsets_);
+  if (!changed.empty()) {
+    const uint32_t count = changed.last - changed.first + 1;
+    // The dynamic offsets belong to the constant set, so only pass them when set 1 is in range.
+    const bool with_constants =
+        changed.first <= DrawRenderState::kDynamicSet &&
+        changed.last >= DrawRenderState::kDynamicSet;
     vk.vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                               bindings_->pipeline_layout, first_set,
-                               uint32_t(sets_.size()) - first_set, sets_.data() + first_set,
+                               bindings_->pipeline_layout, changed.first, count,
+                               sets_.data() + changed.first,
                                with_constants ? uint32_t(dynamic_offsets_.size()) : 0,
                                with_constants ? dynamic_offsets_.data() : nullptr);
   }
