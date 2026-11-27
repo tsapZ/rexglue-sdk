@@ -463,26 +463,51 @@ VkSampler NativeTextureCache::GetSampler(const DrawSampler& key) {
 }
 
 void NativeTextureCache::InvalidateTextures(uint32_t start, uint32_t length) {
-  if (!cached_texture_pages_.empty()) {
-    const auto [first_page, page_count] = GetPhysicalPageRange(start, length);
-    if (!HasAnyPageBitSet(cached_texture_pages_, first_page, page_count)) {
-      return;
-    }
+  const PhysicalRange range{start, length};
+  InvalidateRanges({&range, 1}, InvalidationTarget::kTextures);
+}
+
+void NativeTextureCache::InvalidateResolvedTextures(uint32_t start, uint32_t length) {
+  const PhysicalRange range{start, length};
+  InvalidateRanges({&range, 1}, InvalidationTarget::kResolves);
+}
+
+void NativeTextureCache::InvalidateWrittenRanges(std::span<const PhysicalRange> ranges) {
+  InvalidateRanges(ranges, InvalidationTarget::kBoth);
+}
+
+void NativeTextureCache::InvalidateRanges(std::span<const PhysicalRange> ranges,
+                                          InvalidationTarget target) {
+  if (ranges.empty()) return;
+  if (!cached_texture_pages_.empty() &&
+      std::none_of(ranges.begin(), ranges.end(), [&](const PhysicalRange& range) {
+        const auto [first, count] = GetPhysicalPageRange(range.first, range.second);
+        return HasAnyPageBitSet(cached_texture_pages_, first, count);
+      })) {
+    return;
   }
-  bool erased = false;
-  for (auto it = cached_textures_.begin(); it != cached_textures_.end();) {
-    const CachedTexture& texture = *it->second.texture;
-    if (RangesOverlap(start, length, texture.base_start, texture.base_length) ||
-        RangesOverlap(start, length, texture.mip_start, texture.mip_length)) {
-      it = cached_textures_.erase(it);
-      erased = true;
-    } else {
-      ++it;
-    }
+  bool textures_erased = false;
+  if (target != InvalidationTarget::kResolves) {
+    textures_erased = std::erase_if(cached_textures_, [&](const auto& entry) {
+      const CachedTexture& texture = *entry.second.texture;
+      return OverlapsPhysicalRanges(ranges, texture.base_start, texture.base_length) ||
+             OverlapsPhysicalRanges(ranges, texture.mip_start, texture.mip_length);
+    }) != 0;
   }
-  if (erased) {
-    RebuildCachedTexturePages();
+  bool resolves_erased = false;
+  if (target != InvalidationTarget::kTextures) {
+    resolves_erased = std::erase_if(resolved_images_, [&](const auto& entry) {
+      if (!OverlapsPhysicalRanges(ranges, entry.second.guest_start, entry.second.guest_length)) {
+        return false;
+      }
+      if (presented_resolve_address_ == entry.first) {
+        presented_resolve_address_.reset();
+      }
+      return true;
+    }) != 0;
+    if (resolves_erased) PruneResolvedDependents();
   }
+  if (textures_erased || resolves_erased) RebuildCachedTexturePages();
 }
 
 void NativeTextureCache::PruneResolvedDependents() {
@@ -506,31 +531,6 @@ void NativeTextureCache::PruneResolvedDependents() {
     } else {
       ++it;
     }
-  }
-}
-
-void NativeTextureCache::InvalidateResolvedTextures(uint32_t start, uint32_t length) {
-  if (!cached_texture_pages_.empty()) {
-    const auto [first_page, page_count] = GetPhysicalPageRange(start, length);
-    if (!HasAnyPageBitSet(cached_texture_pages_, first_page, page_count)) {
-      return;
-    }
-  }
-  bool erased = false;
-  for (auto it = resolved_images_.begin(); it != resolved_images_.end();) {
-    if (RangesOverlap(start, length, it->second.guest_start, it->second.guest_length)) {
-      if (presented_resolve_address_ && *presented_resolve_address_ == it->first) {
-        presented_resolve_address_.reset();
-      }
-      it = resolved_images_.erase(it);
-      erased = true;
-    } else {
-      ++it;
-    }
-  }
-  if (erased) {
-    PruneResolvedDependents();
-    RebuildCachedTexturePages();
   }
 }
 

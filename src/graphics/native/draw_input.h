@@ -337,6 +337,34 @@ constexpr bool RangesOverlap(uint32_t a_start, uint32_t a_length, uint32_t b_sta
   return a_start < b_end && b_start < a_end;
 }
 
+using PhysicalRange = std::pair<uint32_t, uint32_t>;  // start, length
+
+// Input ranges are bounded to physical memory by the invalidation callback.
+inline void CoalescePhysicalRanges(std::vector<PhysicalRange>& ranges) {
+  std::sort(ranges.begin(), ranges.end());
+  size_t count = 0;
+  for (const auto [start, length] : ranges) {
+    if (!length) continue;
+    if (count && start <= ranges[count - 1].first + ranges[count - 1].second) {
+      auto& [previous_start, previous_length] = ranges[count - 1];
+      previous_length = std::max(previous_length, start + length - previous_start);
+    } else {
+      ranges[count++] = {start, length};
+    }
+  }
+  ranges.resize(count);
+}
+
+// The ranges must be sorted and coalesced so their endpoints are ordered too.
+inline bool OverlapsPhysicalRanges(std::span<const PhysicalRange> ranges, uint32_t start,
+                                    uint32_t length) {
+  const auto entry = std::lower_bound(
+      ranges.begin(), ranges.end(), start, [](const PhysicalRange& range, uint32_t address) {
+        return uint64_t(range.first) + range.second <= address;
+      });
+  return entry != ranges.end() && RangesOverlap(entry->first, entry->second, start, length);
+}
+
 constexpr bool IsPhysicalRange(uint32_t address, size_t size) {
   return address < kPhysicalMemorySize && size && size <= kPhysicalMemorySize - address;
 }

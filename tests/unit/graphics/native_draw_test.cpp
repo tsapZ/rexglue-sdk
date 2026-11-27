@@ -459,6 +459,22 @@ TEST_CASE("Native guest texture cache keys cover the uploaded texels", "[gpu][na
   CHECK_FALSE(larger < key);
 }
 
+TEST_CASE("Native dirty ranges coalesce without covering clean gaps", "[gpu][native]") {
+  using native::PhysicalRange;
+  std::vector<PhysicalRange> ranges{
+      {0x4000, 0x100}, {0x1100, 0x100}, {0x1080, 0x80}, {0x1000, 0x100},
+      {0x1100, 0x100}, {0x2000, 0}, {native::kPhysicalMemorySize - 16, 16}};
+  native::CoalescePhysicalRanges(ranges);
+  REQUIRE(ranges == std::vector<PhysicalRange>{
+                        {0x1000, 0x200}, {0x4000, 0x100},
+                        {native::kPhysicalMemorySize - 16, 16}});
+  CHECK(native::OverlapsPhysicalRanges(ranges, 0x10FF, 2));
+  CHECK_FALSE(native::OverlapsPhysicalRanges(ranges, 0x1200, 0x2E00));
+  CHECK(native::OverlapsPhysicalRanges(ranges, 0x1200, 0x2E01));
+  CHECK_FALSE(native::OverlapsPhysicalRanges(ranges, 0x1008, 0));
+  CHECK_FALSE(native::OverlapsPhysicalRanges(ranges, native::kPhysicalMemorySize, 1));
+}
+
 TEST_CASE("Native physical range overlap is inclusive of shared bytes only", "[gpu][native]") {
   // Disjoint ranges never overlap.
   CHECK_FALSE(native::RangesOverlap(0x1000, 0x100, 0x2000, 0x100));

@@ -256,7 +256,7 @@ class NativeCommandProcessor : public CommandProcessor {
   // Written from guest threads while the global critical region is held, so it
   // only guards the pending list - never call into memory_ or Vulkan here.
   std::mutex invalidation_mutex_;
-  std::vector<std::pair<uint32_t, uint32_t>> pending_invalidations_;
+  std::vector<PhysicalRange> pending_invalidations_;
   std::atomic<bool> has_pending_invalidations_{false};
   bool invalidated_since_last_draw_ = false;
   void* memory_invalidation_handle_ = nullptr;

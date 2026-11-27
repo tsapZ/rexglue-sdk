@@ -661,18 +661,15 @@ void NativeCommandProcessor::DrainMemoryInvalidations() {
   if (!has_pending_invalidations_.load(std::memory_order_acquire)) {
     return;
   }
-  std::vector<std::pair<uint32_t, uint32_t>> invalidations;
+  std::vector<PhysicalRange> invalidations;
   {
     std::lock_guard<std::mutex> lock(invalidation_mutex_);
     invalidations.swap(pending_invalidations_);
     has_pending_invalidations_.store(false, std::memory_order_release);
   }
-  if (!invalidations.empty()) {
-    invalidated_since_last_draw_ = true;
-  }
+  if (invalidations.empty()) return;
+  invalidated_since_last_draw_ = true;
   for (const auto& [start, length] : invalidations) {
-    texture_cache_->InvalidateTextures(start, length);
-    texture_cache_->InvalidateResolvedTextures(start, length);
     if (index_cache_) {
       index_cache_->Invalidate(start, length);
     }
@@ -693,6 +690,10 @@ void NativeCommandProcessor::DrainMemoryInvalidations() {
     }
     InvalidateSharedVertices(start, length);
   }
+  // Keep the other caches' notification order. The texture cache only needs
+  // the union of written bytes and can process it once before the next draw.
+  CoalescePhysicalRanges(invalidations);
+  texture_cache_->InvalidateWrittenRanges(invalidations);
 }
 
 void NativeCommandProcessor::InvalidateGpuMemory() {

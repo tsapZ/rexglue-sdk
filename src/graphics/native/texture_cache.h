@@ -78,6 +78,8 @@ class NativeTextureCache {
 
   void InvalidateTextures(uint32_t start, uint32_t length);
   void InvalidateResolvedTextures(uint32_t start, uint32_t length);
+  // Invalidates both caches in a single walk for sorted, coalesced write ranges.
+  void InvalidateWrittenRanges(std::span<const PhysicalRange> ranges);
   // Drops every texture and resolve, keeping samplers.
   void InvalidateAll();
   void ClearSamplers();
@@ -95,6 +97,9 @@ class NativeTextureCache {
   std::optional<uint32_t>& presented_resolve_address() { return presented_resolve_address_; }
 
  private:
+  enum class InvalidationTarget { kTextures, kResolves, kBoth };
+  void InvalidateRanges(std::span<const PhysicalRange> ranges, InvalidationTarget target);
+
   struct CachedSampler {
     VkSampler sampler = VK_NULL_HANDLE;
     uint64_t last_use_submission = 0;
