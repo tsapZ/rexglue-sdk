@@ -272,8 +272,9 @@ bool D3D12Provider::Initialize() {
   // has it: EnumAdapters1 lists the adapter the screen hangs on first, which on a laptop with switchable
   // graphics is the processor's own. An Intel UHD 630 next to a GTX 1060 drew Spyro's Adventure as coloured
   // blocks (Core of Light #164). An index (d3d12_adapter >= 0) keeps meaning EnumAdapters1's order.
-  IDXGIFactory6* dxgi_factory6 = nullptr;
-  if (REXCVAR_GET(d3d12_adapter) == -1) {
+  // Every negative value but -2 (WARP) means "any physical adapter" in the loop below, so all of them take this order.
+  Microsoft::WRL::ComPtr<IDXGIFactory6> dxgi_factory6;
+  if (REXCVAR_GET(d3d12_adapter) < 0 && REXCVAR_GET(d3d12_adapter) != -2) {
     dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory6));
   }
   auto enum_adapter = [&](uint32_t index, IDXGIAdapter1** adapter_out) {
@@ -307,9 +308,7 @@ bool D3D12Provider::Initialize() {
     adapter = nullptr;
     ++adapter_index;
   }
-  if (dxgi_factory6) {
-    dxgi_factory6->Release();
-  }
+  dxgi_factory6.Reset();
   if (adapter == nullptr) {
     REXLOG_ERROR(
         "Failed to get an adapter supporting Direct3D 12 with the feature "
