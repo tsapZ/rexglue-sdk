@@ -1674,3 +1674,45 @@ TEST_CASE("Native texture descriptor set view key and keepalive dedup", "[gpu][n
   }
   CHECK(pushed == 2);
 }
+
+TEST_CASE("Native packed pipeline key and float-run constant copy", "[gpu][native]") {
+  CHECK(sizeof(native::DrawPipelineKey) == 64);
+  native::DrawPipelineKey a{};
+  native::DrawPipelineKey b{};
+  a.vertex = reinterpret_cast<const void*>(0x1000);
+  a.pixel = reinterpret_cast<const void*>(0x2000);
+  a.state0 = 0x123456789abcdef0ull;
+  a.state1 = uint64_t(VK_FORMAT_D32_SFLOAT_S8_UINT);
+  a.colors[0] = 0x1122334455667788ull;
+  b = a;
+  native::DrawPipelineKeyHash hasher;
+  CHECK(a == b);
+  CHECK(hasher(a) == hasher(b));
+  b.state1 = uint64_t(VK_FORMAT_D24_UNORM_S8_UINT);
+  CHECK(a != b);
+
+  std::array<uint32_t, 256 * 4> regs{};
+  for (uint32_t i = 0; i < 256 * 4; ++i) {
+    regs[i] = i + 1;
+  }
+  const std::array<uint64_t, 4> bitmap{
+      0b1111ull | (UINT64_C(0b111) << 61),
+      ~uint64_t(0),
+      0,
+      UINT64_C(1) << 63,
+  };
+  std::array<uint32_t, 72 * 4> out{};
+  native::CopyFloatConstantBitmap(reinterpret_cast<uint8_t*>(out.data()), regs.data(), bitmap);
+  std::array<uint32_t, 72 * 4> ref{};
+  size_t pos = 0;
+  for (uint32_t w = 0; w < 4; ++w) {
+    for (uint32_t b = 0; b < 64; ++b) {
+      if (bitmap[w] & (UINT64_C(1) << b)) {
+        std::memcpy(&ref[pos], &regs[(w * 64 + b) << 2], 16);
+        pos += 4;
+      }
+    }
+  }
+  CHECK(pos == 72 * 4);
+  CHECK(out == ref);
+}

@@ -137,7 +137,10 @@ class NativeTargetCache {
     targets_.clear();
     owners_.clear();
     tile_runs_.clear();
-    last_target_valid_ = false;
+    for (auto& slot : target_mru_) {
+      slot.valid = false;
+      slot.target = nullptr;
+    }
     ++ownership_epoch_;
   }
   void set_view_purger(const DrawBindingsViewPurger* purger) { view_purger_ = purger; }
@@ -179,9 +182,38 @@ class NativeTargetCache {
   std::unordered_map<uint64_t, std::shared_ptr<ColorImage>> owners_;
   std::vector<TileRun> tile_runs_;
   uint64_t next_owner_id_ = 1;
-  TargetKey last_target_key_{};
-  CachedTarget* last_target_ = nullptr;
-  bool last_target_valid_ = false;
+  struct TargetMruSlot {
+    TargetKey key{};
+    CachedTarget* target = nullptr;
+    bool valid = false;
+  };
+  std::array<TargetMruSlot, 4> target_mru_{};
+  void PromoteTargetMru(const TargetKey& key, CachedTarget* target) {
+    for (size_t i = 0; i < target_mru_.size(); ++i) {
+      if (target_mru_[i].valid && target_mru_[i].key == key) {
+        if (i > 0) {
+          const TargetMruSlot hit = target_mru_[i];
+          for (size_t j = i; j > 0; --j) {
+            target_mru_[j] = target_mru_[j - 1];
+          }
+          target_mru_[0] = hit;
+        }
+        return;
+      }
+    }
+    for (size_t j = target_mru_.size() - 1; j > 0; --j) {
+      target_mru_[j] = target_mru_[j - 1];
+    }
+    target_mru_[0] = {key, target, true};
+  }
+  void InvalidateTargetMru(const TargetKey& key) {
+    for (auto& slot : target_mru_) {
+      if (slot.valid && slot.key == key) {
+        slot.valid = false;
+        slot.target = nullptr;
+      }
+    }
+  }
   // Advances whenever a tile changes owner, so targets whose tiles are all
   // still their own skip the ownership scan.
   uint64_t ownership_epoch_ = 1;

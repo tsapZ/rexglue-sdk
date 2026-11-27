@@ -63,8 +63,14 @@ ColorImage::~ColorImage() {
 
 VkImageView ColorImage::GetSampledView(VkComponentMapping swizzle) {
   const uint32_t key = PackTextureComponentMapping(swizzle);
+  if (has_last_sampled_view_ && last_sampled_key_ == key) {
+    return last_sampled_view_;
+  }
   auto found = sampled_views_.find(key);
   if (found != sampled_views_.end()) {
+    last_sampled_key_ = key;
+    last_sampled_view_ = found->second;
+    has_last_sampled_view_ = true;
     return found->second;
   }
   VkImageViewCreateInfo info{};
@@ -80,6 +86,9 @@ VkImageView ColorImage::GetSampledView(VkComponentMapping swizzle) {
     return VK_NULL_HANDLE;
   }
   sampled_views_.emplace(key, view);
+  last_sampled_key_ = key;
+  last_sampled_view_ = view;
+  has_last_sampled_view_ = true;
   return view;
 }
 

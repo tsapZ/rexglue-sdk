@@ -257,12 +257,34 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, Dr
     return true;
   };
 
+  struct SlotSubresourceCache {
+    xenos::xe_gpu_texture_fetch_t fetch{};
+    uint32_t base_page = 0;
+    uint32_t mip_page = 0;
+    uint32_t mip_min = 0;
+    uint32_t mip_max = 0;
+  };
+  std::array<SlotSubresourceCache, xenos::kTextureFetchConstantCount> slot_cache{};
+  uint32_t cached_slot_mask = 0;
+  const auto get_slot_info = [&](uint32_t slot) -> const SlotSubresourceCache& {
+    const uint32_t bit = UINT32_C(1) << slot;
+    if (!(cached_slot_mask & bit)) {
+      cached_slot_mask |= bit;
+      auto& entry = slot_cache[slot];
+      entry.fetch = regs_.GetTextureFetch(slot);
+      texture_util::GetSubresourcesFromFetchConstant(entry.fetch, nullptr, nullptr, nullptr,
+                                                     &entry.base_page, &entry.mip_page,
+                                                     &entry.mip_min, &entry.mip_max);
+    }
+    return slot_cache[slot];
+  };
+
   for (const auto& binding : textures) {
     const uint32_t slot = binding.fetch_constant;
-    const auto fetch = regs_.GetTextureFetch(slot);
-    uint32_t base_page = 0, mip_page = 0;
-    texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &base_page,
-                                                   &mip_page, nullptr, nullptr);
+    const auto& slot_info = get_slot_info(slot);
+    const auto& fetch = slot_info.fetch;
+    const uint32_t base_page = slot_info.base_page;
+    const uint32_t mip_page = slot_info.mip_page;
     // A fetch constant that isn't a usable texture of the binding's dimension
     // reads as zero on the guest - bind a zero-cleared fallback of the same
     // dimension rather than dropping the draw. Its signs stay unsigned.
@@ -313,7 +335,8 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, Dr
   }
 
   for (const auto& sampler : samplers) {
-    const auto fetch = regs_.GetTextureFetch(sampler.fetch_constant);
+    const auto& slot_info = get_slot_info(sampler.fetch_constant);
+    const auto& fetch = slot_info.fetch;
     DrawSampler out;
     out.min_filter =
         ToFilter(sampler.min_filter == xenos::TextureFilter::kUseFetchConst ? fetch.min_filter
@@ -332,9 +355,8 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, Dr
     out.address_v = GetSamplerAddressMode(clamp_y, properties.samplerMirrorClampToEdge);
     out.address_w = GetSamplerAddressMode(clamp_z, properties.samplerMirrorClampToEdge);
     out.border_color = fetch.border_color;
-    uint32_t mip_min = 0, mip_max = 0;
-    texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr,
-                                                   nullptr, &mip_min, &mip_max);
+    const uint32_t mip_min = slot_info.mip_min;
+    const uint32_t mip_max = slot_info.mip_max;
     // LOD bias is applied by the translated shader, so mipLodBias stays 0.
     const bool base_map = mip_filter == xenos::TextureFilter::kBaseMap;
     out.min_lod = float(mip_min);

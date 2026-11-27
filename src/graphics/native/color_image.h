@@ -78,6 +78,9 @@ class ColorImage {
   // Sampler views keyed by PackTextureComponentMapping, created on demand when
   // the image is sampled with different component swizzles.
   std::map<uint32_t, VkImageView> sampled_views_;
+  uint32_t last_sampled_key_ = 0;
+  VkImageView last_sampled_view_ = VK_NULL_HANDLE;
+  bool has_last_sampled_view_ = false;
   VkImageLayout layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
   VkPipelineStageFlags stage_ = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
   VkAccessFlags access_ = 0;

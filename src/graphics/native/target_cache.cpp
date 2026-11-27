@@ -154,16 +154,20 @@ std::shared_ptr<ColorImage> NativeTargetCache::FindTarget(uint32_t tile, uint32_
   const uint32_t sx = scaled ? draw_resolution_scale_x_ : 1;
   const uint32_t sy = scaled ? draw_resolution_scale_y_ : 1;
   const TargetKey key{tile, pitch, samples, format, scaled};
-  if (last_target_valid_ && last_target_key_ == key) {
-    last_target_->last_use_submission = clock_.next;
-    ClaimTiles(*last_target_, tile, pitch, samples, format, is_64bpp, used_height, edram_tile_count,
-               scaled);
-    return last_target_->image;
+  for (size_t i = 0; i < target_mru_.size(); ++i) {
+    if (target_mru_[i].valid && target_mru_[i].key == key) {
+      CachedTarget* target = target_mru_[i].target;
+      if (i > 0) {
+        PromoteTargetMru(key, target);
+      }
+      target->last_use_submission = clock_.next;
+      ClaimTiles(*target, tile, pitch, samples, format, is_64bpp, used_height, edram_tile_count,
+                 scaled);
+      return target->image;
+    }
   }
   if (auto existing = targets_.find(key); existing != targets_.end()) {
-    last_target_key_ = key;
-    last_target_ = &existing->second;
-    last_target_valid_ = true;
+    PromoteTargetMru(key, &existing->second);
     existing->second.last_use_submission = clock_.next;
     ClaimTiles(existing->second, tile, pitch, samples, format, is_64bpp, used_height,
                edram_tile_count, scaled);
@@ -184,10 +188,7 @@ std::shared_ptr<ColorImage> NativeTargetCache::FindTarget(uint32_t tile, uint32_
     }
     if (auto it = targets_.find(*victim); it != targets_.end()) {
       owners_.erase(it->second.owner_id);
-      if (last_target_valid_ && last_target_key_ == *victim) {
-        last_target_valid_ = false;
-        last_target_ = nullptr;
-      }
+      InvalidateTargetMru(*victim);
       targets_.erase(it);
     }
   }
@@ -213,9 +214,7 @@ std::shared_ptr<ColorImage> NativeTargetCache::FindTarget(uint32_t tile, uint32_
   auto& created =
       targets_.emplace(key, CachedTarget{{image, clock_.next}, owner_id}).first->second;
   owners_.emplace(owner_id, image);
-  last_target_key_ = key;
-  last_target_ = &created;
-  last_target_valid_ = true;
+  PromoteTargetMru(key, &created);
   // Inherit the aliased tiles first: a fast clear still pending is newer.
   ClaimTiles(created, tile, pitch, samples, format, is_64bpp, used_height, edram_tile_count,
              scaled);

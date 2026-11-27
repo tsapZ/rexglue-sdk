@@ -121,6 +121,9 @@ class NativeIndexCache {
   WatchRangeFn watch_range_;
   std::vector<Chunk> chunks_;
   std::unordered_map<IndexCacheKey, Entry, IndexCacheKeyHash> entries_;
+  IndexCacheKey last_key_{};
+  Entry* last_entry_ = nullptr;
+  bool last_valid_ = false;
   std::vector<uint64_t> cached_pages_;
   std::vector<uint64_t> scratch_pages_;
   std::vector<uint64_t> recent_invalidated_pages_;

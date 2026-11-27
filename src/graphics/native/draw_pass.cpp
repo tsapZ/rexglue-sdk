@@ -88,8 +88,13 @@ VkImageView CachedTexture::GetOrCreateStorageView(VkFormat format) {
 VkImageView CachedTexture::GetOrCreateView(VkImageViewType view_type, VkFormat format,
                                            VkComponentMapping swizzle, uint32_t array_layers) {
   const uint64_t view_key = (uint64_t(format) << 32) | PackTextureComponentMapping(swizzle);
+  if (last_view != VK_NULL_HANDLE && last_view_key == view_key) {
+    return last_view;
+  }
   if (auto found = views.find(view_key); found != views.end()) {
-    return found->second;
+    last_view_key = view_key;
+    last_view = found->second;
+    return last_view;
   }
   VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   info.image = image;
@@ -103,6 +108,8 @@ VkImageView CachedTexture::GetOrCreateView(VkImageViewType view_type, VkFormat f
     return VK_NULL_HANDLE;
   }
   views.emplace(view_key, image_view);
+  last_view_key = view_key;
+  last_view = image_view;
   return image_view;
 }
 
@@ -598,16 +605,15 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
                                uint32_t(input.vertex_samplers.size()),
                                uint32_t(input.texture_bindings.size()),
                                uint32_t(input.samplers.size())};
-  auto found = binding_cache.find(binding_key);
-  if (found == binding_cache.end()) {
+  bindings_ = binding_cache.FindOrNull(binding_key);
+  if (!bindings_) {
     auto layout = std::make_unique<DrawBindings>(*device_);
     if (!layout->Initialize(binding_key[0], binding_key[1], binding_key[2], binding_key[3],
                             binding_key[4])) {
       return false;
     }
-    found = binding_cache.emplace(binding_key, std::move(layout)).first;
+    bindings_ = binding_cache.Insert(binding_key, std::move(layout));
   }
-  bindings_ = found->second.get();
   for (size_t i = 0; i < sets_.size(); ++i) {
     if (i == 0 && shared_vertex_buffer != VK_NULL_HANDLE) {
       sets_[0] = bindings_->GetOrCreateSharedVertexSet(shared_vertex_buffer, shared_buffer_count);
@@ -937,46 +943,46 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
   const auto& depth = input.depth_stencil;
   const auto& front = depth.front;
   const auto& back = depth.back;
-  DrawPipelineKey key{&vertex,
-                      pixel,
-                      {uint32_t(input.topology),
-                       input.primitive_restart,
-                       input.cull,
-                       uint32_t(input.front_face),
-                       input.color_count,
-                       uint32_t(input.depth_format),
-                       uint32_t(input.samples),
-                       depth.depthTestEnable,
-                       depth.depthWriteEnable,
-                       uint32_t(depth.depthCompareOp),
-                       depth.stencilTestEnable,
-                       uint32_t(front.failOp),
-                       uint32_t(front.passOp),
-                       uint32_t(front.depthFailOp),
-                       uint32_t(front.compareOp),
-                       uint32_t(back.failOp),
-                       uint32_t(back.passOp),
-                       uint32_t(back.depthFailOp),
-                       uint32_t(back.compareOp),
-                       shared_buffer_count,
-                       input.edram_depth_clear_color,
-                       uint32_t(input.depth_clamp_enable),
-                       uint32_t(input.rasterizer_discard)},
-                      {}};
+  DrawPipelineKey key{};
+  key.vertex = &vertex;
+  key.pixel = pixel;
+  key.state0 = (uint64_t(input.topology) & 0xFu) |
+               (uint64_t(input.primitive_restart != 0) << 4) |
+               ((uint64_t(input.cull) & 0x3u) << 5) |
+               ((uint64_t(input.front_face) & 0x1u) << 7) |
+               ((uint64_t(input.color_count) & 0x7u) << 8) |
+               ((uint64_t(input.samples) & 0xFu) << 11) |
+               (uint64_t(depth.depthTestEnable != 0) << 15) |
+               (uint64_t(depth.depthWriteEnable != 0) << 16) |
+               ((uint64_t(depth.depthCompareOp) & 0x7u) << 17) |
+               (uint64_t(depth.stencilTestEnable != 0) << 20) |
+               ((uint64_t(front.failOp) & 0x7u) << 21) |
+               ((uint64_t(front.passOp) & 0x7u) << 24) |
+               ((uint64_t(front.depthFailOp) & 0x7u) << 27) |
+               ((uint64_t(front.compareOp) & 0x7u) << 30) |
+               ((uint64_t(back.failOp) & 0x7u) << 33) |
+               ((uint64_t(back.passOp) & 0x7u) << 36) |
+               ((uint64_t(back.depthFailOp) & 0x7u) << 39) |
+               ((uint64_t(back.compareOp) & 0x7u) << 42) |
+               ((uint64_t(shared_buffer_count) & 0x3Fu) << 45) |
+               (uint64_t(input.edram_depth_clear_color != 0) << 51) |
+               (uint64_t(input.depth_clamp_enable != 0) << 52) |
+               (uint64_t(input.rasterizer_discard != 0) << 53);
+  key.state1 = uint64_t(uint32_t(input.depth_format));
   for (uint32_t i = 0; i < input.color_count; ++i) {
     const auto& color = input.blend[i];
-    key.colors[i] = {uint32_t(input.color_formats[i]),
-                     color.blendEnable,
-                     uint32_t(color.srcColorBlendFactor),
-                     uint32_t(color.dstColorBlendFactor),
-                     uint32_t(color.colorBlendOp),
-                     uint32_t(color.srcAlphaBlendFactor),
-                     uint32_t(color.dstAlphaBlendFactor),
-                     uint32_t(color.alphaBlendOp),
-                     color.colorWriteMask};
+    key.colors[i] = (uint64_t(uint32_t(input.color_formats[i])) & 0xFFFFu) |
+                    (uint64_t(color.blendEnable != 0) << 16) |
+                    ((uint64_t(color.srcColorBlendFactor) & 0x1Fu) << 17) |
+                    ((uint64_t(color.dstColorBlendFactor) & 0x1Fu) << 22) |
+                    ((uint64_t(color.colorBlendOp) & 0x7u) << 27) |
+                    ((uint64_t(color.srcAlphaBlendFactor) & 0x1Fu) << 30) |
+                    ((uint64_t(color.dstAlphaBlendFactor) & 0x1Fu) << 35) |
+                    ((uint64_t(color.alphaBlendOp) & 0x7u) << 40) |
+                    ((uint64_t(color.colorWriteMask) & 0xFu) << 43);
   }
-  if (auto cached = pipelines.find(key); cached != pipelines.end()) {
-    pipeline_ = cached->second;
+  if (const VkPipeline cached = pipelines.FindOrNull(key)) {
+    pipeline_ = cached;
     ops_guard.committed = true;
     return true;
   }
@@ -1065,7 +1071,7 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
   if (result != VK_SUCCESS) {
     return false;
   }
-  pipelines.emplace(key, pipeline_);
+  pipelines.Insert(key, pipeline_);
   ops_guard.committed = true;
   return true;
 }

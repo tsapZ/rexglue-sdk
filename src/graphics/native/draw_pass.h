@@ -52,6 +52,8 @@ struct CachedTexture {
   // Keyed by format (UNORM and SNORM views share MUTABLE_FORMAT images) and
   // PackTextureComponentMapping.
   std::map<uint64_t, VkImageView> views;
+  uint64_t last_view_key = 0;
+  VkImageView last_view = VK_NULL_HANDLE;
   VkImageView storage_view = VK_NULL_HANDLE;
   CachedTexture() = default;
   ~CachedTexture();
@@ -199,34 +201,43 @@ struct DrawInput {
   }
 };
 
-struct DrawPipelineKey {
-  const Shader::Translation* vertex;
-  const Shader::Translation* pixel;
-  std::array<uint32_t, 23> state;
-  std::array<std::array<uint32_t, 9>, xenos::kMaxColorRenderTargets> colors;
-  auto operator<=>(const DrawPipelineKey&) const = default;
-};
+// DrawPipelineKey and DrawPipelineKeyHash are defined in draw_input.h.
 
-// Hashes the explicitly initialized members rather than the raw struct bytes,
-// so the hash never depends on padding between the pointers and the arrays.
-struct DrawPipelineKeyHash {
-  size_t operator()(const DrawPipelineKey& key) const noexcept {
-    uint64_t h = (uintptr_t(key.vertex) * 0x9E3779B97F4A7C15ull) ^
-                 (uintptr_t(key.pixel) * 0xBF58476D1CE4E5B9ull);
-    for (uint32_t v : key.state) {
-      h = (h ^ v) * 0x9E3779B97F4A7C15ull;
+struct DrawPipelines {
+  std::unordered_map<DrawPipelineKey, VkPipeline, DrawPipelineKeyHash> map;
+  DrawPipelineKey last_key{};
+  VkPipeline last_pipeline = VK_NULL_HANDLE;
+  bool has_last = false;
+
+  VkPipeline FindOrNull(const DrawPipelineKey& key) {
+    if (has_last && last_key == key) {
+      return last_pipeline;
     }
-    const uint32_t cc = std::min<uint32_t>(key.state[4], xenos::kMaxColorRenderTargets);
-    for (uint32_t c = 0; c < cc; ++c) {
-      for (uint32_t v : key.colors[c]) {
-        h = (h ^ v) * 0x94D049BB133111EBull;
-      }
+    if (auto it = map.find(key); it != map.end()) {
+      last_key = key;
+      last_pipeline = it->second;
+      has_last = true;
+      return it->second;
     }
-    return size_t(h ^ (h >> 32));
+    return VK_NULL_HANDLE;
   }
+  void Insert(const DrawPipelineKey& key, VkPipeline pipeline) {
+    map.emplace(key, pipeline);
+    last_key = key;
+    last_pipeline = pipeline;
+    has_last = true;
+  }
+  size_t size() const { return map.size(); }
+  void clear() {
+    map.clear();
+    last_pipeline = VK_NULL_HANDLE;
+    has_last = false;
+  }
+  auto begin() { return map.begin(); }
+  auto end() { return map.end(); }
+  auto begin() const { return map.begin(); }
+  auto end() const { return map.end(); }
 };
-
-using DrawPipelines = std::unordered_map<DrawPipelineKey, VkPipeline, DrawPipelineKeyHash>;
 constexpr size_t kDrawUploadPageSize = 16 * 1024 * 1024;
 constexpr VkBufferUsageFlags kDrawUploadUsage =
     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -302,7 +313,51 @@ struct DrawBindings {
 
 // Keyed by {shared buffer count, vertex images, vertex samplers, pixel images,
 // pixel samplers}.
-using DrawBindingCache = std::map<std::array<uint32_t, 5>, std::unique_ptr<DrawBindings>>;
+struct DrawBindingKeyHash {
+  size_t operator()(const std::array<uint32_t, 5>& key) const noexcept {
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (uint32_t v : key) {
+      h = (h ^ v) * 0xBF58476D1CE4E5B9ull;
+    }
+    return size_t(h ^ (h >> 32));
+  }
+};
+
+struct DrawBindingCache {
+  std::unordered_map<std::array<uint32_t, 5>, std::unique_ptr<DrawBindings>, DrawBindingKeyHash> map;
+  std::array<uint32_t, 5> last_key{};
+  DrawBindings* last_bindings = nullptr;
+  bool has_last = false;
+
+  DrawBindings* FindOrNull(const std::array<uint32_t, 5>& key) {
+    if (has_last && last_key == key) {
+      return last_bindings;
+    }
+    if (auto it = map.find(key); it != map.end()) {
+      last_key = key;
+      last_bindings = it->second.get();
+      has_last = true;
+      return last_bindings;
+    }
+    return nullptr;
+  }
+  DrawBindings* Insert(const std::array<uint32_t, 5>& key, std::unique_ptr<DrawBindings> value) {
+    auto [it, _] = map.emplace(key, std::move(value));
+    last_key = key;
+    last_bindings = it->second.get();
+    has_last = true;
+    return last_bindings;
+  }
+  void clear() {
+    map.clear();
+    last_bindings = nullptr;
+    has_last = false;
+  }
+  auto begin() { return map.begin(); }
+  auto end() { return map.end(); }
+  auto begin() const { return map.begin(); }
+  auto end() const { return map.end(); }
+};
 
 struct PreuploadedConstants {
   VkBuffer buffer = VK_NULL_HANDLE;

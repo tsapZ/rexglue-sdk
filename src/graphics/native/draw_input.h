@@ -2138,4 +2138,50 @@ struct TextureSetKeyEqual {
   }
 };
 
+// 64-byte bit-packed graphics pipeline key (all unused/padding bits are 0).
+struct DrawPipelineKey {
+  const void* vertex = nullptr;
+  const void* pixel = nullptr;
+  uint64_t state0 = 0;
+  uint64_t state1 = 0;
+  std::array<uint64_t, xenos::kMaxColorRenderTargets> colors{};
+  bool operator==(const DrawPipelineKey&) const = default;
+};
+static_assert(sizeof(DrawPipelineKey) == 64);
+
+struct DrawPipelineKeyHash {
+  size_t operator()(const DrawPipelineKey& key) const noexcept {
+    uint64_t h = (uintptr_t(key.vertex) * 0x9E3779B97F4A7C15ull) ^
+                 (uintptr_t(key.pixel) * 0xBF58476D1CE4E5B9ull) ^
+                 (key.state0 * 0x94D049BB133111EBull) ^
+                 (key.state1 * 0xD6E8FEB86659FD93ull);
+    const uint32_t cc = std::min<uint32_t>(uint32_t((key.state0 >> 8) & 0x7u),
+                                           xenos::kMaxColorRenderTargets);
+    for (uint32_t c = 0; c < cc; ++c) {
+      h = (h ^ key.colors[c]) * 0x94D049BB133111EBull;
+    }
+    return size_t(h ^ (h >> 32));
+  }
+};
+
+// Copies active float4 constants according to a 256-bit bitmap in contiguous runs.
+inline void CopyFloatConstantBitmap(uint8_t* __restrict dst, const uint32_t* __restrict src_base,
+                                    std::span<const uint64_t, 4> bitmap) {
+  for (uint32_t w = 0; w < 4; ++w) {
+    uint64_t bits = bitmap[w];
+    while (bits) {
+      const uint32_t start = uint32_t(std::countr_zero(bits));
+      const uint64_t shifted = bits >> start;
+      const uint32_t run = uint32_t(std::countr_one(shifted));
+      const size_t bytes = size_t(run) * 16;
+      std::memcpy(dst, src_base + ((w * 64 + start) << 2), bytes);
+      dst += bytes;
+      if (start + run >= 64) {
+        break;
+      }
+      bits &= ~(((uint64_t(1) << run) - 1) << start);
+    }
+  }
+}
+
 }  // namespace rex::graphics::native

@@ -49,6 +49,21 @@ void PurgeDrawBindingsSampler(void* context, VkSampler sampler) {
   }
 }
 
+bool BitmapOverlapsVec4Range(const std::array<uint64_t, 4>& bitmap, uint32_t first_vec4,
+                             uint32_t end_vec4_exclusive) {
+  for (uint32_t v = first_vec4; v < end_vec4_exclusive;) {
+    const uint32_t word = v >> 6;
+    const uint32_t bit = v & 63;
+    const uint32_t count = std::min(64 - bit, end_vec4_exclusive - v);
+    const uint64_t mask = (count == 64 ? ~uint64_t(0) : ((uint64_t(1) << count) - 1)) << bit;
+    if (bitmap[word] & mask) {
+      return true;
+    }
+    v += count;
+  }
+  return false;
+}
+
 }  // namespace
 namespace {
 
@@ -445,6 +460,8 @@ void NativeCommandProcessor::ShutdownContext() {
   output_gamma_.reset();
   translator_.reset();
   active_vertex_shader_ = active_pixel_shader_ = nullptr;
+  last_shader_ = nullptr;
+  last_shader_addr_key_ = 0;
   shader_addr_cache_.clear();
   shader_pages_.clear();
   shaders_.clear();
@@ -585,10 +602,18 @@ void NativeCommandProcessor::FlushShaderStorage() {
 void NativeCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   CommandProcessor::WriteRegister(index, value);
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_255_W) {
-    dirty_constants_ |= UINT32_C(1) << Translator::kConstantBufferFloatVertex;
+    const uint32_t vec4 = (index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+    if (!has_last_float_bitmaps_ ||
+        (last_vs_float_bitmap_[vec4 >> 6] & (UINT64_C(1) << (vec4 & 63))) != 0) {
+      dirty_constants_ |= UINT32_C(1) << Translator::kConstantBufferFloatVertex;
+    }
   } else if (index >= XE_GPU_REG_SHADER_CONSTANT_256_X &&
              index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
-    dirty_constants_ |= UINT32_C(1) << Translator::kConstantBufferFloatPixel;
+    const uint32_t vec4 = (index - XE_GPU_REG_SHADER_CONSTANT_256_X) >> 2;
+    if (!has_last_float_bitmaps_ ||
+        (last_ps_float_bitmap_[vec4 >> 6] & (UINT64_C(1) << (vec4 & 63))) != 0) {
+      dirty_constants_ |= UINT32_C(1) << Translator::kConstantBufferFloatPixel;
+    }
   } else if (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
              index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
     dirty_constants_ |= UINT32_C(1) << Translator::kConstantBufferBoolLoop;
@@ -604,14 +629,34 @@ void NativeCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
     return;
   }
   const uint32_t end_index = start_index + num_registers - 1;
+  if (!log_unknown_register_writes() && start_index >= 0x2000 && end_index <= 0x3FFF) {
+    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    return;
+  }
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
     if (start_index <= XE_GPU_REG_SHADER_CONSTANT_255_W) {
-      dirty_constants_ |= UINT32_C(1) << Translator::kConstantBufferFloatVertex;
+      const uint32_t vs_first = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      const uint32_t vs_last =
+          (std::min(end_index, uint32_t(XE_GPU_REG_SHADER_CONSTANT_255_W)) -
+           XE_GPU_REG_SHADER_CONSTANT_000_X) >>
+          2;
+      if (!has_last_float_bitmaps_ ||
+          BitmapOverlapsVec4Range(last_vs_float_bitmap_, vs_first, vs_last + 1)) {
+        dirty_constants_ |= UINT32_C(1) << Translator::kConstantBufferFloatVertex;
+      }
     }
     if (end_index >= XE_GPU_REG_SHADER_CONSTANT_256_X) {
-      dirty_constants_ |= UINT32_C(1) << Translator::kConstantBufferFloatPixel;
+      const uint32_t ps_first =
+          (std::max(start_index, uint32_t(XE_GPU_REG_SHADER_CONSTANT_256_X)) -
+           XE_GPU_REG_SHADER_CONSTANT_256_X) >>
+          2;
+      const uint32_t ps_last = (end_index - XE_GPU_REG_SHADER_CONSTANT_256_X) >> 2;
+      if (!has_last_float_bitmaps_ ||
+          BitmapOverlapsVec4Range(last_ps_float_bitmap_, ps_first, ps_last + 1)) {
+        dirty_constants_ |= UINT32_C(1) << Translator::kConstantBufferFloatPixel;
+      }
     }
     return;
   }
@@ -642,9 +687,15 @@ Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type,
       memory_->TranslatePhysical(guest_address) == reinterpret_cast<const uint8_t*>(host_address);
   const uint64_t addr_key = (uint64_t(guest_address) << 32) | dword_count;
   if (cacheable_addr) {
+    if (last_shader_ && last_shader_addr_key_ == addr_key &&
+        last_shader_->type() == shader_type) {
+      return last_shader_;
+    }
     if (auto found = shader_addr_cache_.find(addr_key);
         found != shader_addr_cache_.end() && found->second->type() == shader_type) {
-      return found->second;
+      last_shader_addr_key_ = addr_key;
+      last_shader_ = found->second;
+      return last_shader_;
     }
   }
   const uint64_t hash = XXH3_64bits(host_address, byte_count);
@@ -664,6 +715,8 @@ Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type,
         AtomicSetPageRangeBits(shader_pages_, first_page, page_count);
         WatchPhysicalRange(guest_address, byte_count);
         shader_addr_cache_.emplace(addr_key, &shader);
+        last_shader_addr_key_ = addr_key;
+        last_shader_ = &shader;
       }
       return &shader;
     }
@@ -675,6 +728,8 @@ Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type,
     AtomicSetPageRangeBits(shader_pages_, first_page, page_count);
     WatchPhysicalRange(guest_address, byte_count);
     shader_addr_cache_.emplace(addr_key, ptr);
+    last_shader_addr_key_ = addr_key;
+    last_shader_ = ptr;
   }
   return ptr;
 }
@@ -706,6 +761,10 @@ void NativeCommandProcessor::DrainMemoryInvalidations() {
           const uint32_t s_addr = uint32_t(it->first >> 32);
           const uint32_t s_len = uint32_t(it->first) * uint32_t(sizeof(uint32_t));
           if (RangesOverlap(start, length, s_addr, s_len)) {
+            if (last_shader_addr_key_ == it->first) {
+              last_shader_ = nullptr;
+              last_shader_addr_key_ = 0;
+            }
             it = shader_addr_cache_.erase(it);
           } else {
             ++it;
@@ -891,6 +950,7 @@ bool NativeCommandProcessor::PreparePreuploadedConstants(const DrawInput& input,
       }
     }
   }
+  has_last_float_bitmaps_ = true;
   if (!has_last_system_constants_ ||
       std::memcmp(&last_system_constants_, &input.system, sizeof(input.system)) != 0) {
     dirty_constants_ |= UINT32_C(1) << Translator::kConstantBufferSystem;
@@ -915,14 +975,17 @@ bool NativeCommandProcessor::PreparePreuploadedConstants(const DrawInput& input,
 
   const VkDeviceSize align = vulkan_device_->properties().minUniformBufferOffsetAlignment;
   auto compute_dirty_layout = [&](uint32_t mask,
-                                  std::array<VkDeviceSize, Translator::kConstantBufferCount>& rel) {
+                                  std::array<VkDeviceSize, Translator::kConstantBufferCount>& rel,
+                                  VkDeviceSize& max_dynamic_end) {
     VkDeviceSize sz = 0;
+    max_dynamic_end = 0;
     for (uint32_t i = 0; i < Translator::kConstantBufferCount; ++i) {
       if (!(mask & (UINT32_C(1) << i))) {
         continue;
       }
       sz = rex::align(sz, align);
       rel[i] = sz;
+      max_dynamic_end = std::max<VkDeviceSize>(max_dynamic_end, sz + kDynamicConstantBufferRanges[i]);
       VkDeviceSize bytes = 16;
       switch (i) {
         case Translator::kConstantBufferSystem:
@@ -944,11 +1007,6 @@ bool NativeCommandProcessor::PreparePreuploadedConstants(const DrawInput& input,
       }
       sz += bytes;
     }
-    for (uint32_t i = 0; i < Translator::kConstantBufferCount; ++i) {
-      if (mask & (UINT32_C(1) << i)) {
-        sz = std::max<VkDeviceSize>(sz, rel[i] + kDynamicConstantBufferRanges[i]);
-      }
-    }
     return sz;
   };
 
@@ -959,19 +1017,33 @@ bool NativeCommandProcessor::PreparePreuploadedConstants(const DrawInput& input,
   }
 
   std::array<VkDeviceSize, Translator::kConstantBufferCount> rel_offsets{};
-  VkDeviceSize req_size = compute_dirty_layout(upload_mask, rel_offsets);
+  VkDeviceSize max_dynamic_end = 0;
+  VkDeviceSize req_size = compute_dirty_layout(upload_mask, rel_offsets, max_dynamic_end);
   VkBuffer buf = VK_NULL_HANDLE;
   VkDeviceSize buf_off = 0;
   uint8_t* mapped = draw_uploads_->Request(clock_.next, req_size, align, buf, buf_off);
   if (!mapped) {
     return false;
   }
+  if (buf_off + max_dynamic_end > kDrawUploadPageSize) {
+    // Near page end: force a fresh page so dynamic UBO ranges stay within kDrawUploadPageSize.
+    mapped = draw_uploads_->Request(clock_.next, max_dynamic_end, align, buf, buf_off);
+    if (!mapped) {
+      return false;
+    }
+  }
   if (buf != last_constant_buffer_ && upload_mask != kAllConstantBuffersMask) {
     upload_mask = kAllConstantBuffersMask;
-    req_size = compute_dirty_layout(upload_mask, rel_offsets);
+    req_size = compute_dirty_layout(upload_mask, rel_offsets, max_dynamic_end);
     mapped = draw_uploads_->Request(clock_.next, req_size, align, buf, buf_off);
     if (!mapped) {
       return false;
+    }
+    if (buf_off + max_dynamic_end > kDrawUploadPageSize) {
+      mapped = draw_uploads_->Request(clock_.next, max_dynamic_end, align, buf, buf_off);
+      if (!mapped) {
+        return false;
+      }
     }
   }
 
@@ -990,33 +1062,16 @@ bool NativeCommandProcessor::PreparePreuploadedConstants(const DrawInput& input,
         if (vs_map.float_count == 0) {
           std::memset(dst, 0, 16);
         } else {
-          for (uint32_t w = 0; w < 4; ++w) {
-            uint64_t bits = vs_map.float_bitmap[w];
-            while (bits) {
-              const uint32_t b = uint32_t(std::countr_zero(bits));
-              bits &= bits - 1;
-              std::memcpy(dst, &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + ((w * 64 + b) << 2)],
-                          16);
-              dst += 16;
-            }
-          }
+          CopyFloatConstantBitmap(dst, &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X],
+                                  vs_map.float_bitmap);
         }
         break;
       case Translator::kConstantBufferFloatPixel:
         if (!ps || ps->constant_register_map().float_count == 0) {
           std::memset(dst, 0, 16);
         } else {
-          const auto& pmap = ps->constant_register_map();
-          for (uint32_t w = 0; w < 4; ++w) {
-            uint64_t bits = pmap.float_bitmap[w];
-            while (bits) {
-              const uint32_t b = uint32_t(std::countr_zero(bits));
-              bits &= bits - 1;
-              std::memcpy(dst, &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X + ((w * 64 + b) << 2)],
-                          16);
-              dst += 16;
-            }
-          }
+          CopyFloatConstantBitmap(dst, &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X],
+                                  ps->constant_register_map().float_bitmap);
         }
         break;
       case Translator::kConstantBufferBoolLoop:

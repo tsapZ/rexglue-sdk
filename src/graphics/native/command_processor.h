@@ -221,8 +221,10 @@ class NativeCommandProcessor : public CommandProcessor {
   uint32_t last_submitted_frame_ = 0;
   // Command buffer of the slot being recorded.
   VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
-  std::multimap<uint64_t, std::unique_ptr<SpirvShader>> shaders_;
+  std::unordered_multimap<uint64_t, std::unique_ptr<SpirvShader>> shaders_;
   std::unordered_map<uint64_t, SpirvShader*> shader_addr_cache_;
+  uint64_t last_shader_addr_key_ = 0;
+  SpirvShader* last_shader_ = nullptr;
   std::vector<uint64_t> shader_pages_;
   std::vector<uint64_t> watched_pages_;
   std::unique_ptr<SpirvShaderTranslator> translator_;
@@ -249,10 +251,12 @@ class NativeCommandProcessor : public CommandProcessor {
   std::array<uint64_t, 4> last_ps_float_bitmap_{};
   SpirvShaderTranslator::SystemConstants last_system_constants_{};
   bool has_last_system_constants_ = false;
+  bool has_last_float_bitmaps_ = false;
   void InvalidateConstantState() {
     dirty_constants_ = kAllConstantBuffersMask;
     last_constant_buffer_ = VK_NULL_HANDLE;
     has_last_system_constants_ = false;
+    has_last_float_bitmaps_ = false;
   }
   bool PreparePreuploadedConstants(const DrawInput& input, const SpirvShader& vs,
                                    const SpirvShader* ps, bool use_shared_vertices,
