@@ -38,7 +38,9 @@ REXCVAR_DEFINE_BOOL(d3d12_break_on_warning, false, "UI/D3D12",
                     "Break on Direct3D 12 validation warnings");
 
 REXCVAR_DEFINE_INT32(d3d12_adapter, -1, "UI/D3D12",
-                     "Index of the DXGI adapter to use (-1 for any physical, -2 for WARP)")
+                     "Index of the DXGI adapter to use, in EnumAdapters1's order (-2 for WARP; "
+                     "-1 or any other negative value: the first physical adapter in Windows' "
+                     "high-performance order)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_INT32(d3d12_queue_priority, 1, "UI/D3D12",
@@ -268,19 +270,22 @@ bool D3D12Provider::Initialize() {
     return false;
   }
 
-  // Choose the adapter. For "any physical adapter" (-1) in Windows' high-performance order when the factory
-  // has it: EnumAdapters1 lists the adapter the screen hangs on first, which on a laptop with switchable
-  // graphics is the processor's own. An Intel UHD 630 next to a GTX 1060 drew Spyro's Adventure as coloured
-  // blocks (Core of Light #164). An index (d3d12_adapter >= 0) keeps meaning EnumAdapters1's order.
-  // Every negative value but -2 (WARP) means "any physical adapter" in the loop below, so all of them take this order.
+  // Choose the adapter. "Any physical adapter" (every negative value but -2, WARP) goes in Windows'
+  // high-performance order when the factory has it: EnumAdapters1 lists the adapter the screen
+  // hangs on first, which on a laptop with switchable graphics is the processor's own. An Intel
+  // UHD 630 next to a GTX 1060 drew Spyro's Adventure as coloured blocks (Core of Light #164). That
+  // order also wins over a "Power saving" choice in Windows' graphics settings (accepted: the games
+  // need the fast card); d3d12_adapter >= 0 picks by EnumAdapters1's index instead.
   Microsoft::WRL::ComPtr<IDXGIFactory6> dxgi_factory6;
   if (REXCVAR_GET(d3d12_adapter) < 0 && REXCVAR_GET(d3d12_adapter) != -2) {
     dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory6));
   }
   auto enum_adapter = [&](uint32_t index, IDXGIAdapter1** adapter_out) {
-    return dxgi_factory6 ? dxgi_factory6->EnumAdapterByGpuPreference(
-                               index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(adapter_out))
-                         : dxgi_factory->EnumAdapters1(index, adapter_out);
+    if (dxgi_factory6) {
+      return dxgi_factory6->EnumAdapterByGpuPreference(index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                       IID_PPV_ARGS(adapter_out));
+    }
+    return dxgi_factory->EnumAdapters1(index, adapter_out);
   };
   uint32_t adapter_index = 0;
   IDXGIAdapter1* adapter = nullptr;

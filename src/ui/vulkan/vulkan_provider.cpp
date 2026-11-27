@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 #include <unordered_map>
 #include <vector>
 
@@ -68,12 +69,38 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
   REXLOG_WARN(
       "Available Vulkan physical devices (use the 'vulkan_device' "
       "configuration variable to force a specific device):");
+  // By kind for the automatic pick below: a discrete card, then the processor's own graphics, a
+  // virtual one, anything else, and a software rasterizer (llvmpipe, lavapipe) last.
+  const auto kind_rank = [](VkPhysicalDeviceType type) {
+    switch (type) {
+      case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+        return 0;
+      case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+        return 1;
+      case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+        return 2;
+      case VK_PHYSICAL_DEVICE_TYPE_CPU:
+        return 4;
+      default:
+        return 3;
+    }
+  };
+#if !defined(_WIN32)
+  // A card the user picked for this process (DRI_PRIME, Mesa's device-select layer) comes first in
+  // the loader's order: then that order stands.
+  const bool user_picked = std::getenv("DRI_PRIME") || std::getenv("MESA_VK_DEVICE_SELECT");
+#else
+  const bool user_picked = false;
+#endif
+  std::unordered_map<VkPhysicalDevice, int> device_rank;
   for (size_t physical_device_index = 0; physical_device_index < physical_devices.size();
        ++physical_device_index) {
     VkPhysicalDeviceProperties physical_device_properties;
     ifn.vkGetPhysicalDeviceProperties(physical_devices[physical_device_index],
                                       &physical_device_properties);
     REXLOG_WARN("* {}: {}", physical_device_index, physical_device_properties.deviceName);
+    device_rank[physical_devices[physical_device_index]] =
+        user_picked ? 0 : kind_rank(physical_device_properties.deviceType);
   }
 
   if (REXCVAR_GET(vulkan_device) >= 0 &&
@@ -84,35 +111,15 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
   }
 
   if (!provider->vulkan_device_) {
-    // By kind first: a discrete card, then the processor's own graphics, a virtual one, anything else, and a
-    // software rasterizer (llvmpipe, lavapipe) last; in the loader's order among equals. On a laptop the
-    // integrated one can come first, and D3D12 took exactly that one (Core of Light #164: an Intel UHD 630
-    // next to a GTX 1060). The feature score below only orders cards of the same kind: a discrete card that
-    // lacks one preferred feature is still far faster than integrated graphics that have it.
-    const auto kind_rank = [](VkPhysicalDeviceType type) {
-      switch (type) {
-        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
-          return 0;
-        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
-          return 1;
-        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
-          return 2;
-        case VK_PHYSICAL_DEVICE_TYPE_CPU:
-          return 4;
-        default:
-          return 3;
-      }
-    };
-    std::unordered_map<VkPhysicalDevice, int> device_rank;
-    for (const VkPhysicalDevice physical_device : physical_devices) {
-      VkPhysicalDeviceProperties properties;
-      ifn.vkGetPhysicalDeviceProperties(physical_device, &properties);
-      device_rank[physical_device] = kind_rank(properties.deviceType);
-    }
+    // By kind first (device_rank above), in the loader's order among equals. On a laptop
+    // the integrated graphics can come first, and D3D12 took exactly those (Core of Light
+    // #164: an Intel UHD 630 next to a GTX 1060). The feature score below only orders cards
+    // of one kind: a discrete card without one preferred feature is still far faster than
+    // integrated graphics with it.
     std::vector<VkPhysicalDevice> physical_devices_ordered = physical_devices;
     std::stable_sort(physical_devices_ordered.begin(), physical_devices_ordered.end(),
                      [&device_rank](VkPhysicalDevice a, VkPhysicalDevice b) {
-                       return device_rank[a] < device_rank[b];
+                       return device_rank.at(a) < device_rank.at(b);
                      });
     bool prefer_geometry_shader = REXCVAR_GET(vulkan_prefer_geometry_shader);
     bool prefer_fragment_stores = REXCVAR_GET(vulkan_prefer_fragment_stores_and_atomics);
@@ -148,13 +155,14 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
 
       std::stable_sort(scored_devices.begin(), scored_devices.end(),
                        [&device_rank](const PhysicalDeviceScore& a, const PhysicalDeviceScore& b) {
-                         const int rank_a = device_rank[a.physical_device];
-                         const int rank_b = device_rank[b.physical_device];
+                         const int rank_a = device_rank.at(a.physical_device);
+                         const int rank_b = device_rank.at(b.physical_device);
                          return rank_a != rank_b ? rank_a < rank_b : a.score > b.score;
                        });
 
-      // Taken as it is: with every score equal it is the kind order above (both sorts are stable), and comparing
-      // only the first and last score would miss a difference between two cards of one kind in the middle.
+      // Taken as it is: with every score equal it is the kind order above (both sorts are
+      // stable), and comparing only the first and last score would miss a difference between
+      // two cards of one kind in the middle.
       physical_devices_ordered.clear();
       for (const PhysicalDeviceScore& scored_device : scored_devices) {
         physical_devices_ordered.push_back(scored_device.physical_device);
