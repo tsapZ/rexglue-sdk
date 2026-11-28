@@ -88,9 +88,14 @@ void NativeTextureCache::InvalidateAll() {
   for (auto& w : resolved_pages_) {
     std::atomic_ref<uint64_t>(w).store(0, std::memory_order_relaxed);
   }
+  ++cache_epoch_;
 }
 
 void NativeTextureCache::ClearSamplers() {
+  for (auto& slot : sampler_mru_) {
+    slot.valid = false;
+    slot.last_use = nullptr;
+  }
   for (const auto& entry : samplers_) {
     if (view_purger_) {
       view_purger_->PurgeSampler(entry.second.sampler);
@@ -236,9 +241,43 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, Dr
   auto& texture_bindings = vertex ? input.vertex_texture_bindings : input.texture_bindings;
   auto& sampler_handles = vertex ? input.vertex_samplers : input.samplers;
   const auto read = [&](uint32_t slot, const xenos::xe_gpu_texture_fetch_t& fetch,
-                        bool signed_variant) {
+                        uint32_t swizzle_signs, bool signed_variant) {
+    std::array<uint32_t, 6> dwords{};
+    std::memcpy(dwords.data(), &fetch, sizeof(dwords));
+    const size_t cache_idx =
+        (dwords[0] ^ dwords[1] ^ (slot * 7u) ^ (signed_variant ? 16u : 0u)) & 31u;
+    auto& fast = raw_fetch_cache_[cache_idx];
+    if (fast.valid && fast.epoch == cache_epoch_ && fast.slot == slot &&
+        fast.signed_variant == signed_variant && fast.dwords == dwords) {
+      fast.cached_entry->last_use_submission = clock_.next;
+      fast.cached_entry->texture->last_use_submission = clock_.next;
+      auto& texture = input.textures.emplace_back();
+      texture.width = fast.width;
+      texture.height = fast.height;
+      texture.depth = fast.depth;
+      texture.array_layers = fast.array_layers;
+      texture.level_count = fast.level_count;
+      texture.format = fast.format;
+      texture.mutable_format = fast.mutable_format;
+      texture.view_type = fast.view_type;
+      texture.host_swizzle = fast.host_swizzle;
+      texture.swizzle = fast.swizzle;
+      texture.cached_texture = KeepTextureAlive(fast.cached_entry->texture);
+      texture.cached_view = fast.cached_view;
+      texture.upload_cached = false;
+      texture.resolution_scaled = fast.resolution_scaled;
+      input.system.texture_swizzled_signs[slot / 4] |= swizzle_signs << ((slot % 4) * 8);
+      if (texture.resolution_scaled) {
+        input.system.textures_resolution_scaled |= uint32_t(1) << slot;
+      }
+      if (!properties.imageViewFormatSwizzle) {
+        PackSystemTextureSwizzle(input.system.texture_swizzles, slot, texture.host_swizzle);
+      }
+      return true;
+    }
     auto& texture = input.textures.emplace_back();
-    if (!ReadTexture(fetch, texture, signed_variant, uploads, submission)) {
+    CachedTextureEntry* cached_entry = nullptr;
+    if (!ReadTexture(fetch, texture, signed_variant, uploads, submission, &cached_entry)) {
       REXGPU_DEBUG(
           "Native Vulkan texture {} unsupported: format={} dimension={} base={:05X} "
           "flags={:08X}/{:08X}",
@@ -246,8 +285,27 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, Dr
           fetch.dword_4, fetch.dword_5);
       return false;
     }
-    input.system.texture_swizzled_signs[slot / 4] |= uint32_t(texture_util::SwizzleSigns(fetch))
-                                                     << ((slot % 4) * 8);
+    if (!texture.upload_cached && cached_entry != nullptr) {
+      fast.epoch = cache_epoch_;
+      fast.dwords = dwords;
+      fast.slot = uint8_t(slot);
+      fast.signed_variant = signed_variant;
+      fast.valid = true;
+      fast.width = texture.width;
+      fast.height = texture.height;
+      fast.depth = texture.depth;
+      fast.array_layers = texture.array_layers;
+      fast.level_count = texture.level_count;
+      fast.format = texture.format;
+      fast.mutable_format = texture.mutable_format;
+      fast.view_type = texture.view_type;
+      fast.host_swizzle = texture.host_swizzle;
+      fast.swizzle = texture.swizzle;
+      fast.cached_entry = cached_entry;
+      fast.cached_view = texture.cached_view;
+      fast.resolution_scaled = texture.resolution_scaled;
+    }
+    input.system.texture_swizzled_signs[slot / 4] |= swizzle_signs << ((slot % 4) * 8);
     if (texture.resolution_scaled) {
       input.system.textures_resolution_scaled |= uint32_t(1) << slot;
     }
@@ -259,6 +317,8 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, Dr
 
   struct SlotSubresourceCache {
     xenos::xe_gpu_texture_fetch_t fetch{};
+    TextureFormatInfo info{};
+    uint32_t swizzle_signs = 0;
     uint32_t base_page = 0;
     uint32_t mip_page = 0;
     uint32_t mip_min = 0;
@@ -272,6 +332,8 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, Dr
       cached_slot_mask |= bit;
       auto& entry = slot_cache[slot];
       entry.fetch = regs_.GetTextureFetch(slot);
+      entry.info = GetTextureFormatInfo(entry.fetch.format);
+      entry.swizzle_signs = texture_util::SwizzleSigns(entry.fetch);
       texture_util::GetSubresourcesFromFetchConstant(entry.fetch, nullptr, nullptr, nullptr,
                                                      &entry.base_page, &entry.mip_page,
                                                      &entry.mip_min, &entry.mip_max);
@@ -301,9 +363,9 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, Dr
     }
     // A signed binding is only sampled for the signed components, and float
     // formats are signed in their unsigned view already.
-    const TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
+    const TextureFormatInfo& info = slot_info.info;
     const bool sampled_signed =
-        binding.is_signed && texture_util::IsAnySignSigned(texture_util::SwizzleSigns(fetch));
+        binding.is_signed && texture_util::IsAnySignSigned(slot_info.swizzle_signs);
     if (sampled_signed && info.signed_format == VK_FORMAT_UNDEFINED) {
       REXGPU_DEBUG("Native Vulkan texture {} format {} has no signed host format", slot,
                    uint32_t(fetch.format));
@@ -316,7 +378,7 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, Dr
         // The unsigned texels, viewed through the SNORM format.
         int& unsigned_index = input.texture_indices[slot * 2];
         if (unsigned_index < 0) {
-          if (!read(slot, fetch, false)) {
+          if (!read(slot, fetch, slot_info.swizzle_signs, false)) {
             return false;
           }
           unsigned_index = int(input.textures.size() - 1);
@@ -326,7 +388,7 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, Dr
           return false;
         }
         input.textures.push_back(std::move(texture));
-      } else if (!read(slot, fetch, signed_variant)) {
+      } else if (!read(slot, fetch, slot_info.swizzle_signs, signed_variant)) {
         return false;
       }
       index = int(input.textures.size() - 1);
@@ -371,8 +433,8 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, Dr
     out.max_anisotropy = GetSamplerAnisotropy(
         aniso, REXCVAR_GET(anisotropic_override), override_eligible,
         properties.samplerAnisotropy ? properties.maxSamplerAnisotropy : 0.0f);
-    const TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
-    const bool any_signed = texture_util::IsAnySignSigned(texture_util::SwizzleSigns(fetch));
+    const TextureFormatInfo& info = slot_info.info;
+    const bool any_signed = texture_util::IsAnySignSigned(slot_info.swizzle_signs);
     const bool linear_filterable =
         info.format != VK_FORMAT_UNDEFINED && IsLinearFilterable(fetch.format, info.format) &&
         (!any_signed || info.signed_format == VK_FORMAT_UNDEFINED ||
@@ -421,9 +483,26 @@ bool NativeTextureCache::IsLinearFilterable(xenos::TextureFormat guest_format, V
 }
 
 VkSampler NativeTextureCache::GetSampler(const DrawSampler& key) {
+  for (size_t i = 0; i < sampler_mru_.size(); ++i) {
+    if (sampler_mru_[i].valid && sampler_mru_[i].key == key) {
+      const SamplerMruSlot hit = sampler_mru_[i];
+      if (i > 0) {
+        for (size_t j = i; j > 0; --j) {
+          sampler_mru_[j] = sampler_mru_[j - 1];
+        }
+        sampler_mru_[0] = hit;
+      }
+      *hit.last_use = clock_.next;
+      return hit.sampler;
+    }
+  }
   auto existing = samplers_.find(key);
   if (existing != samplers_.end()) {
     existing->second.last_use_submission = clock_.next;
+    for (size_t j = sampler_mru_.size() - 1; j > 0; --j) {
+      sampler_mru_[j] = sampler_mru_[j - 1];
+    }
+    sampler_mru_[0] = {key, existing->second.sampler, &existing->second.last_use_submission, true};
     return existing->second.sampler;
   }
   const auto& properties = device_.properties();
@@ -435,6 +514,12 @@ VkSampler NativeTextureCache::GetSampler(const DrawSampler& key) {
       return VK_NULL_HANDLE;
     }
     auto victim_it = samplers_.find(*victim);
+    for (auto& slot : sampler_mru_) {
+      if (slot.valid && slot.sampler == victim_it->second.sampler) {
+        slot.valid = false;
+        slot.last_use = nullptr;
+      }
+    }
     custom_border_color_samplers_ -= victim_it->second.custom_border_color ? 1 : 0;
     if (view_purger_) {
       view_purger_->PurgeSampler(victim_it->second.sampler);
@@ -660,6 +745,7 @@ void NativeTextureCache::InvalidateRanges(std::span<const PhysicalRange> ranges,
           RemoveTextureFromBuckets(*key, *it->second.texture, &dirty_buckets);
           cached_textures_.erase(it);
         }
+        ++cache_epoch_;
         if (!cached_only_pages_.empty()) {
           std::sort(dirty_buckets.begin(), dirty_buckets.end());
           dirty_buckets.erase(std::unique(dirty_buckets.begin(), dirty_buckets.end()),
@@ -693,6 +779,7 @@ void NativeTextureCache::InvalidateRanges(std::span<const PhysicalRange> ranges,
       if (resolves_erased) {
         PruneResolvedDependents();
         RecomputeResolvedPages();
+        ++cache_epoch_;
       }
     }
   }
@@ -743,6 +830,7 @@ std::shared_ptr<CachedTexture> NativeTextureCache::GetOrCreateCachedTexture(
           std::vector<uint32_t> dirty_buckets;
           RemoveTextureFromBuckets(vit->first, *vit->second.texture, &dirty_buckets);
           cache.erase(vit);
+          ++cache_epoch_;
           if (!cached_only_pages_.empty()) {
             std::sort(dirty_buckets.begin(), dirty_buckets.end());
             dirty_buckets.erase(std::unique(dirty_buckets.begin(), dirty_buckets.end()),
@@ -782,7 +870,8 @@ std::shared_ptr<CachedTexture> NativeTextureCache::GetOrCreateCachedTexture(
 bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
                                      DrawTexture& texture, bool signed_variant,
                                      ui::vulkan::VulkanUploadBufferPool* uploads,
-                                     uint64_t submission) {
+                                     uint64_t submission,
+                                     CachedTextureEntry** cached_entry_out) {
   const TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
   if (fetch.type != xenos::FetchConstantType::kTexture || info.format == VK_FORMAT_UNDEFINED) {
     return false;
@@ -910,16 +999,20 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
         }
         const bool needs_upload =
             ShouldUploadResolvedCube(entry->uploaded, entry->resolved_face_versions, face_versions);
-        texture.cached_texture = entry;
+        texture.cached_texture = KeepTextureAlive(entry);
         texture.cached_view = image_view;
         texture.upload_cached = needs_upload;
         if (needs_upload) {
-          texture.resolved_cube_faces = std::move(faces);
+          for (uint32_t f = 0; f < kTextureCubeArrayLayers; ++f) {
+            texture.resolved_cube_faces[f] = KeepImageAlive(faces[f]);
+          }
           texture.resolved_cube_face_versions = face_versions;
         }
         return true;
       }
-      texture.resolved_cube_faces = std::move(faces);
+      for (uint32_t f = 0; f < kTextureCubeArrayLayers; ++f) {
+        texture.resolved_cube_faces[f] = KeepImageAlive(faces[f]);
+      }
       return true;
     }
   }
@@ -974,11 +1067,11 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
         }
         const bool needs_upload = ShouldUploadResolvedCrop(
             entry->uploaded, entry->resolved_crop_version, resolved->second.version);
-        texture.cached_texture = entry;
+        texture.cached_texture = KeepTextureAlive(entry);
         texture.cached_view = image_view;
         texture.upload_cached = needs_upload;
         if (needs_upload) {
-          texture.depth_pack_source = resolved->second.image;
+          texture.depth_pack_source = KeepImageAlive(resolved->second.image);
           texture.depth_pack_float =
               resolved->second.depth_format == xenos::DepthRenderTargetFormat::kD24FS8;
           texture.depth_pack_swap = net_swap;
@@ -1009,7 +1102,7 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
       texture.host_swizzle = MakeHostTextureSwizzle(fetch.swizzle, channel_count, swap_red_blue);
       texture.swizzle =
           MakeTextureComponentMappingFromHostSwizzle(texture.host_swizzle, use_view_swizzle);
-      texture.resolved_image = resolved->second.image;
+      texture.resolved_image = KeepImageAlive(resolved->second.image);
       return true;
     }
     // Resolves are 8x8-aligned, so the cached image can be up to one alignment
@@ -1051,16 +1144,16 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
         }
         const bool needs_upload = ShouldUploadResolvedCrop(
             entry->uploaded, entry->resolved_crop_version, resolved->second.version);
-        texture.cached_texture = entry;
+        texture.cached_texture = KeepTextureAlive(entry);
         texture.cached_view = image_view;
         texture.upload_cached = needs_upload;
         if (needs_upload) {
-          texture.crop_source = resolved->second.image;
+          texture.crop_source = KeepImageAlive(resolved->second.image);
           texture.resolved_crop_version = resolved->second.version;
         }
         return true;
       }
-      texture.crop_source = resolved->second.image;
+      texture.crop_source = KeepImageAlive(resolved->second.image);
       return true;
     }
   }
@@ -1103,9 +1196,12 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
         return false;
       }
       texture.level_count = entry->level_count;
-      texture.cached_texture = entry;
+      texture.cached_texture = KeepTextureAlive(entry);
       texture.cached_view = image_view;
       texture.upload_cached = false;
+      if (cached_entry_out) {
+        *cached_entry_out = &cached->second;
+      }
       return true;
     }
   }
@@ -1213,7 +1309,7 @@ bool NativeTextureCache::ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
   if (image_view == VK_NULL_HANDLE) {
     return false;
   }
-  texture.cached_texture = entry;
+  texture.cached_texture = KeepTextureAlive(entry);
   texture.cached_view = image_view;
   texture.upload_cached = upload;
   return true;

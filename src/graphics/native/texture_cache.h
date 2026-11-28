@@ -55,6 +55,8 @@ class NativeTextureCache {
   static constexpr size_t kMaxResolvedImages = 256;
 
   using WatchRangeFn = std::function<void(uint32_t start, uint32_t length)>;
+  using KeepAliveTextureFn = std::function<void(const std::shared_ptr<CachedTexture>&)>;
+  using KeepAliveImageFn = std::function<void(const std::shared_ptr<ColorImage>&)>;
 
   NativeTextureCache(const ui::vulkan::VulkanDevice& device, VmaAllocator allocator,
                      memory::Memory& memory, const RegisterFile& regs,
@@ -94,6 +96,9 @@ class NativeTextureCache {
   // Marks guest pages as holding cached resolve data.
   void MarkCachedPages(uint32_t start, uint32_t length);
   void set_view_purger(const DrawBindingsViewPurger* purger) { view_purger_ = purger; }
+  void set_keep_alive_texture(KeepAliveTextureFn fn) { keep_alive_texture_ = std::move(fn); }
+  void set_keep_alive_image(KeepAliveImageFn fn) { keep_alive_image_ = std::move(fn); }
+  void BumpCacheEpoch() { ++cache_epoch_; }
   // Lock-free atomic read of a 256 KiB block's GPU-resolved-page mask.
   uint64_t ResolvedPagesWord(uint32_t block) const {
     return block < resolved_pages_.size()
@@ -145,7 +150,19 @@ class NativeTextureCache {
   // unpacking depends on the sign.
   bool ReadTexture(const xenos::xe_gpu_texture_fetch_t& fetch, DrawTexture& texture,
                    bool signed_variant, ui::vulkan::VulkanUploadBufferPool* uploads = nullptr,
-                   uint64_t submission = 0);
+                   uint64_t submission = 0, CachedTextureEntry** cached_entry_out = nullptr);
+  CachedTexture* KeepTextureAlive(const std::shared_ptr<CachedTexture>& texture) const {
+    if (texture && keep_alive_texture_ && texture->last_keepalive_submission != clock_.next) {
+      keep_alive_texture_(texture);
+    }
+    return texture.get();
+  }
+  ColorImage* KeepImageAlive(const std::shared_ptr<ColorImage>& image) const {
+    if (image && keep_alive_image_ && image->last_keepalive_submission() != clock_.next) {
+      keep_alive_image_(image);
+    }
+    return image.get();
+  }
   bool DecodeTextureLevels(const xenos::xe_gpu_texture_fetch_t& fetch,
                            const TextureFormatInfo& info,
                            const texture_util::TextureGuestLayout& layout, uint32_t address,
@@ -209,6 +226,37 @@ class NativeTextureCache {
   std::vector<uint64_t> resolved_pages_;
   std::vector<uint64_t> scratch_resolved_pages_;
   std::vector<uint8_t> decode_row_scratch_;
+  struct SamplerMruSlot {
+    DrawSampler key{};
+    VkSampler sampler = VK_NULL_HANDLE;
+    uint64_t* last_use = nullptr;
+    bool valid = false;
+  };
+  struct RawFetchCacheEntry {
+    uint64_t epoch = 0;
+    std::array<uint32_t, 6> dwords{};
+    uint8_t slot = 0;
+    bool signed_variant = false;
+    bool valid = false;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t depth = 1;
+    uint32_t array_layers = 1;
+    uint32_t level_count = 1;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    bool mutable_format = false;
+    VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    uint32_t host_swizzle = 0;
+    VkComponentMapping swizzle{};
+    CachedTextureEntry* cached_entry = nullptr;
+    VkImageView cached_view = VK_NULL_HANDLE;
+    bool resolution_scaled = false;
+  };
+  uint64_t cache_epoch_ = 1;
+  std::array<SamplerMruSlot, 4> sampler_mru_{};
+  std::array<RawFetchCacheEntry, 32> raw_fetch_cache_{};
+  KeepAliveTextureFn keep_alive_texture_;
+  KeepAliveImageFn keep_alive_image_;
   const DrawBindingsViewPurger* view_purger_ = nullptr;
 };
 

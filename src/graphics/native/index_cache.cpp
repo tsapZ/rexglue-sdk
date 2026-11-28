@@ -36,8 +36,7 @@ bool NativeIndexCache::Initialize(bool watch_pages) {
 }
 
 void NativeIndexCache::InvalidateAll() {
-  last_valid_ = false;
-  last_entry_ = nullptr;
+  InvalidateMru();
   entries_.clear();
   for (auto& chunk : chunks_) {
     chunk.used = 0;
@@ -93,8 +92,7 @@ void NativeIndexCache::Invalidate(uint32_t start, uint32_t length) {
     }
   }
   if (erased) {
-    last_valid_ = false;
-    last_entry_ = nullptr;
+    InvalidateMru();
     RebuildCachedPages();
   }
 }
@@ -156,8 +154,7 @@ bool NativeIndexCache::AllocateInChunks(VkDeviceSize byte_size, size_t& chunk_in
         }
       }
       if (erased) {
-        last_valid_ = false;
-        last_entry_ = nullptr;
+        InvalidateMru();
         RebuildCachedPages();
       }
       chunk.used = aligned_size;
@@ -171,26 +168,41 @@ bool NativeIndexCache::AllocateInChunks(VkDeviceSize byte_size, size_t& chunk_in
   return false;
 }
 
+bool NativeIndexCache::Find(const IndexCacheKey& key, IndexBinding& binding_out) {
+  for (size_t i = 0; i < mru_.size(); ++i) {
+    if (mru_[i].valid && mru_[i].key == key) {
+      Entry* entry = mru_[i].entry;
+      if (i > 0) {
+        for (size_t j = i; j > 0; --j) {
+          mru_[j] = mru_[j - 1];
+        }
+        mru_[0] = {key, entry, true};
+      }
+      entry->last_use_submission = clock_.next;
+      chunks_[entry->chunk_index].last_use_submission = clock_.next;
+      binding_out = {true, entry->buffer, entry->offset,
+                     key.use_uint16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32,
+                     key.index_count};
+      return true;
+    }
+  }
+  if (auto found = entries_.find(key); found != entries_.end()) {
+    PromoteMru(key, &found->second);
+    found->second.last_use_submission = clock_.next;
+    chunks_[found->second.chunk_index].last_use_submission = clock_.next;
+    binding_out = {true, found->second.buffer, found->second.offset,
+                   key.use_uint16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32, key.index_count};
+    return true;
+  }
+  return false;
+}
+
 bool NativeIndexCache::GetOrCreate(const IndexCacheKey& key, std::span<const uint8_t> guest_bytes,
                                    ui::vulkan::VulkanUploadBufferPool& uploads,
                                    IndexBinding& binding_out, CachedIndexUpload& upload_out,
                                    bool& uploaded_out) {
   uploaded_out = false;
-  if (last_valid_ && last_key_ == key) {
-    last_entry_->last_use_submission = clock_.next;
-    chunks_[last_entry_->chunk_index].last_use_submission = clock_.next;
-    binding_out = {true, last_entry_->buffer, last_entry_->offset,
-                   key.use_uint16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32, key.index_count};
-    return true;
-  }
-  if (auto found = entries_.find(key); found != entries_.end()) {
-    last_key_ = key;
-    last_entry_ = &found->second;
-    last_valid_ = true;
-    found->second.last_use_submission = clock_.next;
-    chunks_[found->second.chunk_index].last_use_submission = clock_.next;
-    binding_out = {true, found->second.buffer, found->second.offset,
-                   key.use_uint16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32, key.index_count};
+  if (Find(key, binding_out)) {
     return true;
   }
   if (cached_pages_.empty() || key.index_count < kMinCachedIndices || guest_bytes.empty()) {

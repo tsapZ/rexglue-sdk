@@ -80,6 +80,9 @@ class NativeIndexCache {
   }
   std::pair<uint32_t, uint32_t> WidenInvalidation(uint32_t start, uint32_t length);
 
+  // Looks up a cached static index buffer without touching guest memory.
+  bool Find(const IndexCacheKey& key, IndexBinding& binding_out);
+
   // Looks up or decodes+caches a static index buffer. Returns true with `binding`
   // populated on hit or queued upload (with `upload_out` filled on miss); returns
   // false when the range should be streamed transiently instead (too small,
@@ -121,9 +124,24 @@ class NativeIndexCache {
   WatchRangeFn watch_range_;
   std::vector<Chunk> chunks_;
   std::unordered_map<IndexCacheKey, Entry, IndexCacheKeyHash> entries_;
-  IndexCacheKey last_key_{};
-  Entry* last_entry_ = nullptr;
-  bool last_valid_ = false;
+  struct MruEntry {
+    IndexCacheKey key{};
+    Entry* entry = nullptr;
+    bool valid = false;
+  };
+  std::array<MruEntry, 4> mru_{};
+  void PromoteMru(const IndexCacheKey& key, Entry* entry) {
+    for (size_t i = mru_.size() - 1; i > 0; --i) {
+      mru_[i] = mru_[i - 1];
+    }
+    mru_[0] = {key, entry, true};
+  }
+  void InvalidateMru() {
+    for (auto& slot : mru_) {
+      slot.valid = false;
+      slot.entry = nullptr;
+    }
+  }
   std::vector<uint64_t> cached_pages_;
   std::vector<uint64_t> scratch_pages_;
   std::vector<uint64_t> recent_invalidated_pages_;

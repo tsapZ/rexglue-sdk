@@ -88,12 +88,19 @@ class NativeTargetCache {
   // from the top of the target about to be drawn or resolved; their EDRAM
   // tiles become owned by this target, taking over the contents left there by
   // an aliasing target of the same pitch, sample count and format.
+  using KeepAliveImageFn = std::function<void(const std::shared_ptr<ColorImage>&)>;
+  void set_keep_alive(KeepAliveImageFn fn) { keep_alive_ = std::move(fn); }
+
   std::shared_ptr<ColorImage> FindTarget(uint32_t tile, uint32_t pitch, xenos::MsaaSamples samples,
                                          VkFormat format, VkImageAspectFlags aspects, bool is_64bpp,
                                          uint32_t edram_tile_count,
                                          const std::shared_ptr<ColorImage>& keep,
                                          uint32_t used_height = 0,
                                          bool resolution_scaled = true);
+  ColorImage* FindTargetRaw(uint32_t tile, uint32_t pitch, xenos::MsaaSamples samples,
+                            VkFormat format, VkImageAspectFlags aspects, bool is_64bpp,
+                            uint32_t edram_tile_count, const std::shared_ptr<ColorImage>& keep,
+                            uint32_t used_height = 0, bool resolution_scaled = true);
   VkFormat GetDepthFormat(xenos::DepthRenderTargetFormat format) const;
 
   // Replays an aliased 4x-MSAA fast clear onto a 1x/2x target that already
@@ -220,6 +227,7 @@ class NativeTargetCache {
   std::map<std::pair<uint32_t, uint32_t>, PendingFastClear> pending_fast_clears_;
   std::map<std::tuple<uint32_t, uint32_t, VkFormat>, PendingColorFastClear>
       pending_color_fast_clears_;
+  KeepAliveImageFn keep_alive_;
   const DrawBindingsViewPurger* view_purger_ = nullptr;
 };
 

@@ -229,6 +229,38 @@ std::shared_ptr<ColorImage> NativeTargetCache::FindTarget(uint32_t tile, uint32_
   return image;
 }
 
+ColorImage* NativeTargetCache::FindTargetRaw(uint32_t tile, uint32_t pitch,
+                                             xenos::MsaaSamples samples, VkFormat format,
+                                             VkImageAspectFlags aspects, bool is_64bpp,
+                                             uint32_t edram_tile_count,
+                                             const std::shared_ptr<ColorImage>& keep,
+                                             uint32_t used_height, bool resolution_scaled) {
+  const bool scaled =
+      resolution_scaled && (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
+  const TargetKey key{tile, pitch, samples, format, scaled};
+  for (size_t i = 0; i < target_mru_.size(); ++i) {
+    if (target_mru_[i].valid && target_mru_[i].key == key) {
+      CachedTarget* target = target_mru_[i].target;
+      if (i > 0) {
+        PromoteTargetMru(key, target);
+      }
+      target->last_use_submission = clock_.next;
+      ClaimTiles(*target, tile, pitch, samples, format, is_64bpp, used_height, edram_tile_count,
+                 scaled);
+      if (keep_alive_ && target->image->last_keepalive_submission() != clock_.next) {
+        keep_alive_(target->image);
+      }
+      return target->image.get();
+    }
+  }
+  auto image = FindTarget(tile, pitch, samples, format, aspects, is_64bpp, edram_tile_count, keep,
+                          used_height, resolution_scaled);
+  if (image && keep_alive_ && image->last_keepalive_submission() != clock_.next) {
+    keep_alive_(image);
+  }
+  return image.get();
+}
+
 void NativeTargetCache::ClaimTiles(CachedTarget& target, uint32_t tile, uint32_t pitch,
                                    xenos::MsaaSamples samples, VkFormat format, bool is_64bpp,
                                    uint32_t used_height, uint32_t edram_tile_count,

@@ -351,6 +351,7 @@ void DrawBindings::PurgeImageViews(std::span<const VkImageView> views) {
     if (index.empty()) {
       continue;
     }
+    bool purged_any = false;
     for (VkImageView v : views) {
       auto map_it = index.find(v);
       if (map_it == index.end()) {
@@ -365,8 +366,13 @@ void DrawBindings::PurgeImageViews(std::span<const VkImageView> views) {
                                                 it->second.last_use_submission);
           RemoveTextureSetFromViewIndex(s, key_ptr, v);
           cache.erase(it);
+          purged_any = true;
         }
       }
+    }
+    if (purged_any) {
+      last_texture_set_[s] = VK_NULL_HANDLE;
+      last_texture_entry_[s] = nullptr;
     }
   }
 }
@@ -377,15 +383,21 @@ void DrawBindings::PurgeSampler(VkSampler sampler) {
   }
   for (size_t s = 0; s < 2; ++s) {
     auto& cache = persistent_texture_sets_[s];
+    bool purged_any = false;
     for (auto it = cache.begin(); it != cache.end();) {
       if (std::ranges::find(it->first.samplers, sampler) != it->first.samplers.end()) {
         retired_texture_sets_[s].emplace_back(it->second.pool_index,
                                               it->second.last_use_submission);
         RemoveTextureSetFromViewIndex(s, &it->first);
         it = cache.erase(it);
+        purged_any = true;
       } else {
         ++it;
       }
+    }
+    if (purged_any) {
+      last_texture_set_[s] = VK_NULL_HANDLE;
+      last_texture_entry_[s] = nullptr;
     }
   }
 }
@@ -402,10 +414,21 @@ VkDescriptorSet DrawBindings::GetOrCreateTextureSet(size_t set_slot, uint32_t fr
   const size_t stage = set_slot - 2;
   auto& cache = persistent_texture_sets_[stage];
   if (cacheable) {
+    if (last_texture_set_[stage] != VK_NULL_HANDLE &&
+        std::ranges::equal(last_texture_views_[stage], views) &&
+        std::ranges::equal(last_texture_samplers_[stage], samplers)) {
+      last_texture_entry_[stage]->last_use_submission = submission;
+      return last_texture_set_[stage];
+    }
     const TextureSetKeyView key_view{views, samplers};
     if (auto found = cache.find(key_view); found != cache.end()) {
       found->second.last_use_submission = submission;
-      return pools[set_slot]->Get(found->second.pool_index);
+      const VkDescriptorSet hit_set = pools[set_slot]->Get(found->second.pool_index);
+      last_texture_views_[stage].assign(views.begin(), views.end());
+      last_texture_samplers_[stage].assign(samplers.begin(), samplers.end());
+      last_texture_set_[stage] = hit_set;
+      last_texture_entry_[stage] = &found->second;
+      return hit_set;
     }
     if (cache.size() >= kMaxPersistentTextureSets) {
       ReclaimTextureSets(retired_submission);
@@ -425,6 +448,10 @@ VkDescriptorSet DrawBindings::GetOrCreateTextureSet(size_t set_slot, uint32_t fr
         }
         pools[set_slot]->Free(victim->second.pool_index);
         RemoveTextureSetFromViewIndex(stage, &victim->first);
+        if (last_texture_entry_[stage] == &victim->second) {
+          last_texture_set_[stage] = VK_NULL_HANDLE;
+          last_texture_entry_[stage] = nullptr;
+        }
         cache.erase(victim);
       }
     }
@@ -503,6 +530,10 @@ VkDescriptorSet DrawBindings::GetOrCreateTextureSet(size_t set_slot, uint32_t fr
           view_to_texture_keys_[stage][v].push_back(key_ptr);
         }
       }
+      last_texture_views_[stage].assign(views.begin(), views.end());
+      last_texture_samplers_[stage].assign(samplers.begin(), samplers.end());
+      last_texture_set_[stage] = set;
+      last_texture_entry_[stage] = &it->second;
     }
   } else {
     ephemeral_texture_sets_[frame_slot][stage].push_back(index);
@@ -716,8 +747,22 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
   const size_t ops_start = ops.size();
   first_texture_op_ = uint32_t(ops_start);
   texture_op_count_ = 0;
-  std::vector<uint32_t> op_index_for_input(input.textures.size(), UINT32_MAX);
-  std::vector<VkImageView> texture_views(input.textures.size(), VK_NULL_HANDLE);
+  constexpr size_t kInlineTextures = 32;
+  std::array<uint32_t, kInlineTextures> inline_op_index{};
+  std::array<VkImageView, kInlineTextures> inline_texture_views{};
+  std::vector<uint32_t> heap_op_index;
+  std::vector<VkImageView> heap_texture_views;
+  uint32_t* op_index_for_input = inline_op_index.data();
+  VkImageView* texture_views = inline_texture_views.data();
+  if (input.textures.size() > kInlineTextures) {
+    heap_op_index.assign(input.textures.size(), UINT32_MAX);
+    heap_texture_views.assign(input.textures.size(), VK_NULL_HANDLE);
+    op_index_for_input = heap_op_index.data();
+    texture_views = heap_texture_views.data();
+  } else {
+    std::fill_n(op_index_for_input, input.textures.size(), UINT32_MAX);
+    std::fill_n(texture_views, input.textures.size(), VK_NULL_HANDLE);
+  }
   struct OpsGuard {
     const ui::vulkan::VulkanDevice* dev;
     VmaAllocator alloc;
@@ -873,15 +918,15 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
     const uint32_t op_idx = uint32_t(ops.size());
     op_index_for_input[i] = op_idx;
     auto& op = ops.emplace_back();
-    op.resolved = input_texture.resolved_image.get();
-    op.crop_source = input_texture.crop_source.get();
-    op.depth_pack_source = input_texture.depth_pack_source.get();
+    op.resolved = input_texture.resolved_image;
+    op.crop_source = input_texture.crop_source;
+    op.depth_pack_source = input_texture.depth_pack_source;
     op.depth_pack_float = input_texture.depth_pack_float;
     op.depth_pack_swap = input_texture.depth_pack_swap;
     for (uint32_t face = 0; face < kTextureCubeArrayLayers; ++face) {
-      op.resolved_cube_faces[face] = input_texture.resolved_cube_faces[face].get();
+      op.resolved_cube_faces[face] = input_texture.resolved_cube_faces[face];
     }
-    op.cached = input_texture.cached_texture.get();
+    op.cached = input_texture.cached_texture;
     op.upload_cached = input_texture.upload_cached;
     op.array_layers = op.resolved || input_texture.view_type == VK_IMAGE_VIEW_TYPE_3D
                           ? 1

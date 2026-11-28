@@ -86,25 +86,24 @@ struct DrawTexture {
   uint32_t host_swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_0000;
   VkComponentMapping swizzle{};
   std::vector<std::vector<uint8_t>> levels;
-  std::shared_ptr<ColorImage> resolved_image;
+  ColorImage* resolved_image = nullptr;
   // Cached resolve of the same format but up to 8x8 larger than this texture;
   // its top-left corner is copied into a host image during the upload.
-  std::shared_ptr<ColorImage> crop_source;
-  std::shared_ptr<ColorImage> depth_pack_source;
+  ColorImage* crop_source = nullptr;
+  ColorImage* depth_pack_source = nullptr;
   bool depth_pack_float = false;
   uint32_t depth_pack_swap = 0;
   uint64_t resolved_crop_version = 0;
   // Resolved host image of each cube face, in face order, when the whole cube
   // was rendered on the GPU instead of being stored in guest memory. Each face
   // is copied into its array layer of the uploaded cube during the upload.
-  std::array<std::shared_ptr<ColorImage>, kTextureCubeArrayLayers> resolved_cube_faces;
+  std::array<ColorImage*, kTextureCubeArrayLayers> resolved_cube_faces{};
   std::array<uint64_t, kTextureCubeArrayLayers> resolved_cube_face_versions{};
   // Device-lifetime zero-cleared view bound when the fetch constant cannot
   // produce texels. Non-owning; the host image is allocated once.
   VkImageView fallback_view = VK_NULL_HANDLE;
-  // Device-lifetime texture from the command processor cache. Non-owning when
-  // null; the shared pointer keeps the image alive for this draw's GPU work.
-  std::shared_ptr<CachedTexture> cached_texture;
+  // Device-lifetime texture from the command processor cache.
+  CachedTexture* cached_texture = nullptr;
   VkImageView cached_view = VK_NULL_HANDLE;
   // Whether this draw must copy `levels` into the cached image. False when the
   // image was already uploaded by an earlier draw in the same batch.
@@ -323,6 +322,10 @@ struct DrawBindings {
   std::array<TextureSetMap, 2> persistent_texture_sets_;
   std::array<std::unordered_map<VkImageView, std::vector<const TextureSetKey*>>, 2>
       view_to_texture_keys_;
+  std::array<std::vector<VkImageView>, 2> last_texture_views_;
+  std::array<std::vector<VkSampler>, 2> last_texture_samplers_;
+  std::array<VkDescriptorSet, 2> last_texture_set_{};
+  std::array<PersistentTextureSet*, 2> last_texture_entry_{};
   std::array<std::vector<std::pair<size_t, uint64_t>>, 2> retired_texture_sets_;
   std::array<std::array<std::vector<size_t>, 2>, 3> ephemeral_texture_sets_;
 };

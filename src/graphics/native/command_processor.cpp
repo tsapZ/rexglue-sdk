@@ -384,6 +384,12 @@ bool NativeCommandProcessor::SetupContext() {
         ResetCurrentRunVertexReads();
       });
   target_cache_->set_view_purger(&view_purger_);
+  target_cache_->set_keep_alive(
+      [this](const std::shared_ptr<ColorImage>& img) { KeepAliveImage(img); });
+  texture_cache_->set_keep_alive_texture(
+      [this](const std::shared_ptr<CachedTexture>& tex) { KeepAliveTexture(tex); });
+  texture_cache_->set_keep_alive_image(
+      [this](const std::shared_ptr<ColorImage>& img) { KeepAliveImage(img); });
   shader_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
   watched_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
   current_run_vertex_read_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
@@ -1501,28 +1507,32 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     const size_t index_bytes =
         size_t(index_count) *
         (index.format == xenos::IndexFormat::kInt32 ? sizeof(uint32_t) : sizeof(uint16_t));
-    const auto src_bytes =
-        index_bytes <= index.length ? ReadPhysical(index.guest_base, index_bytes)
-                                    : std::span<const uint8_t>{};
-    if (src_bytes.empty()) {
+    if (index_bytes > index.length) {
       return false;
     }
     const bool use_uint16 = (index.format == xenos::IndexFormat::kInt16) &&
                             (!multi_prim_restart || restart_reset == UINT16_MAX);
-    const IndexCacheKey cache_key{index.guest_base,    index_count,   index.format,
-                                  index.endianness,    multi_prim_restart, restart_reset,
+    const IndexCacheKey cache_key{index.guest_base, index_count,        index.format,
+                                  index.endianness, multi_prim_restart, restart_reset,
                                   use_uint16};
-    CachedIndexUpload queued_upload{};
-    bool uploaded = false;
-    if (!may_snapshot_fast_clear && index_cache_ &&
-        index_cache_->GetOrCreate(cache_key, src_bytes, *draw_uploads_, index_binding,
-                                  queued_upload, uploaded)) {
-      if (uploaded) {
-        pending_.emplace_back(QueuedIndexUpload{queued_upload.src_buffer, queued_upload.src_offset,
-                                                queued_upload.dst_buffer, queued_upload.dst_offset,
-                                                queued_upload.size});
-      }
+    if (!may_snapshot_fast_clear && index_cache_ && index_cache_->Find(cache_key, index_binding)) {
+      // Cache hit: skip ReadPhysical page-access query.
     } else {
+      const auto src_bytes = ReadPhysical(index.guest_base, index_bytes);
+      if (src_bytes.empty()) {
+        return false;
+      }
+      CachedIndexUpload queued_upload{};
+      bool uploaded = false;
+      if (!may_snapshot_fast_clear && index_cache_ &&
+          index_cache_->GetOrCreate(cache_key, src_bytes, *draw_uploads_, index_binding,
+                                    queued_upload, uploaded)) {
+        if (uploaded) {
+          pending_.emplace_back(QueuedIndexUpload{queued_upload.src_buffer, queued_upload.src_offset,
+                                                  queued_upload.dst_buffer, queued_upload.dst_offset,
+                                                  queued_upload.size});
+        }
+      } else {
       const VkDeviceSize host_stride = use_uint16 ? sizeof(uint16_t) : sizeof(uint32_t);
       const VkDeviceSize host_bytes = VkDeviceSize(index_count) * host_stride;
       VkBuffer up_buf = VK_NULL_HANDLE;
@@ -1548,6 +1558,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                            index_count, multi_prim_restart, restart_reset);
         index_binding.indexed = true;
         inline_indices = scratch_indices_;
+      }
       }
     }
   } else {
@@ -1609,7 +1620,6 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
 
-  DrainMemoryInvalidations();
   std::array<bool, 96> uploaded{};
   std::array<std::pair<uint32_t, uint32_t>, 96> shared_vertex_reads{};
   uint32_t shared_vertex_read_count = 0;
@@ -1687,14 +1697,13 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     const uint32_t rt_tile = layout.DecodeBase(target.value);
     const bool rt_is_64bpp = xenos::IsColorRenderTargetFormat64bpp(target.color_format);
-    auto color_target = FindTarget(rt_tile, dimensions.surface_pitch, dimensions.msaa_samples,
-                                   format, VK_IMAGE_ASPECT_COLOR_BIT, rt_is_64bpp, used_height,
-                                   draw_scaled);
+    ColorImage* color_target = target_cache_->FindTargetRaw(
+        rt_tile, dimensions.surface_pitch, dimensions.msaa_samples, format,
+        VK_IMAGE_ASPECT_COLOR_BIT, rt_is_64bpp, used_height, presented_, draw_scaled);
     if (!color_target) {
       return false;
     }
-    KeepAliveImage(color_target);
-    draw.colors[i] = color_target.get();
+    draw.colors[i] = color_target;
     if (std::find(draw.colors.begin(), draw.colors.begin() + i, draw.colors[i]) !=
         draw.colors.begin() + i) {
       draw.colors[i] = nullptr;
@@ -1718,15 +1727,14 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   draw.color_count = input.color_count;
   draw.memexport = memexport;
   if (use_depth) {
-    auto depth_target = FindTarget(layout.DecodeBase(depth_info.value), dimensions.surface_pitch,
-                                   dimensions.msaa_samples, input.depth_format,
-                                   VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, false,
-                                   used_height, draw_scaled);
+    ColorImage* depth_target = target_cache_->FindTargetRaw(
+        layout.DecodeBase(depth_info.value), dimensions.surface_pitch, dimensions.msaa_samples,
+        input.depth_format, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, false,
+        used_height, presented_, draw_scaled);
     if (!depth_target) {
       return false;
     }
-    KeepAliveImage(depth_target);
-    draw.depth = depth_target.get();
+    draw.depth = depth_target;
   }
   PreuploadedConstants preuploaded_constants{};
   if (!PreparePreuploadedConstants(input, vs, ps, use_shared_vertices, preuploaded_constants)) {
@@ -1757,16 +1765,9 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       }
     }
   }
-  // The draw, including its texture uploads, will be recorded, so later draws in
-  // the same batch can sample these cached images without copying them again.
+  // The draw, including its texture uploads, will be recorded, so update cached
+  // texture upload state before later draws in the same batch sample them.
   for (const auto& texture : input.textures) {
-    KeepAliveTexture(texture.cached_texture);
-    KeepAliveImage(texture.resolved_image);
-    KeepAliveImage(texture.crop_source);
-    KeepAliveImage(texture.depth_pack_source);
-    for (const auto& face : texture.resolved_cube_faces) {
-      KeepAliveImage(face);
-    }
     if (texture.upload_cached && texture.cached_texture) {
       texture.cached_texture->uploaded = true;
       if (texture.resolved_cube_face_versions[0] != 0) {
@@ -1966,24 +1967,30 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   } else if (!aliased_4x_depth_clear && !aliased_4x_color_depth_clear) {
     // Any ordinary draw at a tile consumes its pending fast clear.
-    const uint32_t pitch_tiles =
-        xenos::GetSurfacePitchTiles(dimensions.surface_pitch, dimensions.msaa_samples, false);
-    if (pitch_tiles && use_depth) {
-      target_cache_->pending_fast_clears().erase({depth_tile, pitch_tiles});
-    }
-    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-      if ((writes >> (i * 4)) & 15) {
-        const auto target =
-            regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
-        const uint32_t rt_tile = layout.DecodeBase(target.value);
-        if (pitch_tiles) {
-          target_cache_->pending_fast_clears().erase({rt_tile, pitch_tiles});
-        }
-        const uint32_t rt_pitch_tiles = xenos::GetSurfacePitchTiles(
-            dimensions.surface_pitch, dimensions.msaa_samples,
-            xenos::IsColorRenderTargetFormat64bpp(target.color_format));
-        if (rt_pitch_tiles) {
-          target_cache_->ErasePendingColorFastClears(rt_tile, rt_pitch_tiles);
+    const bool has_depth_fast_clears = !target_cache_->pending_fast_clears().empty();
+    const bool has_color_fast_clears = !target_cache_->pending_color_fast_clears().empty();
+    if (has_depth_fast_clears || has_color_fast_clears) {
+      const uint32_t pitch_tiles =
+          xenos::GetSurfacePitchTiles(dimensions.surface_pitch, dimensions.msaa_samples, false);
+      if (has_depth_fast_clears && pitch_tiles && use_depth) {
+        target_cache_->pending_fast_clears().erase({depth_tile, pitch_tiles});
+      }
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+        if ((writes >> (i * 4)) & 15) {
+          const auto target =
+              regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+          const uint32_t rt_tile = layout.DecodeBase(target.value);
+          if (has_depth_fast_clears && pitch_tiles) {
+            target_cache_->pending_fast_clears().erase({rt_tile, pitch_tiles});
+          }
+          if (has_color_fast_clears) {
+            const uint32_t rt_pitch_tiles = xenos::GetSurfacePitchTiles(
+                dimensions.surface_pitch, dimensions.msaa_samples,
+                xenos::IsColorRenderTargetFormat64bpp(target.color_format));
+            if (rt_pitch_tiles) {
+              target_cache_->ErasePendingColorFastClears(rt_tile, rt_pitch_tiles);
+            }
+          }
         }
       }
     }
@@ -2375,6 +2382,7 @@ bool NativeCommandProcessor::IssueCopy() {
                               depth,
                               depth_format};
   resolved_images().insert_or_assign(dest_resolve_address, std::move(resolve_entry));
+  texture_cache_->BumpCacheEpoch();
   if (erased_other_resolved) {
     texture_cache_->PruneResolvedDependents();
     texture_cache_->RebuildCachedTexturePages();
@@ -2717,8 +2725,12 @@ void NativeCommandProcessor::ExecuteColorClear(ColorImage* target, VkRect2D area
 void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands) {
   const auto& vk = vulkan_device_->functions();
   const auto& draw = std::get<QueuedDraw>(commands.front());
+  VkExtent2D covered{};
   for (const auto& command : commands) {
     const auto& pass = pending_passes_[std::get<QueuedDraw>(command).pass_index];
+    const auto& scissor = pass.scissor();
+    covered.width = std::max(covered.width, scissor.offset[0] + scissor.extent[0]);
+    covered.height = std::max(covered.height, scissor.offset[1] + scissor.extent[1]);
     const uint32_t first_op = pass.first_texture_op();
     const uint32_t end_op = first_op + pass.texture_op_count();
     for (uint32_t op_idx = first_op; op_idx < end_op; ++op_idx) {
@@ -2731,12 +2743,6 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
       }
       RecordDrawTextureOp(*vulkan_device_, depth_resolve_.get(), command_buffer_, op);
     }
-  }
-  VkExtent2D covered{};
-  for (const auto& command : commands) {
-    const auto& scissor = pending_passes_[std::get<QueuedDraw>(command).pass_index].scissor();
-    covered.width = std::max(covered.width, scissor.offset[0] + scissor.extent[0]);
-    covered.height = std::max(covered.height, scissor.offset[1] + scissor.extent[1]);
   }
   VkExtent2D attachment_extent{UINT32_MAX, UINT32_MAX};
   std::array<VkRect2D, xenos::kMaxColorRenderTargets + 1> clear_areas{};
