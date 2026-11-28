@@ -386,6 +386,7 @@ bool NativeCommandProcessor::SetupContext() {
   target_cache_->set_view_purger(&view_purger_);
   shader_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
   watched_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
+  current_run_vertex_read_pages_.assign((kSharedVertexPageCount + 63) / 64, 0);
   if (!texture_cache_->Initialize(shared_vertex_ != nullptr)) {
     ShutdownContext();
     return false;
@@ -463,10 +464,15 @@ void NativeCommandProcessor::ShutdownContext() {
   output_gamma_.reset();
   translator_.reset();
   active_vertex_shader_ = active_pixel_shader_ = nullptr;
-  last_shader_ = nullptr;
-  last_shader_addr_key_ = 0;
+  last_shader_.fill(nullptr);
+  last_shader_addr_key_.fill(0);
   shader_addr_cache_.clear();
+  for (auto& bucket : shader_buckets_) {
+    bucket.clear();
+  }
   shader_pages_.clear();
+  current_run_vertex_read_pages_.clear();
+  current_run_vertex_read_dirty_words_.clear();
   shaders_.clear();
   InvalidateConstantState();
   if (vma_allocator_ != VK_NULL_HANDLE) {
@@ -684,21 +690,57 @@ Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type,
   if (!host_address || !dword_count) {
     return nullptr;
   }
+  const size_t stage = shader_type == xenos::ShaderType::kPixel ? 1 : 0;
   const uint32_t byte_count = dword_count * uint32_t(sizeof(uint32_t));
-  const bool cacheable_addr =
-      guest_address != 0 && IsPhysicalRange(guest_address, byte_count) &&
-      memory_->TranslatePhysical(guest_address) == reinterpret_cast<const uint8_t*>(host_address);
-  const uint64_t addr_key = (uint64_t(guest_address) << 32) | dword_count;
+  uint32_t resolved_guest_addr = guest_address;
+  bool cacheable_addr =
+      resolved_guest_addr != 0 && IsPhysicalRange(resolved_guest_addr, byte_count) &&
+      memory_->TranslatePhysical(resolved_guest_addr) ==
+          reinterpret_cast<const uint8_t*>(host_address);
+  if (!cacheable_addr && memory_) {
+    const uint8_t* phys_base = memory_->TranslatePhysical(0);
+    const auto* host_bytes = reinterpret_cast<const uint8_t*>(host_address);
+    if (phys_base && host_bytes >= phys_base) {
+      const ptrdiff_t offset = host_bytes - phys_base;
+      if (offset > 0 && offset <= ptrdiff_t(kPhysicalMemorySize)) {
+        const uint32_t candidate = uint32_t(offset);
+        if (IsPhysicalRange(candidate, byte_count) &&
+            memory_->TranslatePhysical(candidate) == host_bytes) {
+          resolved_guest_addr = candidate;
+          cacheable_addr = true;
+        }
+      }
+    }
+  }
+  const uint64_t addr_key = (uint64_t(resolved_guest_addr) << 32) | dword_count;
+  auto register_cached_shader = [&](SpirvShader* shader_ptr) {
+    const auto [first_page, page_count] = GetPhysicalPageRange(resolved_guest_addr, byte_count);
+    AtomicSetPageRangeBits(shader_pages_, first_page, page_count);
+    WatchPhysicalRange(resolved_guest_addr, byte_count);
+    auto [it, inserted] = shader_addr_cache_.emplace(addr_key, shader_ptr);
+    if (inserted && page_count) {
+      const size_t first_bucket = first_page >> 6;
+      const size_t last_bucket =
+          std::min((first_page + page_count - 1) >> 6, uint32_t(kShaderBucketCount - 1));
+      for (size_t b = first_bucket; b <= last_bucket; ++b) {
+        shader_buckets_[b].push_back(addr_key);
+      }
+    } else if (!inserted) {
+      it->second = shader_ptr;
+    }
+    last_shader_addr_key_[stage] = addr_key;
+    last_shader_[stage] = shader_ptr;
+  };
   if (cacheable_addr) {
-    if (last_shader_ && last_shader_addr_key_ == addr_key &&
-        last_shader_->type() == shader_type) {
-      return last_shader_;
+    if (last_shader_[stage] && last_shader_addr_key_[stage] == addr_key &&
+        last_shader_[stage]->type() == shader_type) {
+      return last_shader_[stage];
     }
     if (auto found = shader_addr_cache_.find(addr_key);
         found != shader_addr_cache_.end() && found->second->type() == shader_type) {
-      last_shader_addr_key_ = addr_key;
-      last_shader_ = found->second;
-      return last_shader_;
+      last_shader_addr_key_[stage] = addr_key;
+      last_shader_[stage] = found->second;
+      return last_shader_[stage];
     }
   }
   const uint64_t hash = XXH3_64bits(host_address, byte_count);
@@ -714,12 +756,7 @@ Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type,
                      return cached == guest;
                    })) {
       if (cacheable_addr) {
-        const auto [first_page, page_count] = GetPhysicalPageRange(guest_address, byte_count);
-        AtomicSetPageRangeBits(shader_pages_, first_page, page_count);
-        WatchPhysicalRange(guest_address, byte_count);
-        shader_addr_cache_.emplace(addr_key, &shader);
-        last_shader_addr_key_ = addr_key;
-        last_shader_ = &shader;
+        register_cached_shader(&shader);
       }
       return &shader;
     }
@@ -727,12 +764,7 @@ Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type,
   auto shader = std::make_unique<SpirvShader>(shader_type, hash, host_address, dword_count);
   auto* ptr = shaders_.emplace(hash, std::move(shader))->second.get();
   if (cacheable_addr) {
-    const auto [first_page, page_count] = GetPhysicalPageRange(guest_address, byte_count);
-    AtomicSetPageRangeBits(shader_pages_, first_page, page_count);
-    WatchPhysicalRange(guest_address, byte_count);
-    shader_addr_cache_.emplace(addr_key, ptr);
-    last_shader_addr_key_ = addr_key;
-    last_shader_ = ptr;
+    register_cached_shader(ptr);
   }
   return ptr;
 }
@@ -758,21 +790,45 @@ void NativeCommandProcessor::DrainMemoryInvalidations() {
     }
     if (!shader_pages_.empty()) {
       const auto [first_page, page_count] = GetPhysicalPageRange(start, length);
-      if (AtomicHasAnyPageBitSet(shader_pages_, first_page, page_count)) {
-        for (auto it = shader_addr_cache_.begin(); it != shader_addr_cache_.end();) {
-          const uint32_t s_addr = uint32_t(it->first >> 32);
-          const uint32_t s_len = uint32_t(it->first) * uint32_t(sizeof(uint32_t));
-          if (RangesOverlap(start, length, s_addr, s_len)) {
-            if (last_shader_addr_key_ == it->first) {
-              last_shader_ = nullptr;
-              last_shader_addr_key_ = 0;
-            }
-            it = shader_addr_cache_.erase(it);
-          } else {
-            ++it;
+      if (page_count && AtomicHasAnyPageBitSet(shader_pages_, first_page, page_count)) {
+        const size_t first_bucket = first_page >> 6;
+        const size_t last_bucket =
+            std::min((first_page + page_count - 1) >> 6, uint32_t(kShaderBucketCount - 1));
+        for (size_t b = first_bucket; b <= last_bucket; ++b) {
+          auto& bucket = shader_buckets_[b];
+          if (bucket.empty()) {
+            std::atomic_ref<uint64_t>(shader_pages_[b]).store(0, std::memory_order_relaxed);
+            continue;
           }
+          uint64_t new_word = 0;
+          const uint32_t bucket_first_page = uint32_t(b) << 6;
+          for (size_t i = 0; i < bucket.size();) {
+            const uint64_t key = bucket[i];
+            const uint32_t s_addr = uint32_t(key >> 32);
+            const uint32_t s_len = uint32_t(key) * uint32_t(sizeof(uint32_t));
+            if (RangesOverlap(start, length, s_addr, s_len)) {
+              for (size_t st = 0; st < 2; ++st) {
+                if (last_shader_addr_key_[st] == key) {
+                  last_shader_[st] = nullptr;
+                  last_shader_addr_key_[st] = 0;
+                }
+              }
+              shader_addr_cache_.erase(key);
+              bucket[i] = bucket.back();
+              bucket.pop_back();
+            } else {
+              const auto [s_first_page, s_page_count] = GetPhysicalPageRange(s_addr, s_len);
+              const uint32_t s_end_page = s_first_page + s_page_count;
+              const uint32_t lo = std::max(s_first_page, bucket_first_page);
+              const uint32_t hi = std::min(s_end_page, bucket_first_page + 64);
+              for (uint32_t p = lo; p < hi; ++p) {
+                new_word |= UINT64_C(1) << (p & 63);
+              }
+              ++i;
+            }
+          }
+          std::atomic_ref<uint64_t>(shader_pages_[b]).store(new_word, std::memory_order_relaxed);
         }
-        AtomicClearPageRangeBits(shader_pages_, first_page, page_count);
       }
     }
     InvalidateSharedVertices(start, length);
@@ -790,7 +846,12 @@ void NativeCommandProcessor::InvalidateGpuMemory() {
   if (index_cache_) {
     index_cache_->InvalidateAll();
   }
+  last_shader_.fill(nullptr);
+  last_shader_addr_key_.fill(0);
   shader_addr_cache_.clear();
+  for (auto& bucket : shader_buckets_) {
+    bucket.clear();
+  }
   for (auto& w : shader_pages_) {
     std::atomic_ref<uint64_t>(w).store(0, std::memory_order_relaxed);
   }
@@ -887,7 +948,7 @@ bool NativeCommandProcessor::EnsureSharedVertexRange(uint32_t address, uint32_t 
         pending_.emplace_back(
             QueuedBufferUpload{src_buffer, src_offset, chunk_addr, chunk_size, hoist_safe});
         if (!hoist_safe) {
-          current_run_vertex_reads_.clear();
+          ClearCurrentRunVertexReadPages();
         }
         return true;
       });
@@ -1503,7 +1564,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   DrainMemoryInvalidations();
   std::array<bool, 96> uploaded{};
-  std::vector<std::pair<uint32_t, uint32_t>> shared_vertex_reads;
+  std::array<std::pair<uint32_t, uint32_t>, 96> shared_vertex_reads{};
+  uint32_t shared_vertex_read_count = 0;
   for (const auto& binding : vs.vertex_bindings()) {
     if (uploaded[binding.fetch_constant]) {
       continue;
@@ -1518,7 +1580,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       if (!EnsureSharedVertexRange(addr, size)) {
         return false;
       }
-      shared_vertex_reads.emplace_back(addr, size);
+      shared_vertex_reads[shared_vertex_read_count++] = {addr, size};
     } else {
       const auto bytes = ReadPhysical(fetch.address << 2, fetch.size << 2);
       if (bytes.empty() || bytes.size() > properties.maxStorageBufferRange - input.vertices.size()) {
@@ -1638,15 +1700,13 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     ResetCurrentRunVertexReads();
   } else {
     if (draw_colors != last_run_colors_ || draw_depth != last_run_depth_) {
-      current_run_vertex_reads_.clear();
+      ClearCurrentRunVertexReadPages();
       last_run_colors_ = draw_colors;
       last_run_depth_ = draw_depth;
     }
     if (use_shared_vertices) {
-      current_run_vertex_reads_.insert(current_run_vertex_reads_.end(),
-                                       shared_vertex_reads.begin(), shared_vertex_reads.end());
-      if (current_run_vertex_reads_.size() > 64) {
-        CoalescePhysicalRanges(current_run_vertex_reads_);
+      for (uint32_t i = 0; i < shared_vertex_read_count; ++i) {
+        MarkCurrentRunVertexRead(shared_vertex_reads[i].first, shared_vertex_reads[i].second);
       }
     }
   }
@@ -1920,7 +1980,7 @@ void NativeCommandProcessor::QueueReplayDraw(const DrawInput& input,
   draw.pass_index = AddPendingPass(input, index_binding, indices, vertex, pixel);
   if (draw.pass_index != SIZE_MAX) {
     if (draw.colors != last_run_colors_ || draw.depth != last_run_depth_) {
-      current_run_vertex_reads_.clear();
+      ClearCurrentRunVertexReadPages();
       last_run_colors_ = draw.colors;
       last_run_depth_ = draw.depth;
     }

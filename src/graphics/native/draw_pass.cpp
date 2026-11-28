@@ -243,22 +243,57 @@ void DrawBindings::ReclaimTextureSets(uint64_t retired_submission) {
   }
 }
 
+void DrawBindings::RemoveTextureSetFromViewIndex(size_t stage, const TextureSetKey* key_ptr,
+                                                 VkImageView skip_view) {
+  auto& index = view_to_texture_keys_[stage];
+  for (VkImageView v : key_ptr->views) {
+    if (v == VK_NULL_HANDLE || v == skip_view) {
+      continue;
+    }
+    auto map_it = index.find(v);
+    if (map_it == index.end()) {
+      continue;
+    }
+    auto& keys = map_it->second;
+    for (size_t i = 0; i < keys.size();) {
+      if (keys[i] == key_ptr) {
+        keys[i] = keys.back();
+        keys.pop_back();
+      } else {
+        ++i;
+      }
+    }
+    if (keys.empty()) {
+      index.erase(map_it);
+    }
+  }
+}
+
 void DrawBindings::PurgeImageViews(std::span<const VkImageView> views) {
   if (views.empty()) {
     return;
   }
   for (size_t s = 0; s < 2; ++s) {
     auto& cache = persistent_texture_sets_[s];
-    for (auto it = cache.begin(); it != cache.end();) {
-      const bool matches = std::ranges::any_of(it->first.views, [&](VkImageView v) {
-        return std::ranges::find(views, v) != views.end();
-      });
-      if (matches) {
-        retired_texture_sets_[s].emplace_back(it->second.pool_index,
-                                              it->second.last_use_submission);
-        it = cache.erase(it);
-      } else {
-        ++it;
+    auto& index = view_to_texture_keys_[s];
+    if (index.empty()) {
+      continue;
+    }
+    for (VkImageView v : views) {
+      auto map_it = index.find(v);
+      if (map_it == index.end()) {
+        continue;
+      }
+      auto keys = std::move(map_it->second);
+      index.erase(map_it);
+      for (const TextureSetKey* key_ptr : keys) {
+        auto it = cache.find(*key_ptr);
+        if (it != cache.end()) {
+          retired_texture_sets_[s].emplace_back(it->second.pool_index,
+                                                it->second.last_use_submission);
+          RemoveTextureSetFromViewIndex(s, key_ptr, v);
+          cache.erase(it);
+        }
       }
     }
   }
@@ -274,6 +309,7 @@ void DrawBindings::PurgeSampler(VkSampler sampler) {
       if (std::ranges::find(it->first.samplers, sampler) != it->first.samplers.end()) {
         retired_texture_sets_[s].emplace_back(it->second.pool_index,
                                               it->second.last_use_submission);
+        RemoveTextureSetFromViewIndex(s, &it->first);
         it = cache.erase(it);
       } else {
         ++it;
@@ -316,6 +352,7 @@ VkDescriptorSet DrawBindings::GetOrCreateTextureSet(size_t set_slot, uint32_t fr
           break;
         }
         pools[set_slot]->Free(victim->second.pool_index);
+        RemoveTextureSetFromViewIndex(stage, &victim->first);
         cache.erase(victim);
       }
     }
@@ -375,7 +412,15 @@ VkDescriptorSet DrawBindings::GetOrCreateTextureSet(size_t set_slot, uint32_t fr
     TextureSetKey key;
     key.views.assign(views.begin(), views.end());
     key.samplers.assign(samplers.begin(), samplers.end());
-    cache.emplace(std::move(key), PersistentTextureSet{index, submission});
+    auto [it, inserted] = cache.emplace(std::move(key), PersistentTextureSet{index, submission});
+    if (inserted) {
+      const TextureSetKey* key_ptr = &it->first;
+      for (VkImageView v : key_ptr->views) {
+        if (v != VK_NULL_HANDLE) {
+          view_to_texture_keys_[stage][v].push_back(key_ptr);
+        }
+      }
+    }
   } else {
     ephemeral_texture_sets_[frame_slot][stage].push_back(index);
   }

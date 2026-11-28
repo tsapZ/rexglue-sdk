@@ -306,10 +306,13 @@ struct DrawBindings {
   VkBuffer last_constant_buffer = VK_NULL_HANDLE;
   VkDescriptorSet last_constant_set = VK_NULL_HANDLE;
   // Persistent cross-frame sets for sets 2 and 3, plus retired/ephemeral fallbacks.
-  std::array<std::unordered_map<TextureSetKey, PersistentTextureSet, TextureSetKeyHash,
-                                TextureSetKeyEqual>,
-             2>
-      persistent_texture_sets_;
+  using TextureSetMap = std::unordered_map<TextureSetKey, PersistentTextureSet, TextureSetKeyHash,
+                                           TextureSetKeyEqual>;
+  void RemoveTextureSetFromViewIndex(size_t stage, const TextureSetKey* key_ptr,
+                                     VkImageView skip_view = VK_NULL_HANDLE);
+  std::array<TextureSetMap, 2> persistent_texture_sets_;
+  std::array<std::unordered_map<VkImageView, std::vector<const TextureSetKey*>>, 2>
+      view_to_texture_keys_;
   std::array<std::vector<std::pair<size_t, uint64_t>>, 2> retired_texture_sets_;
   std::array<std::array<std::vector<size_t>, 2>, 3> ephemeral_texture_sets_;
 };

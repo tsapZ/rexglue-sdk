@@ -1794,3 +1794,22 @@ TEST_CASE("Native Phase 5 clear folding, targeted set range, and storage usage",
   CHECK((native::GetColorImageUsage(VK_IMAGE_ASPECT_COLOR_BIT, true) &
          VK_IMAGE_USAGE_STORAGE_BIT) != 0);
 }
+
+TEST_CASE("Native Phase 1 physical page bitmap range helpers", "[gpu][native]") {
+  std::vector<uint64_t> pages((native::kSharedVertexPageCount + 63) / 64, 0);
+  const auto [p0, c0] = native::GetPhysicalPageRange(0x1000, 0x3000);
+  CHECK(p0 == 1);
+  CHECK(c0 == 3);
+  native::SetPageRangeBits(pages, p0, c0);
+  CHECK(native::HasAnyPageBitSet(pages, 1, 1));
+  CHECK(native::HasAnyPageBitSet(pages, 3, 2));
+  CHECK_FALSE(native::HasAnyPageBitSet(pages, 0, 1));
+  CHECK_FALSE(native::HasAnyPageBitSet(pages, 4, 4));
+  // Cross-word boundary (page 62..65).
+  native::SetPageRangeBits(pages, 62, 4);
+  CHECK(native::HasAnyPageBitSet(pages, 63, 1));
+  CHECK(native::HasAnyPageBitSet(pages, 64, 1));
+  native::ClearPageRangeBits(pages, 62, 4);
+  CHECK_FALSE(native::HasAnyPageBitSet(pages, 62, 4));
+  CHECK(native::HasAnyPageBitSet(pages, 1, 3));
+}

@@ -223,9 +223,11 @@ class NativeCommandProcessor : public CommandProcessor {
   VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
   std::unordered_multimap<uint64_t, std::unique_ptr<SpirvShader>> shaders_;
   std::unordered_map<uint64_t, SpirvShader*> shader_addr_cache_;
-  uint64_t last_shader_addr_key_ = 0;
-  SpirvShader* last_shader_ = nullptr;
+  std::array<uint64_t, 2> last_shader_addr_key_{};
+  std::array<SpirvShader*, 2> last_shader_{};
   std::vector<uint64_t> shader_pages_;
+  static constexpr size_t kShaderBucketCount = (kSharedVertexPageCount + 63) / 64;
+  std::array<std::vector<uint64_t>, kShaderBucketCount> shader_buckets_;
   std::vector<uint64_t> watched_pages_;
   std::unique_ptr<SpirvShaderTranslator> translator_;
   DrawPipelines pipelines_;
@@ -287,18 +289,42 @@ class NativeCommandProcessor : public CommandProcessor {
   void FlushAllDeferredClears();
   void ExecuteDepthClear(ColorImage* target, VkRect2D area, VkClearDepthStencilValue value);
   void ExecuteColorClear(ColorImage* target, VkRect2D area, const VkClearColorValue& value);
+  void ClearCurrentRunVertexReadPages() {
+    for (uint32_t word : current_run_vertex_read_dirty_words_) {
+      current_run_vertex_read_pages_[word] = 0;
+    }
+    current_run_vertex_read_dirty_words_.clear();
+  }
   void ResetCurrentRunVertexReads() {
-    current_run_vertex_reads_.clear();
+    ClearCurrentRunVertexReadPages();
     last_run_colors_.fill(nullptr);
     last_run_depth_ = nullptr;
   }
-  bool OverlapsCurrentRunVertexReads(uint32_t address, uint32_t size) const {
-    for (const auto& r : current_run_vertex_reads_) {
-      if (RangesOverlap(address, size, r.first, r.second)) {
-        return true;
-      }
+  void MarkCurrentRunVertexRead(uint32_t address, uint32_t size) {
+    if (current_run_vertex_read_pages_.empty()) {
+      return;
     }
-    return false;
+    const auto [first_page, page_count] = GetPhysicalPageRange(address, size);
+    if (!page_count) {
+      return;
+    }
+    const uint32_t end_page =
+        std::min(first_page + page_count, uint32_t(current_run_vertex_read_pages_.size() * 64));
+    for (uint32_t page = first_page; page < end_page;) {
+      const uint32_t word = page >> 6;
+      const uint32_t bit = page & 63;
+      const uint32_t count = std::min(64 - bit, end_page - page);
+      const uint64_t mask = (count == 64 ? ~uint64_t(0) : ((uint64_t(1) << count) - 1)) << bit;
+      if (current_run_vertex_read_pages_[word] == 0) {
+        current_run_vertex_read_dirty_words_.push_back(word);
+      }
+      current_run_vertex_read_pages_[word] |= mask;
+      page += count;
+    }
+  }
+  bool OverlapsCurrentRunVertexReads(uint32_t address, uint32_t size) const {
+    const auto [first_page, page_count] = GetPhysicalPageRange(address, size);
+    return HasAnyPageBitSet(current_run_vertex_read_pages_, first_page, page_count);
   }
 
   struct DeferredClear {
@@ -308,7 +334,8 @@ class NativeCommandProcessor : public CommandProcessor {
     bool is_depth = false;
   };
   std::unordered_map<ColorImage*, DeferredClear> deferred_clears_;
-  std::vector<PhysicalRange> current_run_vertex_reads_;
+  std::vector<uint64_t> current_run_vertex_read_pages_;
+  std::vector<uint32_t> current_run_vertex_read_dirty_words_;
   std::array<ColorImage*, xenos::kMaxColorRenderTargets> last_run_colors_{};
   ColorImage* last_run_depth_ = nullptr;
 
