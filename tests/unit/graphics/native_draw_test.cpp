@@ -1823,3 +1823,78 @@ TEST_CASE("Native Phase 2 early-Z hint and shader read stages", "[gpu][native]")
   CHECK((native::kAllShaderReadStages & VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT) != 0);
   CHECK((native::kAllShaderReadStages & VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) != 0);
 }
+
+TEST_CASE("Native Phase 4 rect coverage and inline MSAA resolve eligibility", "[gpu][native]") {
+  CHECK(native::RectCoversRect({{0, 0}, {1280, 720}}, {{0, 0}, {1280, 720}}));
+  CHECK(native::RectCoversRect({{0, 0}, {1280, 720}}, {{10, 20}, {100, 100}}));
+  CHECK_FALSE(native::RectCoversRect({{1, 0}, {1280, 720}}, {{0, 0}, {1280, 720}}));
+  CHECK_FALSE(native::RectCoversRect({{0, 0}, {1279, 720}}, {{0, 0}, {1280, 720}}));
+
+  CHECK(native::IsAverageResolveFormat(VK_FORMAT_R8G8B8A8_UNORM));
+  CHECK(native::IsAverageResolveFormat(VK_FORMAT_R16G16B16A16_SFLOAT));
+  CHECK_FALSE(native::IsAverageResolveFormat(VK_FORMAT_UNDEFINED));
+  CHECK_FALSE(native::IsAverageResolveFormat(VK_FORMAT_R8G8B8A8_UINT));
+  CHECK_FALSE(native::IsAverageResolveFormat(VK_FORMAT_R16G16_SINT));
+  CHECK_FALSE(native::IsAverageResolveFormat(VK_FORMAT_D24_UNORM_S8_UINT));
+
+  const VkExtent2D ext{1280, 720};
+  const auto valid = [&](bool depth_res, bool comp_res, bool fmt_conv, bool same_img,
+                         VkSampleCountFlagBits src_s, VkSampleCountFlagBits dst_s,
+                         VkFormat src_fmt, VkFormat dst_fmt, VkImageAspectFlags src_asp,
+                         VkImageAspectFlags dst_asp, uint32_t src_l, uint32_t dst_l,
+                         uint32_t dst_layer, VkOffset2D src_off, VkOffset2D dst_off,
+                         VkExtent2D src_ext, VkExtent2D dst_ext, VkExtent2D res_ext,
+                         VkExtent2D att_ext, bool fold_def, VkExtent2D fold_ext) {
+    return native::CanFoldInlineMsaaResolve(
+        depth_res, comp_res, fmt_conv, same_img, src_s, dst_s, src_fmt, dst_fmt, src_asp, dst_asp,
+        src_l, dst_l, dst_layer, src_off, dst_off, src_ext, dst_ext, res_ext, att_ext, fold_def,
+        fold_ext);
+  };
+  CHECK(valid(false, false, false, false, VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT,
+              VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+              VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, {0, 0}, {0, 0}, ext, ext, ext, ext, false, {}));
+  CHECK(valid(false, false, false, false, VK_SAMPLE_COUNT_2_BIT, VK_SAMPLE_COUNT_1_BIT,
+              VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+              VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, {0, 0}, {0, 0}, ext, ext, ext, ext, true, ext));
+  // Rejection guards:
+  CHECK_FALSE(valid(true, false, false, false, VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT,
+                    VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, {0, 0}, {0, 0}, ext, ext, ext, ext, false,
+                    {}));
+  CHECK_FALSE(valid(false, true, false, false, VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT,
+                    VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, {0, 0}, {0, 0}, ext, ext, ext, ext, false,
+                    {}));
+  CHECK_FALSE(valid(false, false, true, false, VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT,
+                    VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, {0, 0}, {0, 0}, ext, ext, ext, ext, false,
+                    {}));
+  CHECK_FALSE(valid(false, false, false, false, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT,
+                    VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, {0, 0}, {0, 0}, ext, ext, ext, ext, false,
+                    {}));
+  CHECK_FALSE(valid(false, false, false, false, VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT,
+                    VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, {0, 0}, {0, 0}, ext, ext, ext, ext, false,
+                    {}));
+  CHECK_FALSE(valid(false, false, false, false, VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT,
+                    VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_UINT, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, {0, 0}, {0, 0}, ext, ext, ext, ext, false,
+                    {}));
+  CHECK_FALSE(valid(false, false, false, false, VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT,
+                    VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 1, 2, 0, {0, 0}, {0, 0}, ext, ext, ext, ext, false,
+                    {}));
+  CHECK_FALSE(valid(false, false, false, false, VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT,
+                    VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, {8, 0}, {0, 0}, ext, ext, ext, ext, false,
+                    {}));
+  CHECK_FALSE(valid(false, false, false, false, VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT,
+                    VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, {0, 0}, {0, 0}, ext, ext, ext, {640, 360},
+                    false, {}));
+  CHECK_FALSE(valid(false, false, false, false, VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_1_BIT,
+                    VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, {0, 0}, {0, 0}, ext, ext, ext, ext, true,
+                    {640, 360}));
+}

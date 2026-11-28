@@ -242,6 +242,7 @@ bool NativeTextureCache::ReadTextures(const SpirvShader& shader, bool vertex, Dr
   auto& sampler_handles = vertex ? input.vertex_samplers : input.samplers;
   const auto read = [&](uint32_t slot, const xenos::xe_gpu_texture_fetch_t& fetch,
                         uint32_t swizzle_signs, bool signed_variant) {
+    static_assert(sizeof(xenos::xe_gpu_texture_fetch_t) == 6 * sizeof(uint32_t));
     std::array<uint32_t, 6> dwords{};
     std::memcpy(dwords.data(), &fetch, sizeof(dwords));
     const size_t cache_idx =

@@ -1697,9 +1697,9 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     const uint32_t rt_tile = layout.DecodeBase(target.value);
     const bool rt_is_64bpp = xenos::IsColorRenderTargetFormat64bpp(target.color_format);
-    ColorImage* color_target = target_cache_->FindTargetRaw(
-        rt_tile, dimensions.surface_pitch, dimensions.msaa_samples, format,
-        VK_IMAGE_ASPECT_COLOR_BIT, rt_is_64bpp, used_height, presented_, draw_scaled);
+    ColorImage* color_target =
+        FindTargetRaw(rt_tile, dimensions.surface_pitch, dimensions.msaa_samples, format,
+                      VK_IMAGE_ASPECT_COLOR_BIT, rt_is_64bpp, used_height, draw_scaled);
     if (!color_target) {
       return false;
     }
@@ -1727,10 +1727,11 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   draw.color_count = input.color_count;
   draw.memexport = memexport;
   if (use_depth) {
-    ColorImage* depth_target = target_cache_->FindTargetRaw(
-        layout.DecodeBase(depth_info.value), dimensions.surface_pitch, dimensions.msaa_samples,
-        input.depth_format, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, false,
-        used_height, presented_, draw_scaled);
+    ColorImage* depth_target =
+        FindTargetRaw(layout.DecodeBase(depth_info.value), dimensions.surface_pitch,
+                      dimensions.msaa_samples, input.depth_format,
+                      VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, false, used_height,
+                      draw_scaled);
     if (!depth_target) {
       return false;
     }
@@ -2008,6 +2009,15 @@ std::shared_ptr<ColorImage> NativeCommandProcessor::FindTarget(uint32_t tile, ui
   return target_cache_->FindTarget(tile, pitch, samples, format, aspects, is_64bpp,
                                    ActiveEdramLayout().tile_count, presented_, used_height,
                                    resolution_scaled);
+}
+
+ColorImage* NativeCommandProcessor::FindTargetRaw(uint32_t tile, uint32_t pitch,
+                                                  xenos::MsaaSamples samples, VkFormat format,
+                                                  VkImageAspectFlags aspects, bool is_64bpp,
+                                                  uint32_t used_height, bool resolution_scaled) {
+  return target_cache_->FindTargetRaw(tile, pitch, samples, format, aspects, is_64bpp,
+                                      ActiveEdramLayout().tile_count, presented_, used_height,
+                                      resolution_scaled);
 }
 
 void NativeCommandProcessor::ReleaseTextureOps(std::vector<DrawTextureOp>& ops) {
@@ -2722,9 +2732,65 @@ void NativeCommandProcessor::ExecuteColorClear(ColorImage* target, VkRect2D area
   vk.vkCmdEndRendering(command_buffer_);
 }
 
-void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands) {
+bool NativeCommandProcessor::IsAttachmentDeadAfterRun(ColorImage* target,
+                                                      size_t scan_start) const {
+  if (!target) {
+    return false;
+  }
+  const VkRect2D full_extent{{0, 0}, target->extent()};
+  for (size_t idx = scan_start; idx < pending_.size(); ++idx) {
+    const auto& cmd = pending_[idx];
+    if (const auto* d = std::get_if<QueuedDraw>(&cmd)) {
+      if (d->depth == target) {
+        return false;
+      }
+      for (uint32_t i = 0; i < d->color_count; ++i) {
+        if (d->colors[i] == target) {
+          return false;
+        }
+      }
+      const auto& pass = pending_passes_[d->pass_index];
+      const uint32_t first_op = pass.first_texture_op();
+      const uint32_t end_op = first_op + pass.texture_op_count();
+      for (uint32_t op_idx = first_op; op_idx < end_op; ++op_idx) {
+        const auto& op = pending_texture_ops_[op_idx];
+        if (op.resolved == target || op.crop_source == target || op.depth_pack_source == target) {
+          return false;
+        }
+        for (ColorImage* face : op.resolved_cube_faces) {
+          if (face == target) {
+            return false;
+          }
+        }
+      }
+    } else if (const auto* t = std::get_if<QueuedTileTransfer>(&cmd)) {
+      if (t->source.get() == target || t->destination.get() == target) {
+        return false;
+      }
+    } else if (const auto* r = std::get_if<QueuedResolve>(&cmd)) {
+      if (r->source.get() == target) {
+        return false;
+      }
+      if (r->destination.get() == target) {
+        return r->destination_layer == 0 && r->destination->array_layers() == 1 &&
+               RectCoversRect({r->destination_offset, r->extent}, full_extent);
+      }
+    } else if (const auto* c = std::get_if<QueuedDepthClear>(&cmd)) {
+      if (c->target.get() == target) {
+        return RectCoversRect(c->area, full_extent);
+      }
+    }
+  }
+  return false;
+}
+
+bool NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands,
+                                         size_t next_command_index,
+                                         const QueuedResolve* inline_resolve) {
   const auto& vk = vulkan_device_->functions();
   const auto& draw = std::get<QueuedDraw>(commands.front());
+  ColorImage* const candidate_dest = inline_resolve ? inline_resolve->destination.get() : nullptr;
+  bool dest_used_as_texture = false;
   VkExtent2D covered{};
   for (const auto& command : commands) {
     const auto& pass = pending_passes_[std::get<QueuedDraw>(command).pass_index];
@@ -2740,6 +2806,13 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
       if (op.depth_pack_source) FlushDeferredClear(op.depth_pack_source);
       for (ColorImage* face : op.resolved_cube_faces) {
         if (face) FlushDeferredClear(face);
+      }
+      if (candidate_dest &&
+          (op.resolved == candidate_dest || op.crop_source == candidate_dest ||
+           op.depth_pack_source == candidate_dest ||
+           std::ranges::find(op.resolved_cube_faces, candidate_dest) !=
+               op.resolved_cube_faces.end())) {
+        dest_used_as_texture = true;
       }
       RecordDrawTextureOp(*vulkan_device_, depth_resolve_.get(), command_buffer_, op);
     }
@@ -2794,8 +2867,8 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
   rendering.colorAttachmentCount = draw.color_count;
   rendering.pColorAttachments = colors.data();
   bool needs_full_clear = false;
-  VkExtent2D fold_clear_extent{};
-  std::array<VkImageMemoryBarrier, xenos::kMaxColorRenderTargets + 1> att_barriers{};
+  const VkExtent2D fold_clear_extent = fold_deferred ? clear_areas[0].extent : VkExtent2D{};
+  std::array<VkImageMemoryBarrier, xenos::kMaxColorRenderTargets + 2> att_barriers{};
   uint32_t att_barrier_count = 0;
   VkPipelineStageFlags att_src_stages = 0;
   VkPipelineStageFlags att_dst_stages = 0;
@@ -2811,7 +2884,6 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
       if (auto it = deferred_clears_.find(image); it != deferred_clears_.end()) {
         color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         color.clearValue = it->second.value;
-        fold_clear_extent = it->second.area.extent;
         deferred_clears_.erase(it);
       }
     }
@@ -2830,6 +2902,69 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
       att_dst_stages |= kColorStage;
     }
   }
+  uint32_t inline_slot = UINT32_MAX;
+  bool fold_inline = false;
+  if (!draw.memexport && inline_resolve && !dest_used_as_texture &&
+      inline_resolve->destination.get() != draw.depth) {
+    uint32_t source_matches = 0;
+    bool dest_in_colors = false;
+    for (uint32_t i = 0; i < draw.color_count; ++i) {
+      if (draw.colors[i] == inline_resolve->source.get()) {
+        inline_slot = i;
+        ++source_matches;
+      }
+      if (draw.colors[i] == inline_resolve->destination.get()) {
+        dest_in_colors = true;
+      }
+    }
+    if (source_matches == 1 && !dest_in_colors &&
+        CanFoldInlineMsaaResolve(
+            inline_resolve->depth_descriptor != SIZE_MAX,
+            inline_resolve->color_descriptor != SIZE_MAX, inline_resolve->format_convert,
+            inline_resolve->source == inline_resolve->destination, inline_resolve->source->samples(),
+            inline_resolve->destination->samples(), inline_resolve->source->format(),
+            inline_resolve->destination->format(), inline_resolve->source->aspects(),
+            inline_resolve->destination->aspects(), inline_resolve->source->array_layers(),
+            inline_resolve->destination->array_layers(), inline_resolve->destination_layer,
+            inline_resolve->source_offset, inline_resolve->destination_offset,
+            inline_resolve->source->extent(), inline_resolve->destination->extent(),
+            inline_resolve->extent, attachment_extent, fold_deferred, fold_clear_extent)) {
+      fold_inline = true;
+    }
+  }
+  const size_t dead_scan_start = fold_inline ? next_command_index + 1 : next_command_index;
+  for (uint32_t i = 0; i < draw.color_count; ++i) {
+    ColorImage* image = draw.colors[i];
+    if (!image) {
+      continue;
+    }
+    if (fold_inline && i == inline_slot) {
+      const bool cleared_after =
+          inline_resolve->clear_color &&
+          RectCoversRect({inline_resolve->source_offset, inline_resolve->extent},
+                         {{0, 0}, image->extent()});
+      colors[i].storeOp = (cleared_after || IsAttachmentDeadAfterRun(image, dead_scan_start))
+                              ? VK_ATTACHMENT_STORE_OP_DONT_CARE
+                              : VK_ATTACHMENT_STORE_OP_STORE;
+    } else if (IsAttachmentDeadAfterRun(image, dead_scan_start)) {
+      colors[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    }
+  }
+  if (fold_inline) {
+    deferred_clears_.erase(inline_resolve->destination.get());
+    VkPipelineStageFlags src_s = 0;
+    constexpr VkPipelineStageFlags kColorStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    if (inline_resolve->destination->PrepareTransition(
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, kColorStage,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, att_barriers[att_barrier_count], src_s)) {
+      ++att_barrier_count;
+      att_src_stages |= src_s;
+      att_dst_stages |= kColorStage;
+    }
+    colors[inline_slot].resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+    colors[inline_slot].resolveImageView = inline_resolve->destination->view();
+    colors[inline_slot].resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  }
   if (draw.depth) {
     depth.loadOp =
         draw.depth->initialized() ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -2838,12 +2973,13 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
       if (auto it = deferred_clears_.find(draw.depth); it != deferred_clears_.end()) {
         depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         depth.clearValue.depthStencil = it->second.value.depthStencil;
-        fold_clear_extent = it->second.area.extent;
         deferred_clears_.erase(it);
       }
     }
     needs_full_clear |= depth.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR && !fold_deferred;
-    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depth.storeOp = IsAttachmentDeadAfterRun(draw.depth, dead_scan_start)
+                        ? VK_ATTACHMENT_STORE_OP_DONT_CARE
+                        : VK_ATTACHMENT_STORE_OP_STORE;
     depth.imageView = draw.depth->view();
     depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     VkPipelineStageFlags src_s = 0;
@@ -2874,7 +3010,9 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
     vk.vkCmdPipelineBarrier(command_buffer_, kSharedMemoryShaderStages, kSharedMemoryShaderStages,
                             0, 0, nullptr, 1, &barrier, 0, nullptr);
   }
-  if (fold_deferred) {
+  if (fold_inline) {
+    rendering.renderArea = {{0, 0}, attachment_extent};
+  } else if (fold_deferred) {
     rendering.renderArea.extent = fold_clear_extent;
   } else if (needs_full_clear) {
     rendering.renderArea.extent = attachment_extent;
@@ -2889,6 +3027,24 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
                                                                      attachment_extent, state);
   }
   vk.vkCmdEndRendering(command_buffer_);
+  if (fold_inline) {
+    inline_resolve->destination->Transition(command_buffer_,
+                                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                            kAllShaderReadStages, VK_ACCESS_SHADER_READ_BIT);
+    if (inline_resolve->clear_color) {
+      if (inline_resolve->source_offset.x == 0 && inline_resolve->source_offset.y == 0 &&
+          inline_resolve->source->initialized()) {
+        VkClearValue cv{};
+        cv.color = inline_resolve->clear;
+        DeferClear(inline_resolve->source.get(), {{0, 0}, inline_resolve->extent}, cv, false);
+      } else {
+        FlushDeferredClear(inline_resolve->source.get());
+        ExecuteColorClear(inline_resolve->source.get(),
+                          {inline_resolve->source_offset, inline_resolve->extent},
+                          inline_resolve->clear);
+      }
+    }
+  }
   if (draw.memexport) {
     // Make the exported data visible to later draws, copies and readback.
     VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
@@ -2902,6 +3058,7 @@ void NativeCommandProcessor::RecordDraws(std::span<const FrameCommand> commands)
                             kSharedMemoryShaderStages | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
                             nullptr, 1, &barrier, 0, nullptr);
   }
+  return fold_inline;
 }
 
 void NativeCommandProcessor::RecordDepthClear(const QueuedDepthClear& clear) {
@@ -3355,6 +3512,11 @@ size_t NativeCommandProcessor::RecordPending() {
           break;
         }
       }
+      const QueuedResolve* candidate_resolve =
+          (!draw->memexport && last_draw_end < pending_.size())
+              ? std::get_if<QueuedResolve>(&pending_[last_draw_end])
+              : nullptr;
+      bool folded_resolve = false;
       if (has_interleaved_upload && last_draw_end > first + 1) {
         auto run_begin = pending_.begin() + ptrdiff_t(first);
         auto run_end = pending_.begin() + ptrdiff_t(last_draw_end);
@@ -3370,13 +3532,16 @@ size_t NativeCommandProcessor::RecordPending() {
         if (mid2 != mid1) {
           RecordIndexUploads(std::span(&*mid1, size_t(mid2 - mid1)));
         }
-        RecordDraws(std::span(&*mid2, size_t(run_end - mid2)));
+        folded_resolve = RecordDraws(std::span(&*mid2, size_t(run_end - mid2)), last_draw_end,
+                                     candidate_resolve);
         drawn += size_t(run_end - mid2);
       } else {
-        RecordDraws(std::span(pending_).subspan(first, last_draw_end - first));
+        folded_resolve =
+            RecordDraws(std::span(pending_).subspan(first, last_draw_end - first), last_draw_end,
+                        candidate_resolve);
         drawn += last_draw_end - first;
       }
-      first = last_draw_end;
+      first = folded_resolve ? last_draw_end + 1 : last_draw_end;
     } else if (std::holds_alternative<QueuedBufferUpload>(command)) {
       size_t end = first + 1;
       for (; end < pending_.size(); ++end) {

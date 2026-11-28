@@ -140,6 +140,9 @@ class NativeCommandProcessor : public CommandProcessor {
                                          VkFormat format, VkImageAspectFlags aspects,
                                          bool is_64bpp = false, uint32_t used_height = 0,
                                          bool resolution_scaled = true);
+  ColorImage* FindTargetRaw(uint32_t tile, uint32_t pitch, xenos::MsaaSamples samples,
+                            VkFormat format, VkImageAspectFlags aspects, bool is_64bpp = false,
+                            uint32_t used_height = 0, bool resolution_scaled = true);
   void QueueReplayDraw(const DrawInput& input, std::span<const uint32_t> indices,
                        const Shader::Translation& vertex, const Shader::Translation* pixel,
                        uint32_t rt_index, const std::shared_ptr<ColorImage>& image);
@@ -147,7 +150,9 @@ class NativeCommandProcessor : public CommandProcessor {
   size_t RecordPending();
   bool SubmitCommands();
   bool FlushPendingIfFull();
-  void RecordDraws(std::span<const FrameCommand> commands);
+  bool IsAttachmentDeadAfterRun(ColorImage* target, size_t scan_start) const;
+  bool RecordDraws(std::span<const FrameCommand> commands, size_t next_command_index,
+                   const QueuedResolve* inline_resolve = nullptr);
   void RecordBufferUploads(std::span<const FrameCommand> commands);
   void RecordIndexUploads(std::span<const FrameCommand> commands);
   void RecordResolve(const QueuedResolve& resolve);

@@ -33,6 +33,88 @@ inline bool ShouldUseEarlyDepthHint(bool implicit_early_z_write_allowed,
                                     bool coverage_depends_on_alpha) {
   return implicit_early_z_write_allowed && (!writes_color_target0 || !coverage_depends_on_alpha);
 }
+
+constexpr bool RectCoversRect(VkRect2D outer, VkRect2D inner) {
+  if (outer.offset.x > inner.offset.x || outer.offset.y > inner.offset.y) {
+    return false;
+  }
+  const int64_t outer_right = int64_t(outer.offset.x) + int64_t(outer.extent.width);
+  const int64_t outer_bottom = int64_t(outer.offset.y) + int64_t(outer.extent.height);
+  const int64_t inner_right = int64_t(inner.offset.x) + int64_t(inner.extent.width);
+  const int64_t inner_bottom = int64_t(inner.offset.y) + int64_t(inner.extent.height);
+  return outer_right >= inner_right && outer_bottom >= inner_bottom;
+}
+
+constexpr bool IsAverageResolveFormat(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R5G6B5_UNORM_PACK16:
+    case VK_FORMAT_B5G6R5_UNORM_PACK16:
+    case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
+    case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16_SNORM:
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+constexpr bool CanFoldInlineMsaaResolve(
+    bool is_depth_resolve, bool is_compute_resolve, bool format_convert, bool source_equals_dest,
+    VkSampleCountFlagBits source_samples, VkSampleCountFlagBits dest_samples,
+    VkFormat source_format, VkFormat dest_format, VkImageAspectFlags source_aspects,
+    VkImageAspectFlags dest_aspects, uint32_t source_layers, uint32_t dest_layers,
+    uint32_t dest_layer, VkOffset2D source_offset, VkOffset2D dest_offset, VkExtent2D source_extent,
+    VkExtent2D dest_extent, VkExtent2D resolve_extent, VkExtent2D attachment_extent,
+    bool fold_deferred, VkExtent2D fold_clear_extent) {
+  if (is_depth_resolve || is_compute_resolve || format_convert || source_equals_dest) {
+    return false;
+  }
+  if (source_samples == VK_SAMPLE_COUNT_1_BIT || dest_samples != VK_SAMPLE_COUNT_1_BIT) {
+    return false;
+  }
+  if (source_format != dest_format || !IsAverageResolveFormat(source_format)) {
+    return false;
+  }
+  if (source_aspects != VK_IMAGE_ASPECT_COLOR_BIT || dest_aspects != VK_IMAGE_ASPECT_COLOR_BIT) {
+    return false;
+  }
+  if (source_layers != 1 || dest_layers != 1 || dest_layer != 0) {
+    return false;
+  }
+  if (source_offset.x != 0 || source_offset.y != 0 || dest_offset.x != 0 || dest_offset.y != 0) {
+    return false;
+  }
+  if (source_extent.width != resolve_extent.width ||
+      source_extent.height != resolve_extent.height ||
+      dest_extent.width != resolve_extent.width || dest_extent.height != resolve_extent.height ||
+      attachment_extent.width != resolve_extent.width ||
+      attachment_extent.height != resolve_extent.height) {
+    return false;
+  }
+  if (fold_deferred && (fold_clear_extent.width != resolve_extent.width ||
+                        fold_clear_extent.height != resolve_extent.height)) {
+    return false;
+  }
+  return true;
+}
 constexpr uint32_t kSharedVertexPageShift = 12;
 constexpr uint32_t kSharedVertexPageSize = 1u << kSharedVertexPageShift;
 constexpr uint32_t kSharedVertexPageCount = kPhysicalMemorySize >> kSharedVertexPageShift;
