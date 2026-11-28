@@ -243,6 +243,16 @@ constexpr VkBufferUsageFlags kDrawUploadUsage =
     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
+inline SpirvShaderTranslator::Modification::DepthStencilMode SelectPixelDepthStencilMode(
+    bool implicit_early_z_write_allowed, bool writes_color_target0,
+    bool coverage_depends_on_alpha) {
+  using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
+  return ShouldUseEarlyDepthHint(implicit_early_z_write_allowed, writes_color_target0,
+                                 coverage_depends_on_alpha)
+             ? DepthStencilMode::kEarlyHint
+             : DepthStencilMode::kNoModifiers;
+}
+
 // Descriptor range of each constant buffer, bound as
 // VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: the largest data a draw can have.
 constexpr std::array<uint64_t, SpirvShaderTranslator::kConstantBufferCount>
@@ -336,13 +346,24 @@ struct DrawBindingCache {
   bool has_last = false;
   VkDescriptorSetLayout shared_set0_layout = VK_NULL_HANDLE;
   uint32_t shared_set0_count = 0;
+  std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool> shared_set0_pool;
+  VkDescriptorSet shared_vertex_set = VK_NULL_HANDLE;
+  size_t shared_vertex_set_index = SIZE_MAX;
+  VkBuffer shared_vertex_buffer = VK_NULL_HANDLE;
   VkDescriptorSetLayout shared_set1_layout = VK_NULL_HANDLE;
+  std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool> shared_set1_pool;
+  std::unordered_map<VkBuffer, size_t> constant_sets;
+  VkBuffer last_constant_buffer = VK_NULL_HANDLE;
+  VkDescriptorSet last_constant_set = VK_NULL_HANDLE;
   const ui::vulkan::VulkanDevice* layout_device = nullptr;
 
   DrawBindingCache() = default;
   DrawBindingCache(const DrawBindingCache&) = delete;
   DrawBindingCache& operator=(const DrawBindingCache&) = delete;
   ~DrawBindingCache() { clear(); }
+
+  VkDescriptorSet GetOrCreateSharedVertexSet(VkBuffer buffer, uint32_t shared_count);
+  VkDescriptorSet GetOrCreateConstantSet(VkBuffer buffer);
 
   DrawBindings* FindOrNull(const std::array<uint32_t, 5>& key) {
     if (has_last && last_key == key) {
@@ -364,6 +385,22 @@ struct DrawBindingCache {
     return last_bindings;
   }
   void clear() {
+    if (shared_vertex_set_index != SIZE_MAX && shared_set0_pool) {
+      shared_set0_pool->Free(shared_vertex_set_index);
+    }
+    shared_vertex_set_index = SIZE_MAX;
+    shared_vertex_set = VK_NULL_HANDLE;
+    shared_vertex_buffer = VK_NULL_HANDLE;
+    if (shared_set1_pool) {
+      for (const auto& entry : constant_sets) {
+        shared_set1_pool->Free(entry.second);
+      }
+    }
+    constant_sets.clear();
+    last_constant_buffer = VK_NULL_HANDLE;
+    last_constant_set = VK_NULL_HANDLE;
+    shared_set0_pool.reset();
+    shared_set1_pool.reset();
     map.clear();
     last_bindings = nullptr;
     has_last = false;
@@ -458,6 +495,9 @@ class DrawPass {
   const ui::vulkan::VulkanDevice* device_;
   VmaAllocator allocator_;
   DrawBindings* bindings_ = nullptr;
+  DrawBindingCache* binding_cache_ = nullptr;
+  bool set0_from_cache_ = false;
+  bool set1_from_cache_ = false;
   // Sets this pass allocated and frees; shared and cached sets stay SIZE_MAX.
   std::array<size_t, 4> set_indices_{SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
   std::array<VkDescriptorSet, 4> sets_{};

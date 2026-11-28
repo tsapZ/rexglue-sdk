@@ -15,9 +15,8 @@ namespace {
 
 using Translator = SpirvShaderTranslator;
 
-// Both vertex and pixel shaders sample textures.
-constexpr VkPipelineStageFlags kTextureStages =
-    VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+// Both vertex and pixel shaders sample textures; compute resolves also read/write views.
+constexpr VkPipelineStageFlags kTextureStages = kAllShaderReadStages;
 
 VkShaderModule CreateShaderModule(const ui::vulkan::VulkanDevice& device, const uint32_t* code,
                                   size_t size) {
@@ -140,17 +139,10 @@ DrawBindings::~DrawBindings() {
   vk.vkDestroyPipelineLayout(device.device(), pipeline_layout, nullptr);
 }
 
-VkDescriptorSet DrawBindings::GetOrCreateSharedVertexSet(VkBuffer buffer, uint32_t shared_count) {
-  if (shared_vertex_set != VK_NULL_HANDLE && shared_vertex_buffer == buffer) {
-    return shared_vertex_set;
-  }
-  if (shared_vertex_set_index == SIZE_MAX) {
-    shared_vertex_set_index = pools[0]->Allocate();
-    if (shared_vertex_set_index == SIZE_MAX) {
-      return VK_NULL_HANDLE;
-    }
-    shared_vertex_set = pools[0]->Get(shared_vertex_set_index);
-  }
+namespace {
+
+void WriteSharedVertexSetDescriptors(const ui::vulkan::VulkanDevice& device, VkDescriptorSet set,
+                                     VkBuffer buffer, uint32_t shared_count) {
   constexpr size_t kInlineSharedBuffers = 8;
   std::array<VkDescriptorBufferInfo, kInlineSharedBuffers> inline_shared_infos{};
   std::vector<VkDescriptorBufferInfo> heap_shared_infos;
@@ -167,7 +159,7 @@ VkDescriptorSet DrawBindings::GetOrCreateSharedVertexSet(VkBuffer buffer, uint32
   }
   const VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                    nullptr,
-                                   shared_vertex_set,
+                                   set,
                                    0,
                                    0,
                                    shared_count,
@@ -175,6 +167,86 @@ VkDescriptorSet DrawBindings::GetOrCreateSharedVertexSet(VkBuffer buffer, uint32
                                    nullptr,
                                    shared_infos};
   device.functions().vkUpdateDescriptorSets(device.device(), 1, &write, 0, nullptr);
+}
+
+void WriteConstantSetDescriptors(const ui::vulkan::VulkanDevice& device, VkDescriptorSet set,
+                                 VkBuffer buffer) {
+  std::array<VkDescriptorBufferInfo, Translator::kConstantBufferCount> infos{};
+  std::array<VkWriteDescriptorSet, Translator::kConstantBufferCount> writes{};
+  for (uint32_t i = 0; i < infos.size(); ++i) {
+    infos[i] = {buffer, 0, kDynamicConstantBufferRanges[i]};
+    writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                 nullptr,
+                 set,
+                 i,
+                 0,
+                 1,
+                 VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+                 nullptr,
+                 &infos[i]};
+  }
+  device.functions().vkUpdateDescriptorSets(device.device(), uint32_t(writes.size()),
+                                            writes.data(), 0, nullptr);
+}
+
+}  // namespace
+
+VkDescriptorSet DrawBindingCache::GetOrCreateSharedVertexSet(VkBuffer buffer,
+                                                             uint32_t shared_count) {
+  if (shared_vertex_set != VK_NULL_HANDLE && shared_vertex_buffer == buffer) {
+    return shared_vertex_set;
+  }
+  if (!layout_device || !shared_set0_pool) {
+    return VK_NULL_HANDLE;
+  }
+  if (shared_vertex_set_index == SIZE_MAX) {
+    shared_vertex_set_index = shared_set0_pool->Allocate();
+    if (shared_vertex_set_index == SIZE_MAX) {
+      return VK_NULL_HANDLE;
+    }
+    shared_vertex_set = shared_set0_pool->Get(shared_vertex_set_index);
+  }
+  WriteSharedVertexSetDescriptors(*layout_device, shared_vertex_set, buffer, shared_count);
+  shared_vertex_buffer = buffer;
+  return shared_vertex_set;
+}
+
+VkDescriptorSet DrawBindingCache::GetOrCreateConstantSet(VkBuffer buffer) {
+  if (buffer == last_constant_buffer && last_constant_set != VK_NULL_HANDLE) {
+    return last_constant_set;
+  }
+  if (auto found = constant_sets.find(buffer); found != constant_sets.end()) {
+    last_constant_buffer = buffer;
+    last_constant_set = shared_set1_pool->Get(found->second);
+    return last_constant_set;
+  }
+  if (!layout_device || !shared_set1_pool) {
+    return VK_NULL_HANDLE;
+  }
+  const size_t index = shared_set1_pool->Allocate();
+  if (index == SIZE_MAX) {
+    return VK_NULL_HANDLE;
+  }
+  const VkDescriptorSet set = shared_set1_pool->Get(index);
+  WriteConstantSetDescriptors(*layout_device, set, buffer);
+  constant_sets.emplace(buffer, index);
+  last_constant_buffer = buffer;
+  last_constant_set = set;
+  return set;
+}
+
+VkDescriptorSet DrawBindings::GetOrCreateSharedVertexSet(VkBuffer buffer, uint32_t shared_count) {
+  if (shared_vertex_set != VK_NULL_HANDLE && shared_vertex_buffer == buffer) {
+    return shared_vertex_set;
+  }
+  if (shared_vertex_set_index == SIZE_MAX) {
+    shared_vertex_set_index = pools[0]->Allocate();
+    if (shared_vertex_set_index == SIZE_MAX) {
+      return VK_NULL_HANDLE;
+    }
+    shared_vertex_set = pools[0]->Get(shared_vertex_set_index);
+  }
+  WriteSharedVertexSetDescriptors(device, shared_vertex_set, buffer, shared_count);
   shared_vertex_buffer = buffer;
   return shared_vertex_set;
 }
@@ -415,8 +487,19 @@ VkDescriptorSet DrawBindings::GetOrCreateTextureSet(size_t set_slot, uint32_t fr
     auto [it, inserted] = cache.emplace(std::move(key), PersistentTextureSet{index, submission});
     if (inserted) {
       const TextureSetKey* key_ptr = &it->first;
-      for (VkImageView v : key_ptr->views) {
-        if (v != VK_NULL_HANDLE) {
+      for (size_t vi = 0; vi < key_ptr->views.size(); ++vi) {
+        const VkImageView v = key_ptr->views[vi];
+        if (v == VK_NULL_HANDLE) {
+          continue;
+        }
+        bool duplicate = false;
+        for (size_t pj = 0; pj < vi; ++pj) {
+          if (key_ptr->views[pj] == v) {
+            duplicate = true;
+            break;
+          }
+        }
+        if (!duplicate) {
           view_to_texture_keys_[stage][v].push_back(key_ptr);
         }
       }
@@ -517,16 +600,21 @@ bool DrawBindings::Initialize(uint32_t shared_count, uint32_t vertex_image_count
         return false;
       }
     }
-    std::vector<VkDescriptorPoolSize> sizes;
-    for (const auto& binding : bindings[i]) {
-      if (!sizes.empty() && sizes.back().type == binding.descriptorType) {
-        sizes.back().descriptorCount += binding.descriptorCount;
-      } else {
-        sizes.push_back({binding.descriptorType, binding.descriptorCount});
+    const bool adopt_shared_pool =
+        (i == 0 && shared_set0_layout != VK_NULL_HANDLE) ||
+        (i == 1 && shared_set1_layout != VK_NULL_HANDLE);
+    if (!adopt_shared_pool) {
+      std::vector<VkDescriptorPoolSize> sizes;
+      for (const auto& binding : bindings[i]) {
+        if (!sizes.empty() && sizes.back().type == binding.descriptorType) {
+          sizes.back().descriptorCount += binding.descriptorCount;
+        } else {
+          sizes.push_back({binding.descriptorType, binding.descriptorCount});
+        }
       }
+      pools[i] = std::make_unique<ui::vulkan::SingleLayoutDescriptorSetPool>(
+          &device, empty_layouts[i] ? 1 : 64, uint32_t(sizes.size()), sizes.data(), layouts[i]);
     }
-    pools[i] = std::make_unique<ui::vulkan::SingleLayoutDescriptorSetPool>(
-        &device, empty_layouts[i] ? 1 : 64, uint32_t(sizes.size()), sizes.data(), layouts[i]);
   }
   VkPipelineLayoutCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -552,6 +640,9 @@ DrawPass& DrawPass::operator=(DrawPass&& other) noexcept {
   device_ = other.device_;
   allocator_ = other.allocator_;
   bindings_ = std::exchange(other.bindings_, nullptr);
+  binding_cache_ = std::exchange(other.binding_cache_, nullptr);
+  set0_from_cache_ = std::exchange(other.set0_from_cache_, false);
+  set1_from_cache_ = std::exchange(other.set1_from_cache_, false);
   set_indices_ = std::exchange(other.set_indices_, {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX});
   sets_ = other.sets_;
   dynamic_offsets_ = other.dynamic_offsets_;
@@ -587,10 +678,18 @@ void DrawPass::Release() {
   const VkDevice device = device_->device();
   for (size_t i = 0; i < set_indices_.size(); ++i) {
     if (set_indices_[i] != SIZE_MAX) {
-      bindings_->pools[i]->Free(set_indices_[i]);
+      if (i == 0 && set0_from_cache_ && binding_cache_ && binding_cache_->shared_set0_pool) {
+        binding_cache_->shared_set0_pool->Free(set_indices_[i]);
+      } else if (i == 1 && set1_from_cache_ && binding_cache_ && binding_cache_->shared_set1_pool) {
+        binding_cache_->shared_set1_pool->Free(set_indices_[i]);
+      } else if (bindings_ && bindings_->pools[i]) {
+        bindings_->pools[i]->Free(set_indices_[i]);
+      }
       set_indices_[i] = SIZE_MAX;
     }
   }
+  set0_from_cache_ = false;
+  set1_from_cache_ = false;
   if (buffer_memory_) {
     vk.vkDestroyBuffer(device, buffer_, nullptr);
     vk.vkFreeMemory(device, buffer_memory_, nullptr);
@@ -662,6 +761,9 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
                                uint32_t(input.vertex_samplers.size()),
                                uint32_t(input.texture_bindings.size()),
                                uint32_t(input.samplers.size())};
+  binding_cache_ = &binding_cache;
+  set0_from_cache_ = false;
+  set1_from_cache_ = false;
   bindings_ = binding_cache.FindOrNull(binding_key);
   if (!bindings_) {
     auto layout = std::make_unique<DrawBindings>(*device_);
@@ -676,18 +778,25 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
       binding_cache.layout_device = device_;
       binding_cache.shared_set0_layout = layout->layouts[0];
       binding_cache.shared_set0_count = binding_key[0];
+      binding_cache.shared_set0_pool = std::move(layout->pools[0]);
       layout->owns_prefix_layouts[0] = false;
     }
     if (binding_cache.shared_set1_layout == VK_NULL_HANDLE) {
       binding_cache.layout_device = device_;
       binding_cache.shared_set1_layout = layout->layouts[1];
+      binding_cache.shared_set1_pool = std::move(layout->pools[1]);
       layout->owns_prefix_layouts[1] = false;
     }
     bindings_ = binding_cache.Insert(binding_key, std::move(layout));
   }
   for (size_t i = 0; i < sets_.size(); ++i) {
     if (i == 0 && shared_vertex_buffer != VK_NULL_HANDLE) {
-      sets_[0] = bindings_->GetOrCreateSharedVertexSet(shared_vertex_buffer, shared_buffer_count);
+      sets_[0] = (shared_buffer_count == binding_cache.shared_set0_count &&
+                  binding_cache.shared_set0_pool)
+                     ? binding_cache.GetOrCreateSharedVertexSet(shared_vertex_buffer,
+                                                                shared_buffer_count)
+                     : bindings_->GetOrCreateSharedVertexSet(shared_vertex_buffer,
+                                                             shared_buffer_count);
       if (sets_[0] == VK_NULL_HANDLE) {
         return false;
       }
@@ -708,11 +817,15 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
       }
       continue;
     }
-    auto& pool = *bindings_->pools[i];
+    const bool use_cache_set0 =
+        i == 0 && shared_buffer_count == binding_cache.shared_set0_count &&
+        binding_cache.shared_set0_pool;
+    auto& pool = use_cache_set0 ? *binding_cache.shared_set0_pool : *bindings_->pools[i];
     set_indices_[i] = pool.Allocate();
     if (set_indices_[i] == SIZE_MAX) {
       return false;
     }
+    set0_from_cache_ = use_cache_set0;
     sets_[i] = pool.Get(set_indices_[i]);
   }
 
@@ -824,7 +937,9 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
   }
   if (use_preuploaded_constants) {
     dynamic_offsets_ = preuploaded_constants->dynamic_offsets;
-    sets_[1] = bindings_->GetOrCreateConstantSet(preuploaded_constants->buffer);
+    sets_[1] = binding_cache.shared_set1_pool
+                   ? binding_cache.GetOrCreateConstantSet(preuploaded_constants->buffer)
+                   : bindings_->GetOrCreateConstantSet(preuploaded_constants->buffer);
     if (sets_[1] == VK_NULL_HANDLE) {
       return false;
     }
@@ -842,14 +957,19 @@ bool DrawPass::Initialize(const DrawInput& input, const IndexBinding& index_bind
     }
     if (buffer_memory_) {
       // A dedicated buffer outlives no other draw, so it gets a set of its own.
-      set_indices_[1] = bindings_->pools[1]->Allocate();
+      const bool use_cache_set1 = binding_cache.shared_set1_pool != nullptr;
+      auto& set1_pool = use_cache_set1 ? *binding_cache.shared_set1_pool : *bindings_->pools[1];
+      set_indices_[1] = set1_pool.Allocate();
       if (set_indices_[1] == SIZE_MAX) {
         return false;
       }
-      sets_[1] = bindings_->pools[1]->Get(set_indices_[1]);
-      bindings_->WriteConstantSet(sets_[1], buffer_);
+      set1_from_cache_ = use_cache_set1;
+      sets_[1] = set1_pool.Get(set_indices_[1]);
+      WriteConstantSetDescriptors(*device_, sets_[1], buffer_);
     } else {
-      sets_[1] = bindings_->GetOrCreateConstantSet(buffer_);
+      sets_[1] = binding_cache.shared_set1_pool
+                     ? binding_cache.GetOrCreateConstantSet(buffer_)
+                     : bindings_->GetOrCreateConstantSet(buffer_);
       if (sets_[1] == VK_NULL_HANDLE) {
         return false;
       }

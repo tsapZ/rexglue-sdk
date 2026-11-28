@@ -794,40 +794,79 @@ void NativeCommandProcessor::DrainMemoryInvalidations() {
         const size_t first_bucket = first_page >> 6;
         const size_t last_bucket =
             std::min((first_page + page_count - 1) >> 6, uint32_t(kShaderBucketCount - 1));
+        auto recompute_bucket_word = [&](size_t bucket_idx) {
+          const auto& bucket = shader_buckets_[bucket_idx];
+          uint64_t new_word = 0;
+          const uint32_t bucket_first_page = uint32_t(bucket_idx) << 6;
+          for (uint64_t key : bucket) {
+            const uint32_t s_addr = uint32_t(key >> 32);
+            const uint32_t s_len = uint32_t(key) * uint32_t(sizeof(uint32_t));
+            const auto [s_first_page, s_page_count] = GetPhysicalPageRange(s_addr, s_len);
+            const uint32_t s_end_page = s_first_page + s_page_count;
+            const uint32_t lo = std::max(s_first_page, bucket_first_page);
+            const uint32_t hi = std::min(s_end_page, bucket_first_page + 64);
+            for (uint32_t p = lo; p < hi; ++p) {
+              new_word |= UINT64_C(1) << (p & 63);
+            }
+          }
+          std::atomic_ref<uint64_t>(shader_pages_[bucket_idx])
+              .store(new_word, std::memory_order_relaxed);
+        };
         for (size_t b = first_bucket; b <= last_bucket; ++b) {
           auto& bucket = shader_buckets_[b];
           if (bucket.empty()) {
             std::atomic_ref<uint64_t>(shader_pages_[b]).store(0, std::memory_order_relaxed);
             continue;
           }
-          uint64_t new_word = 0;
-          const uint32_t bucket_first_page = uint32_t(b) << 6;
           for (size_t i = 0; i < bucket.size();) {
             const uint64_t key = bucket[i];
             const uint32_t s_addr = uint32_t(key >> 32);
             const uint32_t s_len = uint32_t(key) * uint32_t(sizeof(uint32_t));
-            if (RangesOverlap(start, length, s_addr, s_len)) {
-              for (size_t st = 0; st < 2; ++st) {
-                if (last_shader_addr_key_[st] == key) {
-                  last_shader_[st] = nullptr;
-                  last_shader_addr_key_[st] = 0;
+            const bool already_erased = shader_addr_cache_.find(key) == shader_addr_cache_.end();
+            if (already_erased || RangesOverlap(start, length, s_addr, s_len)) {
+              if (!already_erased) {
+                for (size_t st = 0; st < 2; ++st) {
+                  if (last_shader_addr_key_[st] == key) {
+                    last_shader_[st] = nullptr;
+                    last_shader_addr_key_[st] = 0;
+                  }
+                }
+                shader_addr_cache_.erase(key);
+                const auto [s_first_page, s_page_count] = GetPhysicalPageRange(s_addr, s_len);
+                if (s_page_count) {
+                  const size_t sb_first = s_first_page >> 6;
+                  const size_t sb_last = std::min((s_first_page + s_page_count - 1) >> 6,
+                                                  uint32_t(kShaderBucketCount - 1));
+                  if (sb_first != sb_last) {
+                    for (size_t sb = sb_first; sb <= sb_last; ++sb) {
+                      if (sb >= first_bucket && sb <= last_bucket) {
+                        continue;
+                      }
+                      auto& sibling = shader_buckets_[sb];
+                      bool removed = false;
+                      for (size_t j = 0; j < sibling.size();) {
+                        if (sibling[j] == key) {
+                          sibling[j] = sibling.back();
+                          sibling.pop_back();
+                          removed = true;
+                        } else {
+                          ++j;
+                        }
+                      }
+                      if (removed) {
+                        recompute_bucket_word(sb);
+                      }
+                    }
+                  }
                 }
               }
-              shader_addr_cache_.erase(key);
               bucket[i] = bucket.back();
               bucket.pop_back();
             } else {
-              const auto [s_first_page, s_page_count] = GetPhysicalPageRange(s_addr, s_len);
-              const uint32_t s_end_page = s_first_page + s_page_count;
-              const uint32_t lo = std::max(s_first_page, bucket_first_page);
-              const uint32_t hi = std::min(s_end_page, bucket_first_page + 64);
-              for (uint32_t p = lo; p < hi; ++p) {
-                new_word |= UINT64_C(1) << (p & 63);
-              }
               ++i;
             }
           }
-          std::atomic_ref<uint64_t>(shader_pages_[b]).store(new_word, std::memory_order_relaxed);
+          recompute_bucket_word(b);
         }
       }
     }
@@ -1221,6 +1260,10 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     string::StringBuffer disassembly;
     ps->AnalyzeUcode(disassembly);
   }
+  const bool raw_has_ps = ps != nullptr;
+  if (ps && !draw_util::IsPixelShaderNeededWithRasterization(*ps, regs)) {
+    ps = nullptr;
+  }
   const auto& properties = vulkan_device_->properties();
   const bool vs_memexport = vs.memexport_eM_written() != 0;
   const bool ps_memexport = ps && ps->memexport_eM_written() != 0;
@@ -1277,6 +1320,9 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       pixel_modification.pixel.param_gen_point = point;
     }
     pixel_modification.pixel.resolution_scale_native = draw_native_1x ? 1u : 0u;
+    pixel_modification.pixel.depth_stencil_mode = SelectPixelDepthStencilMode(
+        ps->implicit_early_z_write_allowed(), ps->writes_color_target(0),
+        draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>()));
     pixel = ps->GetOrCreateTranslation(pixel_modification.value);
   }
   auto& vertex = *vs.GetOrCreateTranslation(vertex_modification.value);
@@ -1433,7 +1479,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   const bool may_snapshot_fast_clear =
       dimensions.msaa_samples == xenos::MsaaSamples::k4X &&
-      ((!use_color && use_depth && !ps) || rectangle);
+      ((!use_color && use_depth && !raw_has_ps) || rectangle);
   const bool use_shared_vertices =
       shared_vertex_ && !(expanded && index_buffer_info) && !may_snapshot_fast_clear;
   IndexBinding index_binding{};
@@ -1532,7 +1578,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                 sizeof(input.fetch));
   }
   const bool need_fast_clear_constants =
-      (!use_color && use_depth && dimensions.msaa_samples == xenos::MsaaSamples::k4X && !ps) ||
+      (!use_color && use_depth && dimensions.msaa_samples == xenos::MsaaSamples::k4X &&
+       !raw_has_ps) ||
       (use_color && pixel != nullptr && input.textures.empty() &&
        prim_type == xenos::PrimitiveType::kRectangleList &&
        dimensions.msaa_samples == xenos::MsaaSamples::k4X);
@@ -1753,7 +1800,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // Replay it on every aliased target that already exists, and remember it so
   // targets created later start out cleared instead of uninitialized.
   const bool aliased_4x_depth_clear =
-      !use_color && use_depth && dimensions.msaa_samples == xenos::MsaaSamples::k4X && !ps;
+      !use_color && use_depth && dimensions.msaa_samples == xenos::MsaaSamples::k4X && !raw_has_ps;
   const bool aliased_4x_color_depth_clear = IsAliased4xColorDepthClear(
       use_color, pixel != nullptr, !input.textures.empty(), prim_type, dimensions.msaa_samples,
       regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable != 0, any_blend_enabled, use_depth,
@@ -1885,6 +1932,9 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           scaled_ps_mod.pixel.param_gen_point = point;
         }
         scaled_ps_mod.pixel.resolution_scale_native = 0;
+        scaled_ps_mod.pixel.depth_stencil_mode = SelectPixelDepthStencilMode(
+            ps->implicit_early_z_write_allowed(), ps->writes_color_target(0),
+            draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>()));
         if (auto* candidate_ps = ps->GetOrCreateTranslation(scaled_ps_mod.value);
             candidate_ps &&
             (candidate_ps->is_translated() ||
@@ -2415,8 +2465,7 @@ bool NativeCommandProcessor::CaptureResolveImage(ColorImage& image, VkOffset2D s
   } else {
     recorded = readback->Record(command_buffer_, image.image(), image.extent());
   }
-  image.Transition(command_buffer_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+  image.Transition(command_buffer_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kAllShaderReadStages,
                    VK_ACCESS_SHADER_READ_BIT);
   const uint32_t frame = current_frame_;
   if (!SubmitCommands() || !RetireAllSubmissions()) {
@@ -2864,6 +2913,38 @@ void NativeCommandProcessor::RecordDepthClear(const QueuedDepthClear& clear) {
   ExecuteDepthClear(clear.target.get(), clear.area, clear.value);
 }
 
+static void TransitionTwoImages(VkCommandBuffer cmd, const ui::vulkan::VulkanDevice& dev,
+                                ColorImage& first, VkImageLayout first_layout,
+                                VkPipelineStageFlags first_stage, VkAccessFlags first_access,
+                                ColorImage& second, VkImageLayout second_layout,
+                                VkPipelineStageFlags second_stage, VkAccessFlags second_access) {
+  if (&first == &second) {
+    first.Transition(cmd, first_layout, first_stage, first_access);
+    second.Transition(cmd, second_layout, second_stage, second_access);
+    return;
+  }
+  std::array<VkImageMemoryBarrier, 2> barriers{};
+  uint32_t count = 0;
+  VkPipelineStageFlags src_stages = 0;
+  VkPipelineStageFlags dst_stages = 0;
+  VkPipelineStageFlags s0 = 0;
+  if (first.PrepareTransition(first_layout, first_stage, first_access, barriers[count], s0)) {
+    src_stages |= s0;
+    dst_stages |= first_stage;
+    ++count;
+  }
+  VkPipelineStageFlags s1 = 0;
+  if (second.PrepareTransition(second_layout, second_stage, second_access, barriers[count], s1)) {
+    src_stages |= s1;
+    dst_stages |= second_stage;
+    ++count;
+  }
+  if (count) {
+    dev.functions().vkCmdPipelineBarrier(cmd, src_stages, dst_stages, 0, 0, nullptr, 0, nullptr,
+                                         count, barriers.data());
+  }
+}
+
 void NativeCommandProcessor::RecordTileTransfer(const QueuedTileTransfer& transfer) {
   FlushDeferredClear(transfer.source.get());
   FlushDeferredClear(transfer.destination.get());
@@ -2881,10 +2962,11 @@ void NativeCommandProcessor::RecordTileTransfer(const QueuedTileTransfer& transf
     }
   }
   constexpr auto transfer_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-  transfer.source->Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                              transfer_stage, VK_ACCESS_TRANSFER_READ_BIT);
-  destination.Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, transfer_stage,
-                         VK_ACCESS_TRANSFER_WRITE_BIT);
+  TransitionTwoImages(command_buffer_, *vulkan_device_, *transfer.source,
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, transfer_stage,
+                      VK_ACCESS_TRANSFER_READ_BIT, destination,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, transfer_stage,
+                      VK_ACCESS_TRANSFER_WRITE_BIT);
   vulkan_device_->functions().vkCmdCopyImage(
       command_buffer_, transfer.source->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
       destination.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(transfer.copies.size()),
@@ -2899,10 +2981,10 @@ void NativeCommandProcessor::RecordResolve(const QueuedResolve& resolve) {
       ExecuteDepthClear(resolve.source.get(), {{0, 0}, resolve.source->extent()}, {0.0f, 0});
     }
     constexpr auto compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    resolve.source->Transition(command_buffer_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, compute,
-                               VK_ACCESS_SHADER_READ_BIT);
-    resolve.destination->Transition(command_buffer_, VK_IMAGE_LAYOUT_GENERAL, compute,
-                                    VK_ACCESS_SHADER_WRITE_BIT);
+    TransitionTwoImages(command_buffer_, *vulkan_device_, *resolve.source,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, compute,
+                        VK_ACCESS_SHADER_READ_BIT, *resolve.destination, VK_IMAGE_LAYOUT_GENERAL,
+                        compute, VK_ACCESS_SHADER_WRITE_BIT);
     depth_resolve_->Record(command_buffer_, resolve.depth_descriptor, resolve.source->depth_view(),
                            resolve.destination->depth_view(),
                            {resolve.source_offset, resolve.extent}, resolve.destination_offset,
@@ -2916,10 +2998,10 @@ void NativeCommandProcessor::RecordResolve(const QueuedResolve& resolve) {
   }
   if (resolve.color_descriptor != SIZE_MAX) {
     constexpr auto compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    resolve.source->Transition(command_buffer_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, compute,
-                               VK_ACCESS_SHADER_READ_BIT);
-    resolve.destination->Transition(command_buffer_, VK_IMAGE_LAYOUT_GENERAL, compute,
-                                    VK_ACCESS_SHADER_WRITE_BIT);
+    TransitionTwoImages(command_buffer_, *vulkan_device_, *resolve.source,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, compute,
+                        VK_ACCESS_SHADER_READ_BIT, *resolve.destination, VK_IMAGE_LAYOUT_GENERAL,
+                        compute, VK_ACCESS_SHADER_WRITE_BIT);
     color_resolve_->Record(command_buffer_, resolve.color_descriptor, resolve.source->view(),
                            resolve.destination->view(), {resolve.source_offset, resolve.extent},
                            resolve.destination_offset, resolve.color_sample,
@@ -2928,10 +3010,11 @@ void NativeCommandProcessor::RecordResolve(const QueuedResolve& resolve) {
                            resolve.exp_bias_scale, resolve.destination_layer);
   } else {
     constexpr auto transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    resolve.source->Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, transfer,
-                               VK_ACCESS_TRANSFER_READ_BIT);
-    resolve.destination->Transition(command_buffer_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, transfer,
-                                    VK_ACCESS_TRANSFER_WRITE_BIT);
+    TransitionTwoImages(command_buffer_, *vulkan_device_, *resolve.source,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, transfer,
+                        VK_ACCESS_TRANSFER_READ_BIT, *resolve.destination,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, transfer,
+                        VK_ACCESS_TRANSFER_WRITE_BIT);
     VkImageCopy copy{};
     copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.srcOffset = {resolve.source_offset.x, resolve.source_offset.y, 0};
@@ -2962,10 +3045,8 @@ void NativeCommandProcessor::RecordResolve(const QueuedResolve& resolve) {
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     }
   }
-  resolve.destination->Transition(
-      command_buffer_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_ACCESS_SHADER_READ_BIT);
+  resolve.destination->Transition(command_buffer_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                  kAllShaderReadStages, VK_ACCESS_SHADER_READ_BIT);
   if (resolve.clear_color) {
     if (resolve.source_offset.x == 0 && resolve.source_offset.y == 0 &&
         resolve.source->initialized()) {

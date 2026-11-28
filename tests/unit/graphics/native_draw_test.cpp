@@ -1813,3 +1813,13 @@ TEST_CASE("Native Phase 1 physical page bitmap range helpers", "[gpu][native]") 
   CHECK_FALSE(native::HasAnyPageBitSet(pages, 62, 4));
   CHECK(native::HasAnyPageBitSet(pages, 1, 3));
 }
+
+TEST_CASE("Native Phase 2 early-Z hint and shader read stages", "[gpu][native]") {
+  CHECK(native::ShouldUseEarlyDepthHint(true, false, true));
+  CHECK(native::ShouldUseEarlyDepthHint(true, true, false));
+  CHECK_FALSE(native::ShouldUseEarlyDepthHint(true, true, true));
+  CHECK_FALSE(native::ShouldUseEarlyDepthHint(false, false, false));
+  CHECK((native::kAllShaderReadStages & VK_PIPELINE_STAGE_VERTEX_SHADER_BIT) != 0);
+  CHECK((native::kAllShaderReadStages & VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT) != 0);
+  CHECK((native::kAllShaderReadStages & VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) != 0);
+}

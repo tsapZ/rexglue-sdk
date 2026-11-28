@@ -24,6 +24,15 @@
 namespace rex::graphics::native {
 
 constexpr uint32_t kPhysicalMemorySize = 512 * 1024 * 1024;
+inline constexpr VkPipelineStageFlags kAllShaderReadStages =
+    VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+
+inline bool ShouldUseEarlyDepthHint(bool implicit_early_z_write_allowed,
+                                    bool writes_color_target0,
+                                    bool coverage_depends_on_alpha) {
+  return implicit_early_z_write_allowed && (!writes_color_target0 || !coverage_depends_on_alpha);
+}
 constexpr uint32_t kSharedVertexPageShift = 12;
 constexpr uint32_t kSharedVertexPageSize = 1u << kSharedVertexPageShift;
 constexpr uint32_t kSharedVertexPageCount = kPhysicalMemorySize >> kSharedVertexPageShift;
