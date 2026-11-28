@@ -54,34 +54,6 @@ REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
-                     "Forces anisotropic filtering for eligible textures.\n"
-                     "Higher values keep textures sharper at oblique angles, but increase texture "
-                     "sampling cost.\n"
-                     " -1 = No override\n"
-                     "  0 = Disable anisotropic filtering\n"
-                     "  1 = Force 1x anisotropic filtering\n"
-                     "  2 = Force 2x anisotropic filtering\n"
-                     "  3 = Force 4x anisotropic filtering\n"
-                     "  4 = Force 8x anisotropic filtering\n"
-                     "  5 = Force 16x anisotropic filtering")
-    .range(-1, 5)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU", "Draw resolution scale X (1 = no scaling)")
-    .range(1, 8)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
-REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU", "Draw resolution scale Y (1 = no scaling)")
-    .range(1, 8)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
-REXCVAR_DEFINE_INT32(resolution_scale, 1, "Graphics",
-                     "Draw resolution scale for both X and Y axes (same as setting "
-                     "draw_resolution_scale_x and draw_resolution_scale_y)")
-    .range(1, 8)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
 
@@ -253,19 +225,7 @@ TextureCache::~TextureCache() {
 }
 
 bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out) {
-  uint32_t shared_scale = uint32_t(std::max(INT32_C(1), REXCVAR_GET(resolution_scale)));
-  bool use_shared_scale = rex::cvar::HasNonDefaultValue("resolution_scale");
-  uint32_t config_x = use_shared_scale && !rex::cvar::HasNonDefaultValue("draw_resolution_scale_x")
-                          ? shared_scale
-                          : uint32_t(std::max(INT32_C(1), REXCVAR_GET(draw_resolution_scale_x)));
-  uint32_t config_y = use_shared_scale && !rex::cvar::HasNonDefaultValue("draw_resolution_scale_y")
-                          ? shared_scale
-                          : uint32_t(std::max(INT32_C(1), REXCVAR_GET(draw_resolution_scale_y)));
-  uint32_t clamped_x = std::min(kMaxDrawResolutionScaleAlongAxis, config_x);
-  uint32_t clamped_y = std::min(kMaxDrawResolutionScaleAlongAxis, config_y);
-  x_out = clamped_x;
-  y_out = clamped_y;
-  return clamped_x == config_x && clamped_y == config_y;
+  return rex::graphics::GetConfigDrawResolutionScale(x_out, y_out);
 }
 
 void TextureCache::ClearCache() {

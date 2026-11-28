@@ -10,6 +10,7 @@
  */
 
 #include <rex/graphics/flags.h>
+#include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/logging.h>
 #include <rex/ui/renderdoc_api.h>
 
@@ -40,6 +41,51 @@ REXCVAR_DEFINE_BOOL(draw_resolution_scaled_pixel_position_centered, false, "GPU/
 REXCVAR_DEFINE_BOOL(use_fuzzy_alpha_epsilon, false, "GPU",
                     "Use approximate compare for alpha test values to prevent "
                     "flickering on NVIDIA graphics cards");
+// Shared by rexgpu-xenos and rexgpu-native, so neither plugin needs the other's caches.
+REXCVAR_DEFINE_INT32(resolution_scale, 1, "Graphics",
+                     "Draw resolution scale for both X and Y axes (same as setting "
+                     "draw_resolution_scale_x and draw_resolution_scale_y)")
+    .range(1, 8)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU", "Draw resolution scale X (1 = no scaling)")
+    .range(1, 8)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU", "Draw resolution scale Y (1 = no scaling)")
+    .range(1, 8)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(draw_resolution_scale_threshold, 0, "GPU",
+                     "Render targets with a pitch at or below this many pixels skip the resolution "
+                     "scale (small post-processing chains: bloom, blur, depth of field). 0: off. The "
+                     "pitch is compared after rounding up to 80-pixel EDRAM tiles. Host render "
+                     "targets only (from Xenia Canary 74db632ab3)")
+    .range(0, 8192)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
+                     "Forces anisotropic filtering for eligible textures.\n"
+                     "Higher values keep textures sharper at oblique angles, but increase texture "
+                     "sampling cost.\n"
+                     " -1 = No override\n"
+                     "  0 = Disable anisotropic filtering\n"
+                     "  1 = Force 1x anisotropic filtering\n"
+                     "  2 = Force 2x anisotropic filtering\n"
+                     "  3 = Force 4x anisotropic filtering\n"
+                     "  4 = Force 8x anisotropic filtering\n"
+                     "  5 = Force 16x anisotropic filtering")
+    .range(-1, 5)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
+
+#if REX_HAS_VULKAN
+REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
+                    "Use sparse shared memory on Vulkan")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif  // REX_HAS_VULKAN
+
 REXCVAR_DEFINE_BOOL(gpu_debug_markers, false, "GPU",
                     "Insert debug markers into GPU command streams for tools "
                     "like PIX and RenderDoc. Automatically enabled when "
@@ -63,3 +109,23 @@ bool IsGpuDebugMarkersEnabled() {
   }
   return result;
 }
+
+namespace rex::graphics {
+
+bool GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out) {
+  uint32_t shared_scale = uint32_t(std::max(INT32_C(1), REXCVAR_GET(resolution_scale)));
+  bool use_shared_scale = rex::cvar::HasNonDefaultValue("resolution_scale");
+  uint32_t config_x = use_shared_scale && !rex::cvar::HasNonDefaultValue("draw_resolution_scale_x")
+                          ? shared_scale
+                          : uint32_t(std::max(INT32_C(1), REXCVAR_GET(draw_resolution_scale_x)));
+  uint32_t config_y = use_shared_scale && !rex::cvar::HasNonDefaultValue("draw_resolution_scale_y")
+                          ? shared_scale
+                          : uint32_t(std::max(INT32_C(1), REXCVAR_GET(draw_resolution_scale_y)));
+  uint32_t clamped_x = std::min(TextureCache::kMaxDrawResolutionScaleAlongAxis, config_x);
+  uint32_t clamped_y = std::min(TextureCache::kMaxDrawResolutionScaleAlongAxis, config_y);
+  x_out = clamped_x;
+  y_out = clamped_y;
+  return clamped_x == config_x && clamped_y == config_y;
+}
+
+}  // namespace rex::graphics

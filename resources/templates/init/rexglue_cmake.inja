@@ -74,7 +74,10 @@ endfunction()
 
 # Configure a rexglue target with SDK libraries and platform settings.
 # Call after add_executable() in your CMakeLists.txt.
-# Usage: rexglue_setup_target(<target> [GPU_PLUGINS xenos])
+# Usage: rexglue_setup_target(<target> [GPU_PLUGINS xenos|native])
+# GPU_PLUGINS native stages the experimental Vulkan renderer next to the host;
+# it needs REXGLUE_USE_VULKAN and gpu_plugin=native at runtime. It is opt-in -
+# the default xenos plugin stays unchanged.
 macro(rexglue_setup_target target_name)
     if(REXGLUE_ENTRYPOINT_GENERATED_SOURCES)
         add_library({{ cmake_var("target_name") }}_recomp OBJECT

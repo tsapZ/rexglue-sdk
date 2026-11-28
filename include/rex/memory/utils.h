@@ -145,6 +145,17 @@ void AlignedFree(T* ptr) {
 using FileMappingHandle = intptr_t;
 constexpr FileMappingHandle kFileMappingHandleInvalid = -1;
 
+// Creates the single owner of a new backing object.
+//
+// POSIX: the name is opened exclusively (O_CREAT | O_EXCL) and unlinked
+// immediately after creation, so the returned descriptor is the only handle to
+// the backing and a crash releases it with the process. A same-name object that
+// already exists is not attached to: the call fails and returns
+// kFileMappingHandleInvalid. Creation is therefore single-owner - the caller
+// must not expect a second CreateFileMappingHandle for the same name to
+// succeed, and must CloseFileMappingHandle exactly once (there is no shared
+// reference to release). The guest heap already gives each instance a unique
+// name and keeps one handle; the Android branch uses its own ashmem paths.
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                           PageAccess access, bool commit);
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path);

@@ -20,8 +20,15 @@ set(REXGLUE_INSTALL_TARGETS
     libavcodec libavutil
 )
 
+# rexgpu-native is installed only with the Vulkan backend, and it stays
+# opt-in: hosting applications stage it explicitly with
+# rexglue_configure_target(<target> GPU_PLUGINS native) and select it at
+# runtime with the gpu_plugin=native cvar. Nothing is staged by default, so an
+# SDK import behaves exactly as before unless a consumer asks for the
+# experimental renderer.
 if(REXGLUE_USE_VULKAN)
     list(APPEND REXGLUE_INSTALL_TARGETS
+        rexgpu-native  # experimental from-scratch Vulkan renderer, opt-in
         SPIRV glslang MachineIndependent GenericCodeGen OSDependent OGLCompiler  # glslang
         spirv-tools-headers
     )

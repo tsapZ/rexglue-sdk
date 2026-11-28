@@ -628,6 +628,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   if (with_gpu_emulation) {
     XE_UI_VULKAN_FEATURE(robustBufferAccess)
+    XE_UI_VULKAN_FEATURE(shaderStorageImageExtendedFormats)
     XE_UI_VULKAN_FEATURE(fullDrawIndexUint32)
     XE_UI_VULKAN_FEATURE(independentBlend)
     XE_UI_VULKAN_FEATURE(geometryShader)

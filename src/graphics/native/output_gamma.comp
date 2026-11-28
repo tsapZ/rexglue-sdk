@@ -1,0 +1,37 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(rgb10_a2, set = 0, binding = 0) writeonly uniform image2D output_image;
+layout(set = 0, binding = 2) uniform sampler2DArray source_image;
+layout(std140, set = 0, binding = 1) uniform Gamma {
+    uvec4 entries[96];
+};
+layout(push_constant) uniform Mode {
+    uint pwl;
+};
+
+uint entry(uint index) {
+    return entries[index / 4][index % 4];
+}
+
+float apply_gamma(float value, uint channel) {
+    if (pwl == 0) {
+        uint rgb = entry(uint(value * 255.0 + 0.5));
+        return float((rgb >> (20u - 10u * channel)) & 1023u) / 1023.0;
+    }
+
+    uint code = uint(value * 1023.0 + 0.5);
+    uint packed = entry((code / 8u) * 3u + channel);
+    float corrected = float(packed & 65535u) + float((packed >> 16u) * (code % 8u)) / 8.0;
+    return clamp(corrected / 65472.0, 0.0, 1.0);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(output_image)))) {
+        return;
+    }
+    vec3 rgb = texelFetch(source_image, ivec3(pixel, 0), 0).rgb;
+    imageStore(output_image, pixel, vec4(apply_gamma(rgb.r, 0), apply_gamma(rgb.g, 1),
+                                        apply_gamma(rgb.b, 2), 1.0));
+}

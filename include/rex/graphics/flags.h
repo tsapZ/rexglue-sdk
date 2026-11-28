@@ -51,6 +51,7 @@ REXCVAR_DECLARE(bool, gpu_transfer_report);
 REXCVAR_DECLARE(bool, gpu_native_surfaces);
 REXCVAR_DECLARE(bool, gpu_native_resolves);
 REXCVAR_DECLARE(bool, gpu_texture_load_report);
+REXCVAR_DECLARE(int32_t, draw_resolution_scale_threshold);
 
 // GPU Textures
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
@@ -113,5 +114,11 @@ REXCVAR_DECLARE(std::string, render_target_path_d3d12);
 REXCVAR_DECLARE(bool, d3d12_readback_memexport);
 REXCVAR_DECLARE(bool, d3d12_readback_resolve);
 #endif  // REX_HAS_D3D12
+
+namespace rex::graphics {
+// resolution_scale / draw_resolution_scale_{x,y}, clamped to the supported maximum. Returns
+// whether the actual scale is not smaller than the requested one.
+bool GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out);
+}  // namespace rex::graphics
 
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1

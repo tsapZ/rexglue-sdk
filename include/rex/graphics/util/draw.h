@@ -529,6 +529,9 @@ struct ResolveInfo {
   // dropped.
   uint32_t copy_dest_extent_start;
   uint32_t copy_dest_extent_length;
+  // Pixel coordinates relative to the unadjusted guest destination base.
+  uint32_t copy_dest_x = 0;
+  uint32_t copy_dest_y = 0;
 
   // The clear shaders always write to a uint4 view of EDRAM.
   uint32_t rb_depth_clear;

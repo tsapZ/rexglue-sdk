@@ -108,6 +108,9 @@ class IGraphicsSystem {
   }
 
   virtual void Shutdown() = 0;
+
+  // Flush persistent shader/pipeline caches before process exit.
+  virtual void FlushShaderStorage() {}
 };
 
 }  // namespace rex::system

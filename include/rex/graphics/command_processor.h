@@ -133,6 +133,7 @@ class CommandProcessor {
   // awaited.
   virtual void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                        bool blocking);
+  virtual void FlushShaderStorage() {}
 
   void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2);
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
@@ -292,7 +293,9 @@ class CommandProcessor {
   std::atomic<bool> worker_running_;
   system::object_ref<system::XHostThread> worker_thread_;
 
+  std::mutex pending_fns_mutex_;
   std::queue<std::function<void()>> pending_fns_;
+  std::atomic<bool> has_pending_fns_{false};
 
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;

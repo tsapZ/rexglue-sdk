@@ -472,32 +472,35 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
       assert_always();
       return kFileMappingHandleInvalid;
   }
-  oflag |= O_CREAT;
+  // Single owner: exclusive creation refuses to attach to an object another
+  // holder already created under this name, so a stale or concurrent backing is
+  // an error instead of silently sharing it. The caller owns the returned
+  // descriptor and closes it once; the name is removed below.
+  oflag |= O_CREAT | O_EXCL;
   auto full_path = MakeShmName(path);
-  int ret = shm_open(full_path.c_str(), oflag, 0777);
+  int ret = shm_open(full_path.c_str(), oflag, 0600);
   if (ret < 0) {
     return kFileMappingHandleInvalid;
   }
   if (rex_ftruncate64(ret, static_cast<off_t>(length)) != 0) {
-    close(ret);
     shm_unlink(full_path.c_str());
+    close(ret);
     return kFileMappingHandleInvalid;
   }
   // The name only served to create the object: views are mapped from the descriptor, and nothing
   // opens it by name again. Unlinked now, the memory goes back when the process ends, however it
   // ends; before, a run that crashed or quit through _Exit (a closed window) left the whole object
   // in /dev/shm, and once that was full the next start died with SIGBUS (Core of Light #135).
-  shm_unlink(full_path.c_str());
+  if (shm_unlink(full_path.c_str()) != 0) {
+    close(ret);
+    return kFileMappingHandleInvalid;
+  }
   return static_cast<FileMappingHandle>(ret);
 #endif
 }
 
-void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
+void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& /*path*/) {
   close(static_cast<int>(handle));
-#if !REX_PLATFORM_ANDROID
-  auto full_path = MakeShmName(path);
-  shm_unlink(full_path.c_str());
-#endif
 }
 
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, PageAccess access,

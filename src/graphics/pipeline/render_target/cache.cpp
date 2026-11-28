@@ -62,13 +62,8 @@ REXCVAR_DEFINE_STRING(gpu_native_surfaces_keep, "", "GPU",
                       "comma-separated")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(draw_resolution_scale_threshold, 0, "GPU",
-                     "Render targets with a pitch at or below this many pixels skip the resolution "
-                     "scale (small post-processing chains: bloom, blur, depth of field). 0: off. The "
-                     "pitch is compared after rounding up to 80-pixel EDRAM tiles. Host render "
-                     "targets only (from Xenia Canary 74db632ab3)")
-    .range(0, 8192)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// Defined in flags.cpp so both rexgpu-xenos and rexgpu-native share the same CVar.
+REXCVAR_DECLARE(int32_t, draw_resolution_scale_threshold);
 
 REXCVAR_DEFINE_BOOL(render_target_update_skip, true, "GPU",
                     "Skip the render target lookups and EDRAM ownership walks of a draw whose "

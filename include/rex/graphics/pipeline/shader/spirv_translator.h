@@ -88,6 +88,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // Draw is at 1x because of draw_resolution_scale_threshold.
+      uint32_t resolution_scale_native : 1;
     } pixel;
     uint64_t value = 0;
 
